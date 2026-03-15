@@ -1,0 +1,31 @@
+# Copy this file to terraform.tfvars and fill in the values.
+# NEVER commit terraform.tfvars to git -- it contains secrets.
+
+# GCP project (default: prod-femled-couple-router)
+# project_id = "prod-femled-couple-router"
+
+# Cloudflare
+cloudflare_api_token = ""
+
+# Container image -- set after first Cloud Build run:
+#   gcloud builds submit --config=../cloudbuild.yaml \
+#     --substitutions=_REGION=us-west1,_REPO=auth-broker,_IMAGE=auth-broker-tee \
+#     --project=prod-femled-couple-router ..
+container_image = "us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest"
+
+# Google OAuth credentials (from GCP Console > APIs & Services > Credentials)
+google_oauth_client_id     = ""
+google_oauth_client_secret = ""
+
+# Shared secrets (copy from existing Cloudflare Worker secrets: wrangler secret list)
+hmac_secret    = ""
+broker_api_key = ""
+
+# Service account key JSON for Firestore access (router-sa)
+# Paste the full JSON key contents here
+gcp_sa_key_json = ""
+
+# TLS certificate and key for oauth-tee.femled.ai
+# Paste the full PEM contents here
+tls_cert_pem = ""
+tls_key_pem  = ""

@@ -102,7 +102,7 @@ The auth-broker exposes an attestation endpoint that returns the current
 TEE attestation token:
 
 ```bash
-curl https://oauth.femled.ai/attestation
+curl https://oauth-tee.femled.ai/attestation
 ```
 
 ### Verifying the Token
