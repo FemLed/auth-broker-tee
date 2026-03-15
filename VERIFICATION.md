@@ -32,7 +32,7 @@ Review the source code at the commit you want to verify. Confirm:
       There is no `userinfo` field.
 - [ ] `src/routes.js` -- No `console.log` or `console.error` references
       email, name, or user profile data.
-- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.log_redirect"="false"`.
+- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.log_redirect"="never"`.
       This prevents the operator from enabling Cloud Logging.
 - [ ] `Dockerfile` -- `LABEL "tee.launch_policy.allow_cmd_override"="false"`.
       This prevents the operator from changing the container entrypoint.

@@ -16,10 +16,7 @@ identify your account.
 
 Normally, the service that processes this OAuth flow sees your email
 address. This is how virtually every "Sign in with Google" implementation
-works. Unlike Apple, which offers a
-["Hide My Email"](https://support.apple.com/en-us/HT210425) relay service,
-**Google does not provide any way to anonymize the email address returned
-during OAuth**. The service always receives your real email.
+works. The service always receives your real email.
 
 For a service like FemLed -- which is deeply personal and serves clients
 who are extremely sensitive about their privacy -- this is unacceptable.
