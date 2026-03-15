@@ -3,6 +3,7 @@ import http from "node:http";
 import { handleLogin, handleCallback, handleRefresh } from "./routes.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { loadTlsCredentials } from "./tls.js";
+import { startRenewalLoop } from "./acme-renewal.js";
 
 const PORT = 443;
 const HEALTH_PORT = 8080;
@@ -49,6 +50,8 @@ async function main() {
   healthServer.listen(HEALTH_PORT, () => {
     console.log(`Health check listening on port ${HEALTH_PORT} (HTTP)`);
   });
+
+  startRenewalLoop(server);
 }
 
 main().catch((err) => {

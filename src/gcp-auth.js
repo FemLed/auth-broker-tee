@@ -71,6 +71,34 @@ export async function fetchSecretValue(secretResourceName) {
   return Buffer.from(data.payload.data, "base64").toString("utf8");
 }
 
+export async function writeSecretValue(secretResourceName, value) {
+  const accessToken = await getGcpAccessToken(
+    "https://www.googleapis.com/auth/cloud-platform"
+  );
+  if (!accessToken) {
+    throw new Error("Failed to get GCP access token for Secret Manager write");
+  }
+
+  const url = `https://secretmanager.googleapis.com/v1/${secretResourceName}:addVersion`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      payload: { data: Buffer.from(value).toString("base64") },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Secret Manager write failed (${response.status}): ${errText}`);
+  }
+
+  return response.json();
+}
+
 export function getProjectId() {
   return GCP_PROJECT_ID;
 }

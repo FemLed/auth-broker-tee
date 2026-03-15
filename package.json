@@ -6,5 +6,7 @@
   "scripts": {
     "start": "node src/server.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "acme-client": "5.4.0"
+  }
 }

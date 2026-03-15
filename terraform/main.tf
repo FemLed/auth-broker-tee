@@ -143,6 +143,11 @@ data "google_secret_manager_secret" "tls_key" {
   depends_on = [google_project_service.secret_manager]
 }
 
+data "google_secret_manager_secret" "cloudflare_dns_token" {
+  secret_id = "auth-broker-cloudflare-dns-token"
+  depends_on = [google_project_service.secret_manager]
+}
+
 # ---------------------------------------------------------------------------
 # Cloud Build trigger
 #
@@ -201,6 +206,7 @@ resource "google_compute_instance" "auth_broker" {
     "tee-env-GOOGLE_SCOPES"        = "openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
     "tee-env-TLS_CERT_SECRET"      = "${data.google_secret_manager_secret.tls_cert.id}/versions/latest"
     "tee-env-TLS_KEY_SECRET"       = "${data.google_secret_manager_secret.tls_key.id}/versions/latest"
+    "tee-env-CLOUDFLARE_DNS_TOKEN" = "secret:${data.google_secret_manager_secret.cloudflare_dns_token.secret_id}"
   }
 
   service_account {

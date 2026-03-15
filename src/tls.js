@@ -1,5 +1,6 @@
 import fs from "node:fs";
-import { fetchSecretValue } from "./gcp-auth.js";
+import crypto from "node:crypto";
+import { fetchSecretValue, writeSecretValue } from "./gcp-auth.js";
 
 const TLS_CERT_SECRET = process.env.TLS_CERT_SECRET;
 const TLS_KEY_SECRET = process.env.TLS_KEY_SECRET;
@@ -25,4 +26,39 @@ export async function loadTlsCredentials() {
   ]);
 
   return { cert, key };
+}
+
+export function isCertExpiringSoon(certPem, thresholdDays = 30) {
+  try {
+    const x509 = new crypto.X509Certificate(certPem);
+    const expiresAt = new Date(x509.validTo).getTime();
+    const msRemaining = expiresAt - Date.now();
+    const daysRemaining = msRemaining / (1000 * 60 * 60 * 24);
+    return daysRemaining < thresholdDays;
+  } catch {
+    return true;
+  }
+}
+
+export function getCertSecretName() {
+  return TLS_CERT_SECRET;
+}
+
+export function getKeySecretName() {
+  return TLS_KEY_SECRET;
+}
+
+export async function persistTlsCredentials(cert, key) {
+  if (!TLS_CERT_SECRET || !TLS_KEY_SECRET) {
+    console.log("[TLS] No Secret Manager paths configured, skipping persist");
+    return;
+  }
+
+  const certSecretParent = TLS_CERT_SECRET.replace(/\/versions\/.*$/, "");
+  const keySecretParent = TLS_KEY_SECRET.replace(/\/versions\/.*$/, "");
+
+  await Promise.all([
+    writeSecretValue(certSecretParent, cert),
+    writeSecretValue(keySecretParent, key),
+  ]);
 }
