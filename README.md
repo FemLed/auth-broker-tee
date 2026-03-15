@@ -1,126 +1,94 @@
-# FemLed Auth Broker (Confidential Space TEE)
+# How FemLed Protects Your Identity
 
-A zero-knowledge OAuth token broker that runs inside a Google Cloud
-Confidential Space hardware Trusted Execution Environment (AMD SEV).
+You are considering a service that requires access to your Google Calendar
+and Gmail. You want assurance that the people who built this service --
+including FemLed's own employees -- cannot learn who you are.
 
-The broker exchanges Google OAuth authorization codes for tokens on behalf
-of FemLed couples, without any ability for FemLed operators to inspect the
-traffic or data flowing through it.
+This document explains the problem, the solution, and how you or your
+security team can independently verify everything.
 
-## Security Properties
+## The Problem
 
-- **TLS terminates inside the TEE** -- the Network Load Balancer does raw TCP
-  passthrough; it never sees plaintext
-- **No SSH access** -- the Confidential Space production image blocks SSH
-- **No logging** -- the `log_redirect` launch policy prevents the operator from
-  capturing stdout/stderr
-- **No userinfo fetch** -- the broker never requests the user's email from Google
-- **Encrypted memory** -- AMD SEV encrypts the VM's memory at the hardware level;
-  even the hypervisor cannot read it
-- **Attestable** -- external parties can cryptographically verify the exact code
-  running in the TEE
+FemLed's AI coaching requires access to your Google Calendar and Gmail.
+To obtain that access, you sign in with Google through an industry-standard
+OAuth flow. During this flow, Google returns authentication tokens that
+identify your account.
 
-## Current Deployment
+Normally, the service that processes this OAuth flow sees your email
+address. This is how virtually every "Sign in with Google" implementation
+works. Unlike Apple, which offers a
+["Hide My Email"](https://support.apple.com/en-us/HT210425) relay service,
+**Google does not provide any way to anonymize the email address returned
+during OAuth**. The service always receives your real email.
 
-| Property | Value |
-|---|---|
-| **Endpoint** | `https://oauth-tee.femled.ai` |
-| **GCP Project** | `prod-femled-couple-router` |
-| **Region** | `us-west1` |
-| **Machine Type** | `n2d-standard-2` (AMD SEV) |
-| **Confidential Space Image** | `confidential-space-260200` |
+For a service like FemLed -- which is deeply personal and serves clients
+who are extremely sensitive about their privacy -- this is unacceptable.
+If FemLed's infrastructure were breached, or if a FemLed employee acted
+maliciously, the identities of every couple using the service could be
+exposed.
 
-## Attestation Values
+## The Solution
 
-These values can be used to verify that the TEE is running the expected code.
-They are updated with each release.
+FemLed's OAuth broker runs inside
+[Google Cloud Confidential Space](https://docs.google.com/confidential-computing/confidential-space/docs/confidential-space-overview),
+a hardware-sealed environment powered by AMD SEV memory encryption.
 
-| Claim | Expected Value |
-|---|---|
-| **Container Image Digest** | `sha256:afaec62e9f59c5ebf8aa9787c8f2f30fe313d7679052b94d90116d1a55c62584` |
-| **Artifact Registry** | `us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee` |
-| **`swname`** | `CONFIDENTIAL_SPACE` |
-| **`dbgstat`** | `disabled-since-boot` |
-| **Launch Policy: `log_redirect`** | `false` |
-| **Launch Policy: `allow_cmd_override`** | `false` |
+Confidential Space is not a software policy or a corporate promise. It is
+a physical property of the hardware. The AMD processor encrypts the
+broker's memory with keys that are inaccessible to the operating system,
+the hypervisor, Google Cloud itself, and FemLed's operators.
 
-## Verifying the TEE
+Concretely, this means:
 
-Full verification instructions are in [VERIFICATION.md](VERIFICATION.md).
+- **FemLed cannot SSH into the machine.** The Confidential Space production
+  image blocks all remote access.
+- **FemLed cannot read the machine's memory.** AMD SEV encrypts it at the
+  hardware level. Not even the hypervisor can decrypt it.
+- **FemLed cannot enable logging.** The broker's code includes a hardware-
+  enforced launch policy that blocks the operator from capturing any output.
+- **FemLed cannot modify the running code.** The sealed environment runs a
+  specific container image. Any change to the code produces a different
+  cryptographic fingerprint that is immediately detectable.
+- **FemLed cannot inspect network traffic.** TLS terminates inside the
+  sealed environment. The load balancer in front of it performs raw TCP
+  passthrough -- it sees only encrypted bytes.
 
-### Quick Check (SLSA Provenance)
+Your Google tokens pass through this sealed environment and are deposited
+directly into your couple's private, isolated infrastructure. The broker
+never stores them, never logs them, and never even requests your email
+address from Google.
 
-```bash
-slsa-verifier verify-image \
-  us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest \
-  --source-uri github.com/FemLed/auth-broker-tee
-```
+## What This Means For You
 
-### Reproducible Build
+FemLed never learns your email address. This is not a policy decision that
+could be reversed. It is enforced by hardware that FemLed does not control
+and cannot circumvent.
 
-```bash
-git clone https://github.com/FemLed/auth-broker-tee
-cd auth-broker-tee
-docker build --build-arg SOURCE_DATE_EPOCH=0 -t local-verify .
-docker inspect --format='{{.Id}}' local-verify
-# Compare with the Container Image Digest above
-```
+Even in a worst-case scenario -- a complete breach of FemLed's cloud
+infrastructure, combined with a malicious insider with full administrative
+access -- your identity remains protected. There is nothing to find.
 
-### Attestation Token
+## Don't Trust, Verify
 
-Request an attestation token from the TEE and verify:
+You do not need to take FemLed's word for any of this. The entire system
+is independently verifiable:
 
-1. `container.image_digest` matches the digest in the table above
-2. `dbgstat` = `disabled-since-boot` (production image, no SSH)
-3. `swname` = `CONFIDENTIAL_SPACE`
-4. Launch policies confirm logging and CMD override are blocked
+1. **The source code is public.** You are reading it right now. Have your
+   security team review it and confirm that it does not log, store, or
+   transmit your email address.
 
-## Source Code Audit Checklist
+2. **The build is reproducible.** Anyone can clone this repository, build
+   the container image, and produce the same cryptographic fingerprint.
 
-When reviewing the source code at a given commit, confirm:
+3. **The running code is attestable.** Google's attestation service
+   produces a cryptographically signed token that proves the exact code
+   running inside the sealed environment. Your security team can compare
+   this against the image they built themselves.
 
-- [ ] `src/routes.js` -- No call to `googleapis.com/oauth2/v2/userinfo`
-- [ ] `src/routes.js` -- Deposit payload contains only `access_token`,
-      `refresh_token`, `id_token`, `expiry_date`, `scope`, `token_type`
-      (no `userinfo` field)
-- [ ] `src/routes.js` -- No `console.log` or `console.error` references email,
-      name, or user profile data
-- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.log_redirect"="false"`
-- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.allow_cmd_override"="false"`
-- [ ] `Dockerfile` -- Base image pinned by SHA-256 digest
-- [ ] `src/server.js` -- TLS server created with `https.createServer()`
-- [ ] `src/tls.js` -- TLS cert/key loaded from Secret Manager (gated by
-      attestation), not from disk or environment variables
+The fingerprint is not listed in this file because any change to this
+file would change the fingerprint -- a self-referential impossibility.
+Instead, the live fingerprint is obtained directly from the sealed
+environment's attestation token and compared against a local build.
 
-## Architecture
-
-```
-User Browser
-    │
-    │ TLS (encrypted end-to-end)
-    ▼
-TCP Passthrough NLB (oauth-tee.femled.ai)
-    │
-    │ Raw TCP (still encrypted)
-    ▼
-┌─────────────────────────────────────┐
-│  Confidential Space TEE (AMD SEV)   │
-│                                     │
-│  ┌─────────────────────────────┐    │
-│  │  TLS Termination            │    │
-│  │  (cert + key in encrypted   │    │
-│  │   memory from Secret Mgr)   │    │
-│  └──────────┬──────────────────┘    │
-│             ▼                       │
-│  ┌─────────────────────────────┐    │
-│  │  Auth Broker (Node.js)      │    │
-│  │  - Exchange OAuth code      │    │
-│  │  - Deposit tokens to tenant │    │
-│  │  - No userinfo fetch        │    │
-│  │  - No PII logging           │    │
-│  └─────────────────────────────┘    │
-│                                     │
-│  No SSH │ No logging │ No memory    │
-│  access │ possible   │ inspection   │
-└─────────────────────────────────────┘
-```
+**For the complete technical verification walkthrough, see
+[VERIFICATION.md](VERIFICATION.md).**

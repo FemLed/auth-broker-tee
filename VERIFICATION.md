@@ -1,62 +1,53 @@
-# Auth Broker Attestation Verification Guide
+# Verification Guide
 
-This document explains how any FemLed couple or independent auditor can
-cryptographically verify that the auth-broker running in the Confidential Space
-TEE is the exact code published in this repository, with no modifications,
-no logging, and no ability for FemLed operators to inspect traffic.
+This document explains how to cryptographically verify that the auth-broker
+running in the Confidential Space TEE is the exact code published in this
+repository, with no modifications, no logging, and no ability for FemLed
+operators to inspect traffic.
+
+If you are not technical, forward this document to your security team.
 
 ## What You Are Verifying
 
-1. The container image running in the TEE was built from a specific git commit
-   in this public repository.
-2. The TEE is running the production Confidential Space image (not debug).
-3. The `log_redirect` launch policy is active (operator cannot capture logs).
-4. The `allow_cmd_override` launch policy is active (operator cannot change the
-   container entrypoint).
-5. TLS terminates inside the TEE — the load balancer sees only encrypted bytes.
+1. The source code in this repository does not log, store, or transmit
+   any personally identifiable information.
+2. The container image running in the TEE was built from this source code.
+3. The TEE is running the production Confidential Space image (not debug).
+4. The `log_redirect` launch policy is active (operator cannot capture logs).
+5. The `allow_cmd_override` launch policy is active (operator cannot change
+   the container entrypoint).
+6. TLS terminates inside the TEE -- the load balancer sees only encrypted
+   bytes.
 
 ---
 
-## Option A: SLSA Provenance Verification (Recommended)
+## Step 1: Audit the Source Code
 
-This verifies that Google Cloud Build produced the container image from a
-specific git commit. You trust Google Cloud Build as an honest builder.
+Review the source code at the commit you want to verify. Confirm:
 
-### Prerequisites
-
-Install the SLSA verifier:
-
-```bash
-go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest
-```
-
-### Steps
-
-```bash
-# 1. Get the image reference (ask FemLed or read from Terraform output)
-IMAGE="us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest"
-
-# 2. Verify SLSA provenance
-slsa-verifier verify-image "$IMAGE" \
-  --source-uri github.com/femled/auth-broker-tee \
-  --source-tag v1.0.0
-
-# 3. If verification passes, the image was built by Google Cloud Build
-#    from the specified source repository and tag.
-```
-
-### What This Proves
-
-- The image was built by Google Cloud Build (not on someone's laptop).
-- The source came from the specified git repository and commit.
-- The provenance is signed by Google's infrastructure, not by FemLed.
+- [ ] `src/routes.js` -- No call to `googleapis.com/oauth2/v2/userinfo`.
+      The broker never requests the user's email from Google.
+- [ ] `src/routes.js` -- The deposit payload contains only `access_token`,
+      `refresh_token`, `id_token`, `expiry_date`, `scope`, `token_type`.
+      There is no `userinfo` field.
+- [ ] `src/routes.js` -- No `console.log` or `console.error` references
+      email, name, or user profile data.
+- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.log_redirect"="false"`.
+      This prevents the operator from enabling Cloud Logging.
+- [ ] `Dockerfile` -- `LABEL "tee.launch_policy.allow_cmd_override"="false"`.
+      This prevents the operator from changing the container entrypoint.
+- [ ] `Dockerfile` -- Base image pinned by SHA-256 digest (not a mutable tag).
+- [ ] `src/server.js` -- TLS server created with `https.createServer()`.
+- [ ] `src/tls.js` -- TLS cert/key loaded from Secret Manager (gated by
+      attestation), not from disk or environment variables.
 
 ---
 
-## Option B: Reproducible Build Verification (Zero Trust)
+## Step 2: Build the Image Yourself
 
-This verifies the image by rebuilding it yourself from source. You trust
-nothing except your own machine and the TEE hardware.
+Clone the repository and build the container image on your own machine.
+This produces a cryptographic digest that you will compare against the
+TEE attestation token in Step 3.
 
 ### Prerequisites
 
@@ -66,102 +57,152 @@ nothing except your own machine and the TEE hardware.
 ### Steps
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/femled/auth-broker-tee
+git clone https://github.com/FemLed/auth-broker-tee
 cd auth-broker-tee
 
-# 2. Check out the version you want to verify
-git checkout v1.0.0
+# Check out the commit you audited in Step 1
+git checkout <commit-or-tag>
 
-# 3. Build with deterministic settings
+# Build with deterministic settings
 docker build --build-arg SOURCE_DATE_EPOCH=0 -t local-verify .
 
-# 4. Get the local image digest
+# Record the digest
 LOCAL_DIGEST=$(docker inspect --format='{{.Id}}' local-verify)
-echo "Local digest: $LOCAL_DIGEST"
-
-# 5. Compare with the digest from the TEE attestation token
-#    (see "Attestation Token Verification" below)
-echo "TEE digest:   $TEE_DIGEST"
-
-# 6. If they match, the audited source code IS what's running.
+echo "Your locally-built digest: $LOCAL_DIGEST"
 ```
+
+Keep this digest. You will compare it in Step 3.
 
 ---
 
-## Attestation Token Verification
+## Step 3: Verify the TEE Attestation Token
 
-The Confidential Space TEE produces attestation tokens that cryptographically
-prove what code is running. These tokens are signed by Google's attestation
-service and contain the container image digest, debug status, and launch
-policies.
+The Confidential Space TEE produces attestation tokens -- cryptographically
+signed JWTs issued by Google's attestation service -- that prove the exact
+container image running inside the sealed environment.
 
-### Requesting an Attestation Token
-
-The auth-broker exposes an attestation endpoint that returns the current
-TEE attestation token:
+### Obtain the Attestation Token
 
 ```bash
-curl https://oauth-tee.femled.ai/attestation
+curl -s https://oauth-tee.femled.ai/attestation
 ```
 
-### Verifying the Token
+### Verify the Token Signature
 
-The attestation token is a JWT signed by Google. Verify it against Google's
-OIDC public keys:
+The token is a JWT signed by Google. Verify it against Google's
+Confidential Space OIDC public keys:
 
-```bash
-# 1. Fetch Google's Confidential Space JWKS
-JWKS_URL="https://confidentialcomputing.googleapis.com/.well-known/openid-configuration"
-
-# 2. Decode the JWT and verify the signature using any JWT library
-
-# 3. Check these claims in the verified token:
+```
+Discovery URL: https://confidentialcomputing.googleapis.com/.well-known/openid-configuration
 ```
 
-| Claim | Expected Value | What It Proves |
+Use any standard JWT library to validate the signature.
+
+### Check the Claims
+
+After verifying the signature, inspect the following claims:
+
+| Claim | What to check | What it proves |
 |---|---|---|
-| `dbgstat` | `disabled-since-boot` | Production image, not debug. No SSH possible. |
-| `swname` | `CONFIDENTIAL_SPACE` | Running on Confidential Space (AMD SEV TEE). |
-| `submods.container.image_digest` | `sha256:...` | Exact container image running. Compare with your local build or SLSA provenance. |
-| `submods.container.cmd_override` | `[]` or absent | Container CMD has not been overridden by the operator. |
-| `submods.container.env_override` | (check for unexpected vars) | No unexpected environment variables injected. |
+| `submods.container.image_digest` | Matches `$LOCAL_DIGEST` from Step 2 | The audited source code is what's running |
+| `dbgstat` | `disabled-since-boot` | Production image. No SSH access possible. |
+| `swname` | `CONFIDENTIAL_SPACE` | Running on Confidential Space (AMD SEV TEE) |
+| `submods.container.cmd_override` | Empty (`[]`) or absent | Entrypoint has not been tampered with |
+| `submods.container.env_override` | No unexpected variables | No unexpected environment variables injected |
 
-### Full Verification Checklist
+If `image_digest` matches your locally-built digest and all other claims
+pass, the code you audited in Step 1 is provably what is running inside
+the sealed environment.
 
-- [ ] Attestation token signature is valid (signed by Google)
+---
+
+## Alternative: SLSA Provenance Verification
+
+If you prefer not to build the image yourself, you can verify that
+Google Cloud Build produced the image from this repository using SLSA
+(Supply-chain Levels for Software Artifacts) provenance.
+
+This approach trusts Google Cloud Build as an honest builder rather than
+rebuilding the image yourself.
+
+### Prerequisites
+
+```bash
+go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest
+```
+
+### Steps
+
+```bash
+IMAGE="us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest"
+
+slsa-verifier verify-image "$IMAGE" \
+  --source-uri github.com/FemLed/auth-broker-tee
+```
+
+If verification passes, the image was built by Google Cloud Build from
+this repository. The provenance is signed by Google's infrastructure,
+not by FemLed.
+
+You can then compare the verified image digest against the TEE attestation
+token's `submods.container.image_digest` claim.
+
+---
+
+## Complete Verification Checklist
+
+- [ ] Source code audited (Step 1) -- no PII logging, no userinfo fetch
+- [ ] Image built locally (Step 2) -- digest recorded
+- [ ] Attestation token obtained (Step 3) -- signature valid (signed by Google)
 - [ ] `dbgstat` = `disabled-since-boot` (production image)
 - [ ] `swname` = `CONFIDENTIAL_SPACE`
-- [ ] `container.image_digest` matches your locally-built digest (Option B)
-      OR matches the SLSA-verified image digest (Option A)
-- [ ] `container.cmd_override` is empty (entrypoint not tampered with)
-- [ ] Source code at the verified git commit contains no PII logging,
-      no userinfo fetch, no data exfiltration
-- [ ] The `log_redirect` launch policy label is present in the Dockerfile
-- [ ] The `allow_cmd_override` launch policy label is present in the Dockerfile
+- [ ] `container.image_digest` matches locally-built digest
+- [ ] `container.cmd_override` is empty
+- [ ] `log_redirect` launch policy label present in Dockerfile
+- [ ] `allow_cmd_override` launch policy label present in Dockerfile
 
 ---
 
-## What the Source Code Guarantees
+## Architecture
 
-Review the source code at the verified git commit. Confirm:
+```
+User Browser
+    |
+    | TLS (encrypted end-to-end)
+    v
+TCP Passthrough NLB (oauth-tee.femled.ai)
+    |
+    | Raw TCP (still encrypted)
+    v
++-------------------------------------+
+|  Confidential Space TEE (AMD SEV)   |
+|                                     |
+|  +-----------------------------+    |
+|  |  TLS Termination            |    |
+|  |  (cert + key in encrypted   |    |
+|  |   memory from Secret Mgr)   |    |
+|  +-------------+--------------+     |
+|                v                    |
+|  +-----------------------------+    |
+|  |  Auth Broker (Node.js)      |    |
+|  |  - Exchange OAuth code      |    |
+|  |  - Deposit tokens to tenant |    |
+|  |  - No userinfo fetch        |    |
+|  |  - No PII logging           |    |
+|  +-----------------------------+    |
+|                                     |
+|  No SSH | No logging | No memory   |
+|  access | possible   | inspection  |
++-------------------------------------+
+```
 
-1. **No userinfo fetch**: There is no call to
-   `googleapis.com/oauth2/v2/userinfo`. The broker never requests the
-   user's email from Google.
+## Why the Image Digest Is Not in This File
 
-2. **No email in deposit payload**: The deposit payload sent to the tenant
-   backend contains only `access_token`, `refresh_token`, `id_token`,
-   `expiry_date`, `scope`, and `token_type`. No `userinfo` field.
+Any change to a file in this repository changes the container image digest.
+If the digest were listed here, it would be stale the moment it was
+committed -- because committing it changes the file, which changes the
+digest.
 
-3. **No PII in logs**: All `console.log` and `console.error` statements
-   reference only tenant UUIDs and HTTP status codes. No email addresses,
-   names, or user identifiers appear in any log statement.
-
-4. **Launch policy blocks logging**: Even if the operator tries to enable
-   Cloud Logging, the `tee.launch_policy.log_redirect=false` label in the
-   Dockerfile prevents it.
-
-5. **TLS terminates inside the TEE**: The server creates an HTTPS listener
-   with cert/key loaded from Secret Manager into encrypted memory. The
-   Network Load Balancer does TCP passthrough only.
+Instead, the live digest is obtained from the TEE attestation token
+(Step 3) and compared against a local build (Step 2). This avoids the
+self-referential problem entirely.

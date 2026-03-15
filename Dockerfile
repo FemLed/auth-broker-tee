@@ -16,6 +16,4 @@ LABEL "tee.launch_policy.allow_cmd_override"="false"
 EXPOSE 443
 EXPOSE 8080
 
-USER node
-
 CMD ["node", "src/server.js"]
