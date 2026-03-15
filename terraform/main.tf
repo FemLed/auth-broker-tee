@@ -93,125 +93,74 @@ resource "google_project_iam_member" "broker_confidential_computing" {
 }
 
 # ---------------------------------------------------------------------------
-# Secrets with values populated from variables
+# References to pre-existing secrets in Secret Manager
+#
+# Secret values are populated via gcloud CLI (one-time setup), NOT via
+# Terraform variables. This ensures no sensitive values appear in Terraform
+# state, tfvars, or the public repository.
+#
+# Existing secrets:
+#   broker-api-key
+#   cloudflare-access-google-oauth-client-id
+#   cloudflare-access-google-oauth-client-secret
+#   auth-broker-hmac-secret
+#   auth-broker-gcp-sa-key
+#   auth-broker-tls-cert
+#   auth-broker-tls-key
 # ---------------------------------------------------------------------------
-resource "google_secret_manager_secret" "google_client_id" {
-  secret_id = "auth-broker-google-client-id"
-  replication { auto {} }
+data "google_secret_manager_secret" "google_client_id" {
+  secret_id = "cloudflare-access-google-oauth-client-id"
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "google_client_id" {
-  secret      = google_secret_manager_secret.google_client_id.id
-  secret_data = var.google_oauth_client_id
-}
-
-resource "google_secret_manager_secret" "google_client_secret" {
-  secret_id = "auth-broker-google-client-secret"
-  replication { auto {} }
+data "google_secret_manager_secret" "google_client_secret" {
+  secret_id = "cloudflare-access-google-oauth-client-secret"
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "google_client_secret" {
-  secret      = google_secret_manager_secret.google_client_secret.id
-  secret_data = var.google_oauth_client_secret
-}
-
-resource "google_secret_manager_secret" "hmac_secret" {
+data "google_secret_manager_secret" "hmac_secret" {
   secret_id = "auth-broker-hmac-secret"
-  replication { auto {} }
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "hmac_secret" {
-  secret      = google_secret_manager_secret.hmac_secret.id
-  secret_data = var.hmac_secret
-}
-
-resource "google_secret_manager_secret" "broker_api_key" {
-  secret_id = "auth-broker-api-key"
-  replication { auto {} }
+data "google_secret_manager_secret" "broker_api_key" {
+  secret_id = "broker-api-key"
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "broker_api_key" {
-  secret      = google_secret_manager_secret.broker_api_key.id
-  secret_data = var.broker_api_key
-}
-
-resource "google_secret_manager_secret" "gcp_sa_key" {
+data "google_secret_manager_secret" "gcp_sa_key" {
   secret_id = "auth-broker-gcp-sa-key"
-  replication { auto {} }
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "gcp_sa_key" {
-  secret      = google_secret_manager_secret.gcp_sa_key.id
-  secret_data = var.gcp_sa_key_json
-}
-
-resource "google_secret_manager_secret" "tls_cert" {
+data "google_secret_manager_secret" "tls_cert" {
   secret_id = "auth-broker-tls-cert"
-  replication { auto {} }
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "tls_cert" {
-  secret      = google_secret_manager_secret.tls_cert.id
-  secret_data = var.tls_cert_pem
-}
-
-resource "google_secret_manager_secret" "tls_key" {
+data "google_secret_manager_secret" "tls_key" {
   secret_id = "auth-broker-tls-key"
-  replication { auto {} }
   depends_on = [google_project_service.secret_manager]
 }
 
-resource "google_secret_manager_secret_version" "tls_key" {
-  secret      = google_secret_manager_secret.tls_key.id
-  secret_data = var.tls_key_pem
-}
-
 # ---------------------------------------------------------------------------
-# Cloud Build trigger -- builds container from GitHub on push to main
+# Cloud Build trigger
+#
+# The GitHub connection must be set up manually in the GCP Console first:
+#   Console > Cloud Build > Triggers > Connect Repository > GitHub
+# Once connected, create a trigger pointing to FemLed/auth-broker-tee,
+# branch ^main$, using cloudbuild.yaml with substitutions:
+#   _REGION=us-west1, _REPO=auth-broker, _IMAGE=auth-broker-tee
 # ---------------------------------------------------------------------------
-resource "google_cloudbuild_trigger" "auth_broker" {
-  name     = "auth-broker-tee-build"
-  location = var.region
-
-  github {
-    owner = "FemLed"
-    name  = "auth-broker-tee"
-
-    push {
-      branch = "^main$"
-    }
-  }
-
-  filename = "cloudbuild.yaml"
-
-  substitutions = {
-    _REGION = var.region
-    _REPO   = google_artifact_registry_repository.auth_broker.repository_id
-    _IMAGE  = "auth-broker-tee"
-  }
-
-  depends_on = [
-    google_project_service.cloud_build,
-    google_artifact_registry_repository.auth_broker,
-  ]
-}
 
 # ---------------------------------------------------------------------------
 # Confidential VM running Confidential Space image
 #
-# NOTE: The container_image must exist in Artifact Registry before this
-# resource can be created. On first deploy, run Cloud Build manually first:
+# On first deploy, build the container image first:
+#   cd /path/to/auth-broker-tee
 #   gcloud builds submit --config=cloudbuild.yaml \
 #     --substitutions=_REGION=us-west1,_REPO=auth-broker,_IMAGE=auth-broker-tee \
 #     --project=prod-femled-couple-router
-# Then apply Terraform with:
-#   -var="container_image=us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest"
 # ---------------------------------------------------------------------------
 resource "google_compute_instance" "auth_broker" {
   name         = "auth-broker-tee"
@@ -242,16 +191,16 @@ resource "google_compute_instance" "auth_broker" {
   metadata = {
     "tee-image-reference" = var.container_image
     "tee-restart-policy"  = "Always"
-    "tee-env-GOOGLE_CLIENT_ID"     = "secret:${google_secret_manager_secret.google_client_id.secret_id}"
-    "tee-env-GOOGLE_CLIENT_SECRET" = "secret:${google_secret_manager_secret.google_client_secret.secret_id}"
-    "tee-env-HMAC_SECRET"          = "secret:${google_secret_manager_secret.hmac_secret.secret_id}"
-    "tee-env-BROKER_API_KEY"       = "secret:${google_secret_manager_secret.broker_api_key.secret_id}"
-    "tee-env-GCP_SA_KEY"           = "secret:${google_secret_manager_secret.gcp_sa_key.secret_id}"
+    "tee-env-GOOGLE_CLIENT_ID"     = "secret:${data.google_secret_manager_secret.google_client_id.secret_id}"
+    "tee-env-GOOGLE_CLIENT_SECRET" = "secret:${data.google_secret_manager_secret.google_client_secret.secret_id}"
+    "tee-env-HMAC_SECRET"          = "secret:${data.google_secret_manager_secret.hmac_secret.secret_id}"
+    "tee-env-BROKER_API_KEY"       = "secret:${data.google_secret_manager_secret.broker_api_key.secret_id}"
+    "tee-env-GCP_SA_KEY"           = "secret:${data.google_secret_manager_secret.gcp_sa_key.secret_id}"
     "tee-env-GCP_PROJECT_ID"       = var.project_id
     "tee-env-REDIRECT_URI"         = "https://oauth-tee.femled.ai/callback"
     "tee-env-GOOGLE_SCOPES"        = "openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
-    "tee-env-TLS_CERT_SECRET"      = "${google_secret_manager_secret.tls_cert.id}/versions/latest"
-    "tee-env-TLS_KEY_SECRET"       = "${google_secret_manager_secret.tls_key.id}/versions/latest"
+    "tee-env-TLS_CERT_SECRET"      = "${data.google_secret_manager_secret.tls_cert.id}/versions/latest"
+    "tee-env-TLS_KEY_SECRET"       = "${data.google_secret_manager_secret.tls_key.id}/versions/latest"
   }
 
   service_account {
@@ -264,13 +213,6 @@ resource "google_compute_instance" "auth_broker" {
   depends_on = [
     google_project_service.compute,
     google_project_service.confidential_computing,
-    google_secret_manager_secret_version.google_client_id,
-    google_secret_manager_secret_version.google_client_secret,
-    google_secret_manager_secret_version.hmac_secret,
-    google_secret_manager_secret_version.broker_api_key,
-    google_secret_manager_secret_version.gcp_sa_key,
-    google_secret_manager_secret_version.tls_cert,
-    google_secret_manager_secret_version.tls_key,
   ]
 }
 
@@ -322,8 +264,9 @@ resource "google_compute_instance_group" "auth_broker" {
   }
 }
 
-resource "google_compute_health_check" "auth_broker" {
+resource "google_compute_region_health_check" "auth_broker" {
   name               = "auth-broker-tee-health"
+  region             = var.region
   check_interval_sec = 10
   timeout_sec        = 5
 
@@ -340,10 +283,11 @@ resource "google_compute_region_backend_service" "auth_broker" {
   region                = var.region
   protocol              = "TCP"
   load_balancing_scheme = "EXTERNAL"
-  health_checks         = [google_compute_health_check.auth_broker.id]
+  health_checks         = [google_compute_region_health_check.auth_broker.id]
 
   backend {
-    group = google_compute_instance_group.auth_broker.id
+    group          = google_compute_instance_group.auth_broker.id
+    balancing_mode = "CONNECTION"
   }
 }
 
@@ -381,8 +325,4 @@ output "oauth_url" {
 
 output "artifact_registry_repo" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.auth_broker.repository_id}"
-}
-
-output "cloud_build_trigger" {
-  value = google_cloudbuild_trigger.auth_broker.name
 }
