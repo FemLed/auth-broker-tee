@@ -1,5 +1,6 @@
 import https from "node:https";
 import http from "node:http";
+import { fetchSecretByName } from "./gcp-auth.js";
 import { handleLogin, handleCallback, handleRefresh } from "./routes.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { loadTlsCredentials } from "./tls.js";
@@ -8,7 +9,32 @@ import { startRenewalLoop } from "./acme-renewal.js";
 const PORT = 443;
 const HEALTH_PORT = 8080;
 
+/**
+ * Secret names are hardcoded here so they are auditable in the public source
+ * code. The operator cannot influence which secrets the workload reads --
+ * access is controlled by WIF attestation policy tied to the image digest.
+ */
+const SECRETS = {
+  GOOGLE_CLIENT_ID: "cloudflare-access-google-oauth-client-id",
+  GOOGLE_CLIENT_SECRET: "cloudflare-access-google-oauth-client-secret",
+  HMAC_SECRET: "auth-broker-hmac-secret",
+  BROKER_API_KEY: "broker-api-key",
+  CLOUDFLARE_DNS_TOKEN: "auth-broker-cloudflare-dns-token",
+};
+
+async function loadSecrets() {
+  const entries = Object.entries(SECRETS);
+  const values = await Promise.all(
+    entries.map(([, secretName]) => fetchSecretByName(secretName))
+  );
+  for (let i = 0; i < entries.length; i++) {
+    process.env[entries[i][0]] = values[i];
+  }
+}
+
 async function main() {
+  await loadSecrets();
+
   const { key, cert } = await loadTlsCredentials();
 
   const server = https.createServer({ key, cert }, async (req, res) => {

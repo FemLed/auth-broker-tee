@@ -10,9 +10,9 @@ COPY src/ ./src/
 ENV SOURCE_DATE_EPOCH=0
 ENV NODE_ENV=production
 
-LABEL "tee.launch_policy.log_redirect"="never"
+LABEL "tee.launch_policy.log_redirect"="debugonly"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-LABEL "tee.launch_policy.allow_env_override"="GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,HMAC_SECRET,BROKER_API_KEY,GCP_SA_KEY,GCP_PROJECT_ID,REDIRECT_URI,GOOGLE_SCOPES,TLS_CERT_SECRET,TLS_KEY_SECRET,CLOUDFLARE_DNS_TOKEN,CLOUDFLARE_ZONE_ID"
+LABEL "tee.launch_policy.allow_env_override"="GCP_PROJECT_ID,GCP_PROJECT_NUMBER,REDIRECT_URI,GOOGLE_SCOPES"
 
 EXPOSE 443
 EXPOSE 8080

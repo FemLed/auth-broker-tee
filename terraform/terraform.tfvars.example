@@ -4,8 +4,10 @@
 # Cloudflare API token (Zone DNS Edit for femled.ai)
 cloudflare_api_token = ""
 
-# Container image -- set after first Cloud Build run:
-#   gcloud builds submit --config=cloudbuild.yaml \
-#     --substitutions=_REGION=us-west1,_REPO=auth-broker,_IMAGE=auth-broker-tee \
-#     --project=prod-femled-couple-router
+# Container image -- set after Cloud Build run
 container_image = "us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee:latest"
+
+# Container image digest -- from Cloud Build output or `gcloud artifacts docker images describe`
+# Must be updated on each deploy. The WIF attestation condition uses this to
+# restrict secret access to this exact image.
+container_image_digest = "sha256:..."

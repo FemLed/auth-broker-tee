@@ -1,17 +1,12 @@
 import crypto from "node:crypto";
-import { getGcpAccessToken, getProjectId } from "./gcp-auth.js";
+import { getMetadataAccessToken, getProjectId } from "./gcp-auth.js";
 import { jsonResponse, textResponse, redirectResponse } from "./http-helpers.js";
 
 const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const FIRESTORE_COLLECTION = "couples";
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const HMAC_SECRET = process.env.HMAC_SECRET;
-const BROKER_API_KEY = process.env.BROKER_API_KEY;
-const REDIRECT_URI = process.env.REDIRECT_URI;
-const GOOGLE_SCOPES = process.env.GOOGLE_SCOPES;
+const env = (k) => process.env[k];
 
 const routeCache = new Map();
 
@@ -24,13 +19,13 @@ export async function handleLogin(url, req, res) {
     return jsonResponse(res, 400, { error: "Missing tenant parameter" });
   }
 
-  const state = signState(tenant, HMAC_SECRET);
+  const state = signState(tenant, env("HMAC_SECRET"));
 
   const params = new URLSearchParams({
-    client_id: GOOGLE_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
+    client_id: env("GOOGLE_CLIENT_ID"),
+    redirect_uri: env("REDIRECT_URI"),
     response_type: "code",
-    scope: GOOGLE_SCOPES,
+    scope: env("GOOGLE_SCOPES"),
     access_type: "offline",
     prompt: "consent",
     state,
@@ -56,7 +51,7 @@ export async function handleCallback(url, req, res) {
     return textResponse(res, 400, "Missing code or state");
   }
 
-  const tenant = verifyState(state, HMAC_SECRET);
+  const tenant = verifyState(state, env("HMAC_SECRET"));
   if (!tenant) {
     return textResponse(res, 403, "Invalid or tampered state parameter");
   }
@@ -66,9 +61,9 @@ export async function handleCallback(url, req, res) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       code,
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-      redirect_uri: REDIRECT_URI,
+      client_id: env("GOOGLE_CLIENT_ID"),
+      client_secret: env("GOOGLE_CLIENT_SECRET"),
+      redirect_uri: env("REDIRECT_URI"),
       grant_type: "authorization_code",
     }),
   });
@@ -102,7 +97,7 @@ export async function handleCallback(url, req, res) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Broker-Api-Key": BROKER_API_KEY,
+      "X-Broker-Api-Key": env("BROKER_API_KEY"),
     },
     body: JSON.stringify(depositPayload),
   });
@@ -125,7 +120,7 @@ export async function handleRefresh(req, res) {
   }
 
   const apiKey = req.headers["x-broker-api-key"];
-  if (apiKey !== BROKER_API_KEY) {
+  if (apiKey !== env("BROKER_API_KEY")) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
 
@@ -143,8 +138,8 @@ export async function handleRefresh(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
+      client_id: env("GOOGLE_CLIENT_ID"),
+      client_secret: env("GOOGLE_CLIENT_SECRET"),
       refresh_token,
       grant_type: "refresh_token",
     }),
@@ -183,9 +178,7 @@ async function getApiUrlForTenant(uuid) {
     return cached.apiUrl;
   }
 
-  const accessToken = await getGcpAccessToken(
-    "https://www.googleapis.com/auth/datastore"
-  );
+  const accessToken = await getMetadataAccessToken();
   if (!accessToken) {
     console.error("Failed to get GCP access token for Firestore lookup");
     return null;

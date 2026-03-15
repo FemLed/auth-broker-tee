@@ -27,7 +27,7 @@ exposed.
 ## The Solution
 
 FemLed's OAuth broker runs inside
-[Google Cloud Confidential Space](https://docs.google.com/confidential-computing/confidential-space/docs/confidential-space-overview),
+[Google Cloud Confidential Space](https://docs.cloud.google.com/confidential-computing/confidential-space/docs/confidential-space-overview),
 a hardware-sealed environment powered by AMD SEV memory encryption.
 
 Confidential Space is not a software policy or a corporate promise. It is

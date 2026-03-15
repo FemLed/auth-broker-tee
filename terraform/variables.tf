@@ -4,6 +4,12 @@ variable "project_id" {
   default     = "prod-femled-couple-router"
 }
 
+variable "project_number" {
+  description = "GCP project number for the auth broker (used in WIF audience)"
+  type        = string
+  default     = "125139120897"
+}
+
 variable "region" {
   description = "GCP region for the Confidential VM"
   type        = string
@@ -24,6 +30,11 @@ variable "machine_type" {
 
 variable "container_image" {
   description = "Full Artifact Registry path to the auth-broker container image"
+  type        = string
+}
+
+variable "container_image_digest" {
+  description = "SHA-256 digest of the container image (e.g. sha256:abc123...). Used in the WIF attestation condition to restrict secret access to this exact image."
   type        = string
 }
 

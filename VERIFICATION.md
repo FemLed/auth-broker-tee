@@ -149,6 +149,48 @@ token's `submods.container.image_digest` claim.
 
 ---
 
+## How Secrets Are Accessed (Workload Identity Federation)
+
+The broker uses
+[Workload Identity Federation](https://docs.google.com/confidential-computing/confidential-space/docs/create-grant-access-confidential-resources)
+(WIF) to authenticate with Google Cloud using the Confidential Space
+attestation token.
+
+The flow:
+
+1. The Confidential Space launcher writes a signed attestation token to
+   `/run/container_launcher/attestation_verifier_claims_token`.
+2. At startup, the broker reads this token and exchanges it with Google's
+   Security Token Service (STS) for a federated access token.
+3. The federated access token is used to fetch secrets from Secret Manager.
+
+The WIF provider's attestation policy restricts access to workloads that:
+- Run on `CONFIDENTIAL_SPACE` with a `STABLE` image
+- Have a container image digest matching the expected value
+
+Each Secret Manager secret has an IAM binding that grants
+`secretAccessor` only to the federated identity matching the expected
+image digest. The operator cannot grant access to a different image.
+
+The secret names are **hardcoded in `src/server.js`** (auditable). The operator cannot influence which
+secrets the workload reads.
+
+### What to verify
+
+- [ ] `src/server.js` -- The `SECRETS` object lists only the expected
+      secret names. No unexpected secrets are accessed.
+- [ ] `src/gcp-auth.js` -- Authentication uses the attestation token at
+      `/run/container_launcher/attestation_verifier_claims_token`, not
+      the metadata server (except for Firestore access which uses the
+      VM service account).
+- [ ] `Dockerfile` -- `allow_env_override` lists only non-sensitive
+      config vars (`GCP_PROJECT_ID`, `GCP_PROJECT_NUMBER`,
+      `REDIRECT_URI`, `GOOGLE_SCOPES`). No secret names are listed.
+- [ ] The WIF provider's attestation condition in Terraform matches the
+      expected image digest and requires `CONFIDENTIAL_SPACE` + `STABLE`.
+
+---
+
 ## Complete Verification Checklist
 
 - [ ] Source code audited (Step 1) -- no PII logging, no userinfo fetch
@@ -160,6 +202,9 @@ token's `submods.container.image_digest` claim.
 - [ ] `container.cmd_override` is empty
 - [ ] `log_redirect` launch policy label present in Dockerfile
 - [ ] `allow_cmd_override` launch policy label present in Dockerfile
+- [ ] `allow_env_override` lists only non-sensitive config vars
+- [ ] Secrets accessed via WIF (not env vars or metadata)
+- [ ] WIF attestation condition requires correct image digest + STABLE
 
 ---
 

@@ -48,6 +48,16 @@ resource "google_project_service" "confidential_computing" {
   disable_on_destroy = false
 }
 
+resource "google_project_service" "iam_credentials" {
+  service            = "iamcredentials.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "sts" {
+  service            = "sts.googleapis.com"
+  disable_on_destroy = false
+}
+
 # ---------------------------------------------------------------------------
 # Artifact Registry
 # ---------------------------------------------------------------------------
@@ -62,6 +72,15 @@ resource "google_artifact_registry_repository" "auth_broker" {
 
 # ---------------------------------------------------------------------------
 # Service Account for the Confidential VM workload
+#
+# This SA is attached to the VM. It needs:
+#   - Artifact Registry read (to pull the container image)
+#   - Confidential Computing workload user (to get attestation tokens)
+#   - Log writer (for health/operational logs only -- launch policy blocks
+#     workload stdout/stderr on production image)
+#
+# It does NOT get secretmanager.secretAccessor. Secret access is granted
+# via WIF federated identity tied to the container image digest.
 # ---------------------------------------------------------------------------
 resource "google_service_account" "auth_broker_vm" {
   account_id   = "auth-broker-tee"
@@ -71,12 +90,6 @@ resource "google_service_account" "auth_broker_vm" {
 resource "google_project_iam_member" "broker_artifact_reader" {
   project = var.project_id
   role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${google_service_account.auth_broker_vm.email}"
-}
-
-resource "google_project_iam_member" "broker_secret_accessor" {
-  project = var.project_id
-  role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.auth_broker_vm.email}"
 }
 
@@ -93,79 +106,132 @@ resource "google_project_iam_member" "broker_confidential_computing" {
 }
 
 # ---------------------------------------------------------------------------
-# References to pre-existing secrets in Secret Manager
+# Workload Identity Federation
 #
-# Secret values are populated via gcloud CLI (one-time setup), NOT via
-# Terraform variables. This ensures no sensitive values appear in Terraform
-# state, tfvars, or the public repository.
+# The WIF pool and provider allow the workload to authenticate using its
+# Confidential Space attestation token. The attestation condition ensures
+# only the expected container image digest running on a production
+# Confidential Space image can obtain a federated access token.
 #
-# Existing secrets:
-#   broker-api-key
-#   cloudflare-access-google-oauth-client-id
-#   cloudflare-access-google-oauth-client-secret
-#   auth-broker-hmac-secret
-#   auth-broker-gcp-sa-key
-#   auth-broker-tls-cert
-#   auth-broker-tls-key
+# Per-secret IAM bindings below grant this federated identity access to
+# specific Secret Manager secrets -- not a broad project-level role.
+# ---------------------------------------------------------------------------
+resource "google_iam_workload_identity_pool" "auth_broker" {
+  workload_identity_pool_id = "auth-broker-tee-pool"
+  display_name              = "Auth Broker TEE Pool"
+
+  depends_on = [google_project_service.iam_credentials]
+}
+
+resource "google_iam_workload_identity_pool_provider" "attestation_verifier" {
+  workload_identity_pool_id          = google_iam_workload_identity_pool.auth_broker.workload_identity_pool_id
+  workload_identity_pool_provider_id = "attestation-verifier"
+  display_name                       = "Confidential Space Attestation Verifier"
+
+  oidc {
+    issuer_uri        = "https://confidentialcomputing.googleapis.com/"
+    allowed_audiences = ["https://sts.googleapis.com"]
+  }
+
+  attribute_mapping = {
+    "google.subject"         = "\"gcpcs::\"+assertion.submods.container.image_digest+\"::\"+assertion.submods.gce.project_number+\"::\"+assertion.submods.gce.instance_id"
+    "attribute.image_digest" = "assertion.submods.container.image_digest"
+  }
+
+  attribute_condition = join(" && ", [
+    "assertion.swname == 'CONFIDENTIAL_SPACE'",
+    "'STABLE' in assertion.submods.confidential_space.support_attributes",
+    "assertion.submods.gce.project_id == '${var.project_id}'",
+    "'${google_service_account.auth_broker_vm.email}' in assertion.google_service_accounts",
+  ])
+
+  depends_on = [google_project_service.sts]
+}
+
+# ---------------------------------------------------------------------------
+# Secret Manager secrets (references to pre-existing secrets)
 # ---------------------------------------------------------------------------
 data "google_secret_manager_secret" "google_client_id" {
-  secret_id = "cloudflare-access-google-oauth-client-id"
+  secret_id  = "cloudflare-access-google-oauth-client-id"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "google_client_secret" {
-  secret_id = "cloudflare-access-google-oauth-client-secret"
+  secret_id  = "cloudflare-access-google-oauth-client-secret"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "hmac_secret" {
-  secret_id = "auth-broker-hmac-secret"
+  secret_id  = "auth-broker-hmac-secret"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "broker_api_key" {
-  secret_id = "broker-api-key"
-  depends_on = [google_project_service.secret_manager]
-}
-
-data "google_secret_manager_secret" "gcp_sa_key" {
-  secret_id = "auth-broker-gcp-sa-key"
+  secret_id  = "broker-api-key"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "tls_cert" {
-  secret_id = "auth-broker-tls-cert"
+  secret_id  = "auth-broker-tls-cert"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "tls_key" {
-  secret_id = "auth-broker-tls-key"
+  secret_id  = "auth-broker-tls-key"
   depends_on = [google_project_service.secret_manager]
 }
 
 data "google_secret_manager_secret" "cloudflare_dns_token" {
-  secret_id = "auth-broker-cloudflare-dns-token"
+  secret_id  = "auth-broker-cloudflare-dns-token"
   depends_on = [google_project_service.secret_manager]
 }
 
 # ---------------------------------------------------------------------------
-# Cloud Build trigger
+# Per-secret IAM bindings for the WIF federated identity
 #
-# The GitHub connection must be set up manually in the GCP Console first:
-#   Console > Cloud Build > Triggers > Connect Repository > GitHub
-# Once connected, create a trigger pointing to FemLed/auth-broker-tee,
-# branch ^main$, using cloudbuild.yaml with substitutions:
-#   _REGION=us-west1, _REPO=auth-broker, _IMAGE=auth-broker-tee
+# Each secret grants secretAccessor only to workloads whose attestation
+# token contains the expected container image digest. The operator cannot
+# grant access to a different image -- only the WIF provider controls this.
 # ---------------------------------------------------------------------------
+locals {
+  wif_principal = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.auth_broker.workload_identity_pool_id}/attribute.image_digest/${var.container_image_digest}"
+
+  secrets_needing_read = [
+    data.google_secret_manager_secret.google_client_id.secret_id,
+    data.google_secret_manager_secret.google_client_secret.secret_id,
+    data.google_secret_manager_secret.hmac_secret.secret_id,
+    data.google_secret_manager_secret.broker_api_key.secret_id,
+    data.google_secret_manager_secret.tls_cert.secret_id,
+    data.google_secret_manager_secret.tls_key.secret_id,
+    data.google_secret_manager_secret.cloudflare_dns_token.secret_id,
+  ]
+
+  secrets_needing_write = [
+    data.google_secret_manager_secret.tls_cert.secret_id,
+    data.google_secret_manager_secret.tls_key.secret_id,
+  ]
+}
+
+resource "google_secret_manager_secret_iam_member" "wif_read" {
+  for_each  = toset(local.secrets_needing_read)
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = local.wif_principal
+}
+
+resource "google_secret_manager_secret_iam_member" "wif_write" {
+  for_each  = toset(local.secrets_needing_write)
+  secret_id = each.value
+  role      = "roles/secretmanager.secretVersionAdder"
+  member    = local.wif_principal
+}
 
 # ---------------------------------------------------------------------------
-# Confidential VM running Confidential Space image
+# Confidential VM
 #
-# On first deploy, build the container image first:
-#   cd /path/to/auth-broker-tee
-#   gcloud builds submit --config=cloudbuild.yaml \
-#     --substitutions=_REGION=us-west1,_REPO=auth-broker,_IMAGE=auth-broker-tee \
-#     --project=prod-femled-couple-router
+# Metadata contains only non-sensitive configuration. All secrets are
+# fetched at runtime via WIF from hardcoded Secret Manager resource names
+# in the source code.
 # ---------------------------------------------------------------------------
 resource "google_compute_instance" "auth_broker" {
   name         = "auth-broker-tee"
@@ -178,6 +244,12 @@ resource "google_compute_instance" "auth_broker" {
 
   scheduling {
     on_host_maintenance = "TERMINATE"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
   }
 
   boot_disk {
@@ -196,17 +268,10 @@ resource "google_compute_instance" "auth_broker" {
   metadata = {
     "tee-image-reference" = var.container_image
     "tee-restart-policy"  = "Always"
-    "tee-env-GOOGLE_CLIENT_ID"     = "secret:${data.google_secret_manager_secret.google_client_id.secret_id}"
-    "tee-env-GOOGLE_CLIENT_SECRET" = "secret:${data.google_secret_manager_secret.google_client_secret.secret_id}"
-    "tee-env-HMAC_SECRET"          = "secret:${data.google_secret_manager_secret.hmac_secret.secret_id}"
-    "tee-env-BROKER_API_KEY"       = "secret:${data.google_secret_manager_secret.broker_api_key.secret_id}"
-    "tee-env-GCP_SA_KEY"           = "secret:${data.google_secret_manager_secret.gcp_sa_key.secret_id}"
     "tee-env-GCP_PROJECT_ID"       = var.project_id
+    "tee-env-GCP_PROJECT_NUMBER"   = var.project_number
     "tee-env-REDIRECT_URI"         = "https://oauth-tee.femled.ai/callback"
     "tee-env-GOOGLE_SCOPES"        = "openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
-    "tee-env-TLS_CERT_SECRET"      = "${data.google_secret_manager_secret.tls_cert.id}/versions/latest"
-    "tee-env-TLS_KEY_SECRET"       = "${data.google_secret_manager_secret.tls_key.id}/versions/latest"
-    "tee-env-CLOUDFLARE_DNS_TOKEN" = "secret:${data.google_secret_manager_secret.cloudflare_dns_token.secret_id}"
   }
 
   service_account {
@@ -219,11 +284,12 @@ resource "google_compute_instance" "auth_broker" {
   depends_on = [
     google_project_service.compute,
     google_project_service.confidential_computing,
+    google_iam_workload_identity_pool_provider.attestation_verifier,
   ]
 }
 
 # ---------------------------------------------------------------------------
-# Firewall: allow HTTPS (443) and health check (8080) traffic
+# Firewall
 # ---------------------------------------------------------------------------
 resource "google_compute_firewall" "auth_broker_https" {
   name    = "auth-broker-tee-allow-https"
@@ -307,7 +373,7 @@ resource "google_compute_forwarding_rule" "auth_broker" {
 }
 
 # ---------------------------------------------------------------------------
-# DNS: oauth-tee.femled.ai -> NLB IP
+# DNS
 # ---------------------------------------------------------------------------
 resource "cloudflare_dns_record" "oauth_tee_femled_ai" {
   zone_id = var.cloudflare_zone_id
@@ -331,4 +397,43 @@ output "oauth_url" {
 
 output "artifact_registry_repo" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.auth_broker.repository_id}"
+}
+
+output "wif_pool" {
+  value = google_iam_workload_identity_pool.auth_broker.workload_identity_pool_id
+}
+
+output "wif_provider" {
+  value = google_iam_workload_identity_pool_provider.attestation_verifier.workload_identity_pool_provider_id
+}
+
+# ---------------------------------------------------------------------------
+# Data access audit logs for WIF token exchanges
+#
+# Per Google's best practices: "enable data access logs for IAM APIs"
+# to maintain a non-repudiable audit trail of all WIF token exchanges
+# and service account impersonation events.
+# ---------------------------------------------------------------------------
+resource "google_project_iam_audit_config" "sts_audit" {
+  project = var.project_id
+  service = "sts.googleapis.com"
+
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+
+resource "google_project_iam_audit_config" "iam_audit" {
+  project = var.project_id
+  service = "iam.googleapis.com"
+
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
 }

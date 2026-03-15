@@ -1,61 +1,93 @@
-import crypto from "node:crypto";
+import fs from "node:fs";
 
-const GCP_SA_KEY = process.env.GCP_SA_KEY;
 const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID;
+const GCP_PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
+const WIF_POOL_ID = "auth-broker-tee-pool";
+const WIF_PROVIDER_ID = "attestation-verifier";
+const ATTESTATION_TOKEN_PATH =
+  "/run/container_launcher/attestation_verifier_claims_token";
 
-let gcpTokenCache = null;
+let wifTokenCache = null;
 
-export async function getGcpAccessToken(scope) {
+/**
+ * Obtains a federated access token by exchanging the Confidential Space
+ * attestation token via Workload Identity Federation (WIF).
+ *
+ * The attestation token is written to a well-known path by the Confidential
+ * Space launcher and is signed by Google Cloud Attestation. The STS exchange
+ * returns a short-lived access token scoped to the federated identity, which
+ * only has access to secrets whose IAM bindings match the container image
+ * digest in the attestation token.
+ */
+export async function getWifAccessToken() {
   const now = Date.now();
-  const cacheKey = scope || "default";
-  if (gcpTokenCache && gcpTokenCache.scope === cacheKey && gcpTokenCache.expiresAt > now) {
-    return gcpTokenCache.token;
+  if (wifTokenCache && wifTokenCache.expiresAt > now) {
+    return wifTokenCache.token;
   }
 
-  const saKey = JSON.parse(GCP_SA_KEY);
-  const iat = Math.floor(now / 1000);
-  const exp = iat + 3600;
+  const subjectToken = fs.readFileSync(ATTESTATION_TOKEN_PATH, "utf8").trim();
 
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: saKey.client_email,
-    sub: saKey.client_email,
-    aud: "https://oauth2.googleapis.com/token",
-    iat,
-    exp,
-    scope: scope || "https://www.googleapis.com/auth/datastore",
-  };
+  const audience = `//iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}`;
 
-  const jwt = signRsaJwt(header, payload, saKey.private_key);
-
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+  const response = await fetch("https://sts.googleapis.com/v1/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      subject_token: subjectToken,
+      audience,
+      scope: "https://www.googleapis.com/auth/cloud-platform",
+    }),
   });
 
-  if (!tokenResponse.ok) {
-    const errorText = await tokenResponse.text();
-    console.error("GCP token exchange failed:", tokenResponse.status);
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`WIF STS token exchange failed (${response.status}): ${errText}`);
+  }
+
+  const data = await response.json();
+  wifTokenCache = {
+    token: data.access_token,
+    expiresAt: now + (data.expires_in - 120) * 1000,
+  };
+  return data.access_token;
+}
+
+/**
+ * Obtains a standard GCP access token from the metadata server.
+ * Used for Firestore access (which uses the VM service account, not WIF).
+ */
+const METADATA_TOKEN_URL =
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+let metadataTokenCache = null;
+
+export async function getMetadataAccessToken() {
+  const now = Date.now();
+  if (metadataTokenCache && metadataTokenCache.expiresAt > now) {
+    return metadataTokenCache.token;
+  }
+
+  const response = await fetch(METADATA_TOKEN_URL, {
+    headers: { "Metadata-Flavor": "Google" },
+  });
+
+  if (!response.ok) {
+    console.error("Metadata token fetch failed:", response.status);
     return null;
   }
 
-  const tokenData = await tokenResponse.json();
-  gcpTokenCache = {
-    token: tokenData.access_token,
-    scope: cacheKey,
-    expiresAt: now + 3500 * 1000,
+  const data = await response.json();
+  metadataTokenCache = {
+    token: data.access_token,
+    expiresAt: now + (data.expires_in - 60) * 1000,
   };
-  return tokenData.access_token;
+  return data.access_token;
 }
 
 export async function fetchSecretValue(secretResourceName) {
-  const accessToken = await getGcpAccessToken(
-    "https://www.googleapis.com/auth/cloud-platform"
-  );
-  if (!accessToken) {
-    throw new Error("Failed to get GCP access token for Secret Manager");
-  }
+  const accessToken = await getWifAccessToken();
 
   const url = `https://secretmanager.googleapis.com/v1/${secretResourceName}:access`;
   const response = await fetch(url, {
@@ -64,20 +96,23 @@ export async function fetchSecretValue(secretResourceName) {
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Secret Manager access failed (${response.status}): ${errText}`);
+    throw new Error(
+      `Secret Manager access failed (${response.status}): ${errText}`
+    );
   }
 
   const data = await response.json();
   return Buffer.from(data.payload.data, "base64").toString("utf8");
 }
 
-export async function writeSecretValue(secretResourceName, value) {
-  const accessToken = await getGcpAccessToken(
-    "https://www.googleapis.com/auth/cloud-platform"
+export async function fetchSecretByName(secretName) {
+  return fetchSecretValue(
+    `projects/${GCP_PROJECT_ID}/secrets/${secretName}/versions/latest`
   );
-  if (!accessToken) {
-    throw new Error("Failed to get GCP access token for Secret Manager write");
-  }
+}
+
+export async function writeSecretValue(secretResourceName, value) {
+  const accessToken = await getWifAccessToken();
 
   const url = `https://secretmanager.googleapis.com/v1/${secretResourceName}:addVersion`;
   const response = await fetch(url, {
@@ -93,7 +128,9 @@ export async function writeSecretValue(secretResourceName, value) {
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Secret Manager write failed (${response.status}): ${errText}`);
+    throw new Error(
+      `Secret Manager write failed (${response.status}): ${errText}`
+    );
   }
 
   return response.json();
@@ -101,33 +138,4 @@ export async function writeSecretValue(secretResourceName, value) {
 
 export function getProjectId() {
   return GCP_PROJECT_ID;
-}
-
-function signRsaJwt(header, payload, privateKeyPem) {
-  const headerB64 = base64urlEncode(JSON.stringify(header));
-  const payloadB64 = base64urlEncode(JSON.stringify(payload));
-  const unsignedToken = `${headerB64}.${payloadB64}`;
-
-  const sign = crypto.createSign("RSA-SHA256");
-  sign.update(unsignedToken);
-  const signature = sign.sign(privateKeyPem);
-  const signatureB64 = base64urlFromBuffer(signature);
-
-  return `${unsignedToken}.${signatureB64}`;
-}
-
-function base64urlEncode(str) {
-  return Buffer.from(str)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function base64urlFromBuffer(buf) {
-  return buf
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
 }
