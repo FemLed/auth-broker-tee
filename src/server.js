@@ -2,6 +2,7 @@ import https from "node:https";
 import http from "node:http";
 import { fetchSecretByName } from "./gcp-auth.js";
 import { handleLogin, handleCallback, handleRefresh } from "./routes.js";
+import { handleAttestation } from "./attestation.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { loadTlsCredentials } from "./tls.js";
 import { startRenewalLoop } from "./acme-renewal.js";
@@ -48,6 +49,8 @@ async function main() {
           return await handleCallback(url, req, res);
         case "/refresh":
           return await handleRefresh(req, res);
+        case "/attestation":
+          return await handleAttestation(url, req, res);
         case "/health":
           return jsonResponse(res, 200, { status: "ok" });
         default:

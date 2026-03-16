@@ -83,20 +83,29 @@ container image running inside the sealed environment.
 
 ### Obtain the Attestation Token
 
+Generate a random nonce (8-88 bytes) and request a fresh attestation token:
+
 ```bash
-curl -s https://oauth-tee.femled.ai/attestation
+NONCE=$(openssl rand -hex 16)
+curl -s "https://oauth-tee.femled.ai/attestation?nonce=${NONCE}" > attestation.jwt
+echo "Nonce: $NONCE"
 ```
+
+The response is a JWT signed by Google's attestation service with a custom
+audience (`https://oauth-tee.femled.ai`). This token cannot be used for
+STS exchange -- it is safe to inspect and share with your security team.
 
 ### Verify the Token Signature
 
-The token is a JWT signed by Google. Verify it against Google's
-Confidential Space OIDC public keys:
+Verify the JWT against Google's Confidential Space OIDC public keys:
 
 ```
-Discovery URL: https://confidentialcomputing.googleapis.com/.well-known/openid-configuration
+Discovery: https://confidentialcomputing.googleapis.com/.well-known/openid-configuration
 ```
 
-Use any standard JWT library to validate the signature.
+Use any standard JWT library to validate the signature. Confirm that:
+- The `aud` claim is `https://oauth-tee.femled.ai`
+- The `eat_nonce` claim contains the nonce you provided
 
 ### Check the Claims
 
