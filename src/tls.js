@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { fetchSecretValue, writeSecretValue } from "./gcp-auth.js";
+import { fetchSecretByName, writeSecretValue } from "./gcp-auth.js";
 
-const TLS_CERT_SECRET = process.env.TLS_CERT_SECRET;
-const TLS_KEY_SECRET = process.env.TLS_KEY_SECRET;
+const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID;
+const TLS_CERT_SECRET_NAME = "auth-broker-tls-cert";
+const TLS_KEY_SECRET_NAME = "auth-broker-tls-key";
 
 export async function loadTlsCredentials() {
   if (process.env.TLS_CERT_PATH && process.env.TLS_KEY_PATH) {
@@ -13,16 +14,9 @@ export async function loadTlsCredentials() {
     };
   }
 
-  if (!TLS_CERT_SECRET || !TLS_KEY_SECRET) {
-    throw new Error(
-      "TLS credentials not configured. Set TLS_CERT_SECRET and TLS_KEY_SECRET " +
-        "(Secret Manager resource names) or TLS_CERT_PATH and TLS_KEY_PATH (file paths)."
-    );
-  }
-
   const [cert, key] = await Promise.all([
-    fetchSecretValue(TLS_CERT_SECRET),
-    fetchSecretValue(TLS_KEY_SECRET),
+    fetchSecretByName(TLS_CERT_SECRET_NAME),
+    fetchSecretByName(TLS_KEY_SECRET_NAME),
   ]);
 
   return { cert, key };
@@ -40,25 +34,12 @@ export function isCertExpiringSoon(certPem, thresholdDays = 30) {
   }
 }
 
-export function getCertSecretName() {
-  return TLS_CERT_SECRET;
-}
-
-export function getKeySecretName() {
-  return TLS_KEY_SECRET;
-}
-
 export async function persistTlsCredentials(cert, key) {
-  if (!TLS_CERT_SECRET || !TLS_KEY_SECRET) {
-    console.log("[TLS] No Secret Manager paths configured, skipping persist");
-    return;
-  }
-
-  const certSecretParent = TLS_CERT_SECRET.replace(/\/versions\/.*$/, "");
-  const keySecretParent = TLS_KEY_SECRET.replace(/\/versions\/.*$/, "");
+  const certParent = `projects/${GCP_PROJECT_ID}/secrets/${TLS_CERT_SECRET_NAME}`;
+  const keyParent = `projects/${GCP_PROJECT_ID}/secrets/${TLS_KEY_SECRET_NAME}`;
 
   await Promise.all([
-    writeSecretValue(certSecretParent, cert),
-    writeSecretValue(keySecretParent, key),
+    writeSecretValue(certParent, cert),
+    writeSecretValue(keyParent, key),
   ]);
 }

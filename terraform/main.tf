@@ -126,7 +126,7 @@ resource "google_iam_workload_identity_pool" "auth_broker" {
 resource "google_iam_workload_identity_pool_provider" "attestation_verifier" {
   workload_identity_pool_id          = google_iam_workload_identity_pool.auth_broker.workload_identity_pool_id
   workload_identity_pool_provider_id = "attestation-verifier"
-  display_name                       = "Confidential Space Attestation Verifier"
+  display_name                       = "CS Attestation Verifier"
 
   oidc {
     issuer_uri        = "https://confidentialcomputing.googleapis.com/"
