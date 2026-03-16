@@ -262,7 +262,9 @@ resource "google_compute_instance" "auth_broker" {
 
   network_interface {
     network = "default"
-    access_config {}
+    access_config {
+      nat_ip = google_compute_address.auth_broker_ip.address
+    }
   }
 
   metadata = {
@@ -289,6 +291,17 @@ resource "google_compute_instance" "auth_broker" {
 }
 
 # ---------------------------------------------------------------------------
+# Static External IP Address
+# ---------------------------------------------------------------------------
+resource "google_compute_address" "auth_broker_ip" {
+  name        = "auth-broker-tee-ip"
+  region      = var.region
+  description = "Static external IP for auth-broker TEE (oauth-tee.femled.ai)"
+
+  depends_on = [google_project_service.compute]
+}
+
+# ---------------------------------------------------------------------------
 # Firewall
 # ---------------------------------------------------------------------------
 resource "google_compute_firewall" "auth_broker_https" {
@@ -306,79 +319,13 @@ resource "google_compute_firewall" "auth_broker_https" {
   depends_on = [google_project_service.compute]
 }
 
-resource "google_compute_firewall" "auth_broker_health" {
-  name    = "auth-broker-tee-allow-health"
-  network = "default"
-
-  allow {
-    protocol = "tcp"
-    ports    = ["8080"]
-  }
-
-  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
-  target_tags   = ["auth-broker-tee"]
-
-  depends_on = [google_project_service.compute]
-}
-
 # ---------------------------------------------------------------------------
-# TCP Passthrough Network Load Balancer
-# ---------------------------------------------------------------------------
-resource "google_compute_instance_group" "auth_broker" {
-  name = "auth-broker-tee-group"
-  zone = var.zone
-
-  instances = [google_compute_instance.auth_broker.id]
-
-  named_port {
-    name = "https"
-    port = 443
-  }
-}
-
-resource "google_compute_region_health_check" "auth_broker" {
-  name               = "auth-broker-tee-health"
-  region             = var.region
-  check_interval_sec = 10
-  timeout_sec        = 5
-
-  http_health_check {
-    port         = 8080
-    request_path = "/health"
-  }
-
-  depends_on = [google_project_service.compute]
-}
-
-resource "google_compute_region_backend_service" "auth_broker" {
-  name                  = "auth-broker-tee-backend"
-  region                = var.region
-  protocol              = "TCP"
-  load_balancing_scheme = "EXTERNAL"
-  health_checks         = [google_compute_region_health_check.auth_broker.id]
-
-  backend {
-    group          = google_compute_instance_group.auth_broker.id
-    balancing_mode = "CONNECTION"
-  }
-}
-
-resource "google_compute_forwarding_rule" "auth_broker" {
-  name                  = "auth-broker-tee-forwarding"
-  region                = var.region
-  load_balancing_scheme = "EXTERNAL"
-  port_range            = "443"
-  ip_protocol           = "TCP"
-  backend_service       = google_compute_region_backend_service.auth_broker.id
-}
-
-# ---------------------------------------------------------------------------
-# DNS
+# DNS: oauth-tee.femled.ai -> static IP (dns-only, not proxied)
 # ---------------------------------------------------------------------------
 resource "cloudflare_dns_record" "oauth_tee_femled_ai" {
   zone_id = var.cloudflare_zone_id
   name    = "oauth-tee"
-  content = google_compute_forwarding_rule.auth_broker.ip_address
+  content = google_compute_address.auth_broker_ip.address
   type    = "A"
   ttl     = 300
   proxied = false
@@ -387,8 +334,8 @@ resource "cloudflare_dns_record" "oauth_tee_femled_ai" {
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
-output "nlb_ip" {
-  value = google_compute_forwarding_rule.auth_broker.ip_address
+output "static_ip" {
+  value = google_compute_address.auth_broker_ip.address
 }
 
 output "oauth_url" {
