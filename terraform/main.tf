@@ -105,6 +105,12 @@ resource "google_project_iam_member" "broker_confidential_computing" {
   member  = "serviceAccount:${google_service_account.auth_broker_vm.email}"
 }
 
+resource "google_project_iam_member" "broker_datastore_viewer" {
+  project = var.project_id
+  role    = "roles/datastore.viewer"
+  member  = "serviceAccount:${google_service_account.auth_broker_vm.email}"
+}
+
 # ---------------------------------------------------------------------------
 # Workload Identity Federation
 #
