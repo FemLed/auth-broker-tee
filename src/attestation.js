@@ -3,25 +3,48 @@ import { jsonResponse } from "./http-helpers.js";
 
 const ATTESTATION_AUDIENCE = "https://oauth-tee.femled.ai";
 const LAUNCHER_SOCKET = "/run/container_launcher/teeserver.sock";
+const REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+let cachedToken = null;
 
 /**
- * GET /attestation?nonce=<value>
+ * GET /attestation
  *
- * Returns a fresh Confidential Space attestation token with a custom
- * audience and the caller's nonce. The token is a JWT signed by Google's
- * attestation service -- the caller validates it against Google's public
- * keys, not against anything FemLed controls.
+ * Two modes:
  *
- * The custom audience ("https://oauth-tee.femled.ai") ensures this token
- * cannot be used for STS exchange (which requires "https://sts.googleapis.com").
+ *   1. No nonce (programmatic): returns a pre-cached attestation token
+ *      instantly. The token is refreshed in the background every 10 minutes.
+ *      Callers verify freshness via the `exp` claim.
+ *
+ *   2. With nonce (manual verification per VERIFICATION.md): makes a live
+ *      call to the Confidential Space launcher to produce a token bound to
+ *      the caller's nonce. This is slow (10-15s) but proves freshness via
+ *      `eat_nonce`.
+ *
+ * The custom audience ("https://oauth-tee.femled.ai") ensures neither token
+ * variant can be used for STS exchange (which requires
+ * "https://sts.googleapis.com").
  */
 export async function handleAttestation(url, req, res) {
   const nonces = url.searchParams.getAll("nonce");
 
   if (nonces.length === 0) {
-    return jsonResponse(res, 400, {
-      error: "Missing required 'nonce' query parameter. Provide a random value (8-88 bytes) to bind the token to your verification session.",
+    if (!cachedToken) {
+      try {
+        cachedToken = await requestAttestationToken([]);
+      } catch (err) {
+        console.error("Attestation cache miss, launcher call failed:", err.message);
+        return jsonResponse(res, 503, {
+          error: "Attestation token not yet available. Try again shortly.",
+        });
+      }
+    }
+
+    res.writeHead(200, {
+      "Content-Type": "application/jwt",
+      "Cache-Control": "public, max-age=300",
     });
+    return res.end(cachedToken);
   }
 
   for (const n of nonces) {
@@ -46,6 +69,24 @@ export async function handleAttestation(url, req, res) {
       error: "Attestation service unavailable.",
     });
   }
+}
+
+/**
+ * Starts a background loop that refreshes the cached attestation token
+ * every 10 minutes. Called once from server.js after startup.
+ */
+export function startAttestationRefreshLoop() {
+  async function refresh() {
+    try {
+      cachedToken = await requestAttestationToken([]);
+      console.log("[Attestation] Cached token refreshed");
+    } catch (err) {
+      console.error("[Attestation] Background refresh failed:", err.message);
+    }
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_INTERVAL_MS);
 }
 
 function requestAttestationToken(nonces) {

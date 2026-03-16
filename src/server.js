@@ -2,7 +2,7 @@ import https from "node:https";
 import http from "node:http";
 import { fetchSecretByName } from "./gcp-auth.js";
 import { handleLogin, handleCallback, handleRefresh } from "./routes.js";
-import { handleAttestation } from "./attestation.js";
+import { handleAttestation, startAttestationRefreshLoop } from "./attestation.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { loadTlsCredentials } from "./tls.js";
 import { startRenewalLoop } from "./acme-renewal.js";
@@ -81,6 +81,7 @@ async function main() {
   });
 
   startRenewalLoop(server);
+  startAttestationRefreshLoop();
 }
 
 main().catch((err) => {
