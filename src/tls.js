@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import crypto from "node:crypto";
 import { fetchSecretByName, writeSecretValue } from "./gcp-auth.js";
 
@@ -7,19 +6,16 @@ const TLS_CERT_SECRET_NAME = "auth-broker-tls-cert";
 const TLS_KEY_SECRET_NAME = "auth-broker-tls-key";
 
 export async function loadTlsCredentials() {
-  if (process.env.TLS_CERT_PATH && process.env.TLS_KEY_PATH) {
-    return {
-      cert: fs.readFileSync(process.env.TLS_CERT_PATH, "utf8"),
-      key: fs.readFileSync(process.env.TLS_KEY_PATH, "utf8"),
-    };
+  try {
+    const [cert, key] = await Promise.all([
+      fetchSecretByName(TLS_CERT_SECRET_NAME),
+      fetchSecretByName(TLS_KEY_SECRET_NAME),
+    ]);
+
+    return { cert, key };
+  } catch (error) {
+    throw new Error(`TLS credentials not configured in Secret Manager: ${error.message}`);
   }
-
-  const [cert, key] = await Promise.all([
-    fetchSecretByName(TLS_CERT_SECRET_NAME),
-    fetchSecretByName(TLS_KEY_SECRET_NAME),
-  ]);
-
-  return { cert, key };
 }
 
 export function isCertExpiringSoon(certPem, thresholdDays = 30) {

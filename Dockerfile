@@ -10,7 +10,7 @@ COPY src/ ./src/
 ENV SOURCE_DATE_EPOCH=0
 ENV NODE_ENV=production
 
-LABEL "tee.launch_policy.log_redirect"="debugonly"
+LABEL "tee.launch_policy.log_redirect"="never"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
 LABEL "tee.launch_policy.allow_env_override"="GCP_PROJECT_ID,GCP_PROJECT_NUMBER,REDIRECT_URI,GOOGLE_SCOPES"
 
