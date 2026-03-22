@@ -1,7 +1,12 @@
 import https from "node:https";
 import http from "node:http";
 import { fetchSecretByName } from "./gcp-auth.js";
-import { handleLogin, handleCallback, handleRefresh } from "./routes.js";
+import {
+  handleLogin,
+  handleCallback,
+  handleRefresh,
+  handleGitHubInstallationToken,
+} from "./routes.js";
 import { handleAttestation, startAttestationRefreshLoop } from "./attestation.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { loadTlsCredentials } from "./tls.js";
@@ -21,6 +26,8 @@ const SECRETS = {
   HMAC_SECRET: "auth-broker-hmac-secret",
   BROKER_API_KEY: "broker-api-key",
   CLOUDFLARE_DNS_TOKEN: "auth-broker-cloudflare-dns-token",
+  GITHUB_APP_ID: "femled-code-agent-github-app-id",
+  GITHUB_APP_PRIVATE_KEY: "femled-code-agent-github-app-private-key",
 };
 
 async function loadSecrets() {
@@ -49,6 +56,8 @@ async function main() {
           return await handleCallback(url, req, res);
         case "/refresh":
           return await handleRefresh(req, res);
+        case "/github-app/installation-token":
+          return await handleGitHubInstallationToken(req, res);
         case "/attestation":
           return await handleAttestation(url, req, res);
         case "/health":

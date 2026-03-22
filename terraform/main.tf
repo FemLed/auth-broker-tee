@@ -192,6 +192,16 @@ data "google_secret_manager_secret" "cloudflare_dns_token" {
   depends_on = [google_project_service.secret_manager]
 }
 
+data "google_secret_manager_secret" "github_app_id" {
+  secret_id  = "femled-code-agent-github-app-id"
+  depends_on = [google_project_service.secret_manager]
+}
+
+data "google_secret_manager_secret" "github_app_private_key" {
+  secret_id  = "femled-code-agent-github-app-private-key"
+  depends_on = [google_project_service.secret_manager]
+}
+
 # ---------------------------------------------------------------------------
 # Per-secret IAM bindings for the WIF federated identity
 #
@@ -210,6 +220,8 @@ locals {
     data.google_secret_manager_secret.tls_cert.secret_id,
     data.google_secret_manager_secret.tls_key.secret_id,
     data.google_secret_manager_secret.cloudflare_dns_token.secret_id,
+    data.google_secret_manager_secret.github_app_id.secret_id,
+    data.google_secret_manager_secret.github_app_private_key.secret_id,
   ]
 
   secrets_needing_write = [
@@ -274,12 +286,12 @@ resource "google_compute_instance" "auth_broker" {
   }
 
   metadata = {
-    "tee-image-reference" = var.container_image
-    "tee-restart-policy"  = "Always"
-    "tee-env-GCP_PROJECT_ID"       = var.project_id
-    "tee-env-GCP_PROJECT_NUMBER"   = var.project_number
-    "tee-env-REDIRECT_URI"         = "https://oauth-tee.femled.ai/callback"
-    "tee-env-GOOGLE_SCOPES"        = "openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
+    "tee-image-reference"        = var.container_image
+    "tee-restart-policy"         = "Always"
+    "tee-env-GCP_PROJECT_ID"     = var.project_id
+    "tee-env-GCP_PROJECT_NUMBER" = var.project_number
+    "tee-env-REDIRECT_URI"       = "https://oauth-tee.femled.ai/callback"
+    "tee-env-GOOGLE_SCOPES"      = "openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
   }
 
   service_account {

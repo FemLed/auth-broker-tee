@@ -4,11 +4,13 @@ import { jsonResponse, textResponse, redirectResponse } from "./http-helpers.js"
 
 const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const GITHUB_API_BASE = "https://api.github.com";
 const FIRESTORE_COLLECTION = "couples";
 
 const env = (k) => process.env[k];
 
 const routeCache = new Map();
+let githubAppJwtCache = null;
 
 // ---------------------------------------------------------------------------
 // GET /login
@@ -167,6 +169,57 @@ export async function handleRefresh(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /github-app/installation-token
+// ---------------------------------------------------------------------------
+export async function handleGitHubInstallationToken(req, res) {
+  if (req.method !== "POST") {
+    return textResponse(res, 405, "Method not allowed");
+  }
+
+  const apiKey = req.headers["x-broker-api-key"];
+  if (apiKey !== env("BROKER_API_KEY")) {
+    return jsonResponse(res, 401, { error: "Unauthorized" });
+  }
+
+  const body = await readJsonBody(req);
+  if (!body) {
+    return jsonResponse(res, 400, { error: "Invalid JSON body" });
+  }
+
+  const owner = body.owner || "FemLed";
+  const repo = body.repo;
+  const permissions = sanitizeGitHubPermissions(body.permissions);
+
+  if (!repo || !isSafeRepoComponent(owner) || !isSafeRepoComponent(repo)) {
+    return jsonResponse(res, 400, { error: "owner and repo must be safe GitHub identifiers" });
+  }
+
+  if (!env("GITHUB_APP_ID") || !env("GITHUB_APP_PRIVATE_KEY")) {
+    return jsonResponse(res, 500, { error: "GitHub App secrets are not configured" });
+  }
+
+  try {
+    const appJwt = getGitHubAppJwt();
+    const installationId = await getGitHubInstallationId(appJwt, owner, repo);
+    const tokenData = await createInstallationToken(appJwt, installationId, repo, permissions);
+
+    return jsonResponse(res, 200, {
+      token: tokenData.token,
+      expiresAt: tokenData.expires_at,
+      installationId,
+      repository: { owner, repo },
+      permissions: tokenData.permissions || permissions,
+    });
+  } catch (error) {
+    console.error("GitHub installation token issue failed:", error);
+    return jsonResponse(res, 502, {
+      error: "Failed to issue GitHub installation token",
+      details: error.message,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Firestore route lookup
 // ---------------------------------------------------------------------------
 async function getApiUrlForTenant(uuid) {
@@ -241,6 +294,131 @@ function verifyState(state, secret) {
     return null;
   }
   return data;
+}
+
+function isSafeRepoComponent(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._-]+$/.test(value);
+}
+
+function sanitizeGitHubPermissions(inputPermissions) {
+  const defaultPermissions = {
+    contents: "write",
+    pull_requests: "write",
+  };
+
+  if (!inputPermissions || typeof inputPermissions !== "object") {
+    return defaultPermissions;
+  }
+
+  const allowedPermissions = new Set([
+    "contents",
+    "pull_requests",
+    "issues",
+    "checks",
+    "statuses",
+    "workflows",
+  ]);
+  const allowedLevels = new Set(["read", "write"]);
+  const sanitized = {};
+
+  for (const [key, value] of Object.entries(inputPermissions)) {
+    if (!allowedPermissions.has(key) || !allowedLevels.has(value)) {
+      continue;
+    }
+    sanitized[key] = value;
+  }
+
+  if (!sanitized.contents) sanitized.contents = "write";
+  if (!sanitized.pull_requests) sanitized.pull_requests = "write";
+
+  return sanitized;
+}
+
+function getGitHubAppJwt() {
+  const nowMs = Date.now();
+  if (githubAppJwtCache && githubAppJwtCache.expiresAt > nowMs) {
+    return githubAppJwtCache.token;
+  }
+
+  const appId = env("GITHUB_APP_ID");
+  const privateKey = normalizePem(env("GITHUB_APP_PRIVATE_KEY"));
+  const nowSeconds = Math.floor(nowMs / 1000);
+
+  const header = base64UrlEncode({ alg: "RS256", typ: "JWT" });
+  const payload = base64UrlEncode({
+    iat: nowSeconds - 60,
+    exp: nowSeconds + 9 * 60,
+    iss: appId,
+  });
+
+  const unsignedToken = `${header}.${payload}`;
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(unsignedToken);
+  signer.end();
+  const signature = signer.sign(privateKey).toString("base64url");
+  const token = `${unsignedToken}.${signature}`;
+
+  githubAppJwtCache = {
+    token,
+    expiresAt: nowMs + 8 * 60 * 1000,
+  };
+
+  return token;
+}
+
+function normalizePem(value) {
+  return value.includes("\\n") ? value.replace(/\\n/g, "\n") : value;
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+async function getGitHubInstallationId(appJwt, owner, repo) {
+  const response = await fetch(`${GITHUB_API_BASE}/repos/${owner}/${repo}/installation`, {
+    method: "GET",
+    headers: githubHeaders(appJwt),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`GitHub installation lookup failed (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json();
+  if (!data.id) {
+    throw new Error("GitHub installation lookup returned no installation id");
+  }
+
+  return data.id;
+}
+
+async function createInstallationToken(appJwt, installationId, repo, permissions) {
+  const response = await fetch(`${GITHUB_API_BASE}/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: githubHeaders(appJwt),
+    body: JSON.stringify({
+      repositories: [repo],
+      permissions,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`GitHub installation token creation failed (${response.status}): ${errorText}`);
+  }
+
+  return response.json();
+}
+
+function githubHeaders(bearerToken) {
+  return {
+    Authorization: `Bearer ${bearerToken}`,
+    Accept: "application/vnd.github+json",
+    "Content-Type": "application/json",
+    "User-Agent": "FemLed-Auth-Broker",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
 }
 
 // ---------------------------------------------------------------------------
