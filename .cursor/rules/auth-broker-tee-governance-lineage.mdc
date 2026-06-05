@@ -1,0 +1,147 @@
+---
+description: Define auth-broker-tee lineage continuation vs operator re-genesis
+alwaysApply: true
+---
+
+# Auth Broker TEE Governance Lineage
+
+Before changing, deploying, or reviewing `auth-broker-tee`, classify the task as one of:
+
+1. **Lineage continuation**
+   - Default path for normal updates.
+   - The active TEE must approve the exact candidate.
+   - Candidate starts inactive.
+   - Activation requires predecessor-signed successor certificate, candidate
+     attestation, encrypted state transfer, candidate activation proof, and
+     predecessor finalization/retirement.
+   - Do not replace the active VM directly for a normal update.
+
+2. **Operator-authorized re-genesis**
+   - Explicit lineage reset.
+   - Only valid when the user explicitly says to abandon the current lineage or start a new genesis.
+   - Do not describe this as predecessor-approved.
+   - State clearly that continuity is broken and the new TEE is trusted from genesis onward.
+   - Pin exact image digest, source revision, prompt digest, model policy digest, and verification evidence.
+
+## Lineage Continuation Handoff
+
+The inactive-to-active successor flow is:
+
+1. Build and sign the candidate image through the canonical workflow. CI,
+   Artifact Registry, GitHub reviews, and Cloud Build are evidence only.
+2. Open a temporary Terraform `candidate_image_digests` WIF window for the
+   exact candidate image digest, then launch the candidate as a separate
+   inactive TEE. Do not attach production traffic or replace the active VM.
+   Inactive candidates may serve health, attestation, governance/policy
+   manifests, and activation-apply routes only.
+3. Ask the active predecessor for `/governance/preapprove` using the exact
+   candidate image digest, manifest/config evidence, and complete
+   governance-critical source evidence.
+4. Ask the active predecessor for `/governance/activation-offer` with the
+   predecessor-signed preapproval plus the candidate governance public key,
+   activation public key, and image digest. This creates the activation nonce.
+5. Fetch candidate attestation bound to that activation nonce. The predecessor
+   then calls `/governance/activation-complete`, verifies nonce/image/key
+   binding, performs activation-time Gemini successor arbitration, signs the
+   successor certificate, encrypts transferable state, and enters
+   `activating_successor`. It must NOT retire yet.
+6. Apply the returned activation bundle to the inactive candidate with
+   `/governance/activation-apply`. The candidate must return a signed
+   `activationProof` for the exact successor payload digest, nonce, image
+   digest, lineage digest, and epoch.
+7. Submit that proof to the predecessor with `/governance/activation-finalize`.
+   Only after finalization may the predecessor retire.
+8. Move production traffic only after the candidate reports `status: active`,
+   the next epoch, and a lineage ending in the predecessor-signed successor
+   certificate.
+9. After production traffic moves, tenants poll the live attested
+   governance/policy manifests from their own projects and accept only lineages
+   that extend their previously accepted broker state. Tenant polling is
+   post-activation maintenance, not governance authority.
+
+If `/governance/activation-complete` succeeds but activation apply or
+finalization fails, the predecessor must remain non-retired. Recover by fixing
+the exact candidate/apply problem or retrying the bounded handoff. Do not start
+a fresh genesis unless the user explicitly authorizes operator re-genesis and
+accepts broken continuity.
+
+### Automation vs Manual Operator Steps
+
+The guarded `build-and-attest.yml` successor activation job may automate only
+the bounded lineage-continuation handoff for the exact image digest produced by
+that same workflow run.
+
+Automated steps:
+
+1. Open temporary candidate WIF access using only constrained mechanisms:
+   resource-level Secret Manager / Artifact Registry bindings plus the
+   constrained candidate project-role reconciler for `roles/aiplatform.user`
+   and `roles/serviceusage.serviceUsageConsumer`.
+2. Create a separate inactive candidate VM when explicitly enabled, or use a
+   pre-created candidate IP supplied by the operator.
+3. Verify candidate `/health`, attestation/governance evidence, inactive
+   status, and exact image digest.
+4. Mint the governance-audience GitHub OIDC token from
+   `build-and-attest.yml@refs/heads/master` on a `push` event.
+5. Run `/governance/preapprove`, `/governance/activation-offer`,
+   `/governance/activation-complete`, `/governance/activation-apply`, and
+   `/governance/activation-finalize` through `scripts/activate-successor.mjs`.
+6. Upload activation evidence artifacts for review.
+
+Manual steps that remain required:
+
+1. Enable the guarded workflow variables deliberately:
+   `ENABLE_SUCCESSOR_ACTIVATION`, and either `SUCCESSOR_CANDIDATE_IP` or
+   `ENABLE_SUCCESSOR_CANDIDATE_CREATE`.
+2. Review the activation evidence after the workflow finishes.
+3. Move production traffic / DNS only after the candidate reports
+   `status: active`, the next epoch, and lineage ending in the predecessor-
+   signed successor certificate.
+4. Run `scripts/reconcile-active-tee-iam.mjs` and review/apply the resulting
+   Terraform inputs to promote `container_image_digest` and remove temporary
+   candidate digests.
+5. Trigger tenant trust polling after production traffic points at the active
+   successor.
+6. Delete retired predecessor/candidate VMs only after live DNS and tenant
+   verification point at the active successor.
+
+The automation must not move DNS, mutate production traffic, promote Terraform
+state, delete retired TEEs, or perform operator-authorized re-genesis. Those
+remain explicit operator actions because they affect external routing,
+infrastructure state, and rollback/recovery.
+
+## Tenant Route Document Signing
+
+When publishing or rotating `auth_broker_route_documents/{tenantId}`, the
+tenant route payload must be signed by the tenant-held KMS key over the exact
+canonical route payload bytes the broker verifies.
+
+Correct operational sequence:
+
+1. Build a `femled.auth_broker.tenant_registration.v1` payload containing the
+   tenant route public key, algorithm, KMS key version, allowed API/app hosts,
+   broker audience, minimum route version, and short expiry. Sign that payload
+   with the tenant-held route private key / KMS key.
+2. Ask the currently active TEE for `/governance/tenant-admission` with the
+   same fields plus the signed registration envelope. GitHub OIDC is not
+   tenant admission authority.
+3. Build the route payload as canonical JSON using the same sorted-key
+   canonicalization as `src/canonical-json.js`.
+4. Sign the canonical JSON payload file itself with tenant KMS, for example:
+   `gcloud kms asymmetric-sign --digest-algorithm=sha256 --input-file=<canonical-payload.json> --signature-file=<route.sig> ...`.
+5. Verify locally with `crypto.verify("sha256", canonicalPayloadBytes,
+   tenantPublicKey, signatureBytes)` before writing Firestore.
+6. Write the route document containing the fresh `admissionEnvelope` and
+   tenant-signed `routeEnvelope`.
+
+Admission envelopes are tied to the active TEE governance key and lineage that
+signed them. If the active TEE reboots or re-genesis occurs, discard old
+admissions and request a fresh admission before publishing a route document.
+Route registry refresh should happen in process; do not reboot the active TEE
+just to refresh routes, because that loses in-memory governance state.
+
+Hard-coded checks may enforce only mechanically provable invariants: image/config/attestation digest equality, nonce binding, candidate key binding, complete source evidence, parseability, launch policy constraints, and forbidden dynamic imports or unbounded secrets access.
+
+Intent, meaning, policy alignment, recovery semantics, and suspicious language belong to Gemini First Principles review, not regex hard vetoes.
+
+GitHub reviews, GitHub status checks, Cloud Build, Artifact Registry, Terraform, GCP IAM, and operator identity are evidence or orchestration only. They are not TEE governance authority.

@@ -1,0 +1,14 @@
+{
+  "name": "femled-auth-broker-compliance",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated compliance-checker dependencies for auth-broker-tee. Not shipped in the TEE image.",
+  "type": "module",
+  "scripts": {
+    "check": "bash run.sh"
+  },
+  "dependencies": {
+    "acorn": "8.12.1",
+    "acorn-walk": "8.3.4"
+  }
+}

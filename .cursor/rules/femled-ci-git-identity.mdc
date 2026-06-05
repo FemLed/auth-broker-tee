@@ -1,0 +1,104 @@
+---
+description: Require FemLed-CI identity for auth-broker-tee git, PR, and release operations
+alwaysApply: true
+---
+
+# Auth Broker GitHub Identity Boundary
+
+The `auth-broker-tee` repository is privacy-sensitive. Do not associate a
+personal GitHub account with repository write operations or release decisions.
+
+Required identity boundary:
+
+- `FemLed-CI`: creates all code commits, including commits added to pull
+  request branches, pushes branches, opens pull requests, and merges after
+  required status checks pass.
+
+When working in this repository:
+
+- Do not create code commits using a personal/user GitHub identity, including
+  commits made while opening, updating, or fixing pull requests.
+- Do not push branches using a personal/user GitHub token.
+- Do not open, close, merge, or otherwise manage pull requests using a
+  personal/user GitHub identity.
+- Do not bypass branch protection, required signatures, or
+  required status checks.
+- Any commit, push, branch creation, pull request creation, merge, or
+  release/deploy action must be performed through `FemLed-CI`.
+- Do not introduce a machine-user PR approval shim. The TEE First Principles
+  status check is the review gate; GitHub PR approvals are not the trust root.
+
+If the active git/GitHub identity is not clearly the correct app identity for
+the operation, stop before any write operation and ask the user to switch
+credentials or provide the approved CI mechanism.
+
+## Minting a FemLed-CI GitHub App Token
+
+Use a short-lived GitHub App installation token from GCP Secret Manager. Do not
+use `gh auth login`, the keychain token, or a personal PAT for write operations.
+
+```bash
+APP_ID=$(gcloud secrets versions access latest \
+  --project="prod-femled-couple-router" \
+  --secret="femled-ci-github-app-id")
+
+PRIVATE_KEY=$(gcloud secrets versions access latest \
+  --project="prod-femled-couple-router" \
+  --secret="femled-ci-github-app-private-key")
+
+GH_TOKEN=$(APP_ID="$APP_ID" PRIVATE_KEY="$PRIVATE_KEY" node --input-type=module <<'NODE'
+import crypto from 'node:crypto';
+
+const owner = 'FemLed';
+const repo = 'auth-broker-tee';
+
+function b64url(value) {
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+
+function appJwt() {
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64url({ alg: 'RS256', typ: 'JWT' });
+  const payload = b64url({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID });
+  const unsigned = `${header}.${payload}`;
+  const key = process.env.PRIVATE_KEY.replace(/\\n/g, '\n');
+  const sig = crypto.sign('RSA-SHA256', Buffer.from(unsigned), key).toString('base64url');
+  return `${unsigned}.${sig}`;
+}
+
+async function api(path, { method = 'GET', token, body } = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'FemLed-CI-token-mint',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  const json = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new Error(`${method} ${path} failed ${response.status}: ${text}`);
+  return json;
+}
+
+const jwt = appJwt();
+const installation = await api(`/repos/${owner}/${repo}/installation`, { token: jwt });
+const token = await api(`/app/installations/${installation.id}/access_tokens`, {
+  method: 'POST',
+  token: jwt,
+});
+
+process.stdout.write(token.token);
+NODE
+)
+
+export GH_TOKEN
+gh api user --jq .login
+```
+
+After use, run `unset GH_TOKEN APP_ID PRIVATE_KEY`. Never print or commit the
+token or private key. Request narrower installation permissions in the Node
+body when a task only needs a subset of the app's granted permissions.

@@ -1,0 +1,16 @@
+# Builds for auth-broker-tee no longer go through Cloud Build.
+# The build pipeline is now [.github/workflows/build-and-attest.yml](.github/workflows/build-and-attest.yml),
+# which runs on GitHub Actions, signs each image keyless via Sigstore,
+# and publishes an in-toto compliance attestation to Rekor.
+#
+# Why the move: Cloud Build's signing identity is a GCP service account
+# under the project owner's control, which weakens the supply-chain
+# trust property. GitHub Actions OIDC issues an identity tied to the
+# specific workflow file on the specific branch, which the operator
+# cannot re-issue without a public commit and a new Sigstore Rekor
+# entry. See SUPPLY_CHAIN_BOOTSTRAP.md.
+#
+# If you reach this file via muscle memory: stop running `gcloud builds
+# submit`, push to master on https://github.com/FemLed/auth-broker-tee
+# instead. If you must build outside CI, the GHA workflow is fully
+# reproducible -- follow VERIFICATION.md Step 2.

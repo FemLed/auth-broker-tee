@@ -1,0 +1,833 @@
+## Build, attest, and publish the auth-broker-tee container image.
+##
+## What this workflow guarantees on every push to master:
+##
+##  1. Every check defined in .compliance/ passed (gates the build).
+##  2. The image was built reproducibly: building twice in independent
+##     stages produces identical SHA-256 manifest digests. Mismatch fails.
+##  3. The image is signed in Sigstore by THIS workflow's GitHub OIDC
+##     identity (cert SAN encodes repo + workflow path + branch). The
+##     signature is logged in Rekor (public, append-only).
+##  4. The compliance predicate (every check's status, plus the rules
+##     digest, plus branch-protection findings) is itself signed in
+##     Sigstore with the same identity and stored as an in-toto
+##     attestation against the image.
+##  5. PR approval and push-side image signing require a signed First
+##     Principles adjudication from the currently deployed TEE.
+##
+## On pull requests, only the compliance gate runs -- no GCP push, no
+## signing -- so reviewers see whether the change passes before merge.
+##
+## See SUPPLY_CHAIN_BOOTSTRAP.md for the deploy sequencing this depends on.
+
+name: build-and-attest
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Note: no `workflow_dispatch` trigger. The push-side WIF provider in
+  # terraform/supply-chain.tf only honors tokens whose `event_name == 'push'`,
+  # so manual dispatch could not authenticate to GCP anyway -- adding it
+  # would create operational pressure to weaken the WIF policy.
+
+permissions:
+  contents: read
+  id-token: write     # OIDC for Sigstore keyless + GCP WIF
+  packages: read
+  pull-requests: write
+
+env:
+  IMAGE_REGISTRY: us-west1-docker.pkg.dev
+  IMAGE_REPO: auth-broker
+  IMAGE_NAME: auth-broker-tee
+  REPAIR_WORKER_IMAGE_NAME: auth-broker-tee-repair-worker
+  GCP_PROJECT_ID: prod-femled-couple-router
+  # Cloud KMS key used to produce a Confidential Space-compatible image
+  # signature (separate from the keyless Sigstore signature used for the
+  # public Rekor entry). Points at the CRYPTO KEY (not a specific
+  # version) so cosign signs with whatever version is currently primary
+  # in KMS. Rotation is therefore "promote a new key version to
+  # primary" without touching this workflow file. Mirror of
+  # `image_signer_kms_key_uri` Terraform output WITHOUT the
+  # `/cryptoKeyVersions/...` suffix.
+  COSIGN_KMS_KEY_URI: gcpkms://projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-cosign/cryptoKeys/image-signer
+  # Confidential Space signed-image flow only honors signatures that
+  # carry these two annotations (per Google's signed-container codelab).
+  # The signing algorithm MUST match
+  # `cosign_kms_attestation_signature_algorithm` in Terraform.
+  COSIGN_SIG_ALGORITHM: ECDSA_P256_SHA256
+
+jobs:
+  compliance:
+    name: compliance gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      rules_digest: ${{ steps.compliance.outputs.rules_digest }}
+      summary_path: ${{ steps.compliance.outputs.summary_path }}
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ".compliance/package-lock.json"
+
+      - name: Install .compliance/ dependencies
+        run: npm ci --prefix .compliance --prefer-offline --no-audit --no-fund --ignore-scripts
+
+      - name: Install Semgrep
+        run: |
+          python3 -m pip install --quiet "semgrep==1.86.0"
+          semgrep --version
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin v1.14.1
+          syft version
+
+      - name: Install OSV-Scanner
+        run: |
+          OSV_VERSION="1.9.2"
+          curl -sSL -o /usr/local/bin/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Run compliance suite
+        id: compliance
+        env:
+          STRICT: "true"
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PROTECTED_BRANCH: master
+          GITHUB_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GITHUB_REF: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          bash .compliance/run.sh
+          rules_digest=$(jq -r .compliance_rules_digest .compliance-results/summary.json)
+          echo "rules_digest=${rules_digest}" >> "$GITHUB_OUTPUT"
+          echo "summary_path=.compliance-results/summary.json" >> "$GITHUB_OUTPUT"
+
+      - name: Upload compliance summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-summary
+          path: |
+            .compliance-results/
+          include-hidden-files: true
+          retention-days: 90
+
+      - name: Comment compliance digest on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = JSON.parse(fs.readFileSync('.compliance-results/summary.json', 'utf8'));
+            const checks = Object.entries(summary.results)
+              .map(([name, body]) => `| \`${name}\` | ${body?.status ?? 'unknown'} |`)
+              .join('\n');
+            const body = [
+              '### auth-broker-tee compliance summary',
+              '',
+              `**Rules digest:** \`${summary.compliance_rules_digest}\``,
+              `**Overall:** \`${summary.overall_status}\``,
+              '',
+              '| Check | Status |',
+              '| --- | --- |',
+              checks,
+              '',
+              '_If this PR changes any file under `.compliance/`, the rules digest will differ from the digest pinned by external verifiers. Communicate the new digest in release notes._',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  tee-first-principles-review:
+    name: tee-first-principles-review
+    needs: compliance
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      decision: ${{ steps.review-mode.outputs.decision }}
+      key_id: ${{ steps.verify.outputs.key_id }}
+      model: ${{ steps.verify.outputs.model }}
+      policy_version: ${{ steps.verify.outputs.policy_version }}
+      mode: ${{ steps.review-mode.outputs.mode }}
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Download compliance summary from gate job
+        uses: actions/download-artifact@v4
+        with:
+          name: compliance-summary
+          path: .compliance-results/
+
+      - name: Build adjudication request
+        run: node .github/scripts/create-first-principles-request.mjs first-principles-request.json
+
+      # Image signing UNCONDITIONALLY requires a signed APPROVE First Principles
+      # adjudication from the active TEE. There is deliberately no bootstrap /
+      # break-glass bypass: GitHub repository variables, branch protection, or
+      # admin identity must never become a governance root of trust. Recovery
+      # from a lost lineage is the operator-genesis path against a live attested
+      # reviewer, not a CI flag.
+      - name: Determine TEE review mode
+        id: review-mode
+        env:
+          AUTH_BROKER_URL: ${{ vars.AUTH_BROKER_URL || 'https://oauth-tee.femled.ai' }}
+        run: |
+          echo "mode=active-tee" >> "$GITHUB_OUTPUT"
+          echo "decision=APPROVE" >> "$GITHUB_OUTPUT"
+          echo "url=${AUTH_BROKER_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Request GitHub OIDC token for TEE
+        id: oidc
+        env:
+          AUDIENCE: https://oauth-tee.femled.ai/first-principles
+        run: |
+          token_json=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(echo "${token_json}" | jq -r .value)
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC token for TEE adjudication"
+            exit 1
+          fi
+          {
+            echo "token<<EOF"
+            echo "${token}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask TEE to adjudicate First Principles
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          AUTH_BROKER_URL: ${{ steps.review-mode.outputs.url }}
+        run: |
+          curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @first-principles-request.json \
+            "${AUTH_BROKER_URL}/first-principles/adjudicate" \
+            > first-principles-response.json
+
+      - name: Verify signed TEE adjudication
+        id: verify
+        env:
+          FIRST_PRINCIPLES_TEE_EXPECTED_IMAGE_DIGEST: ${{ vars.FIRST_PRINCIPLES_TEE_EXPECTED_IMAGE_DIGEST }}
+          FIRST_PRINCIPLES_EXPECTED_PROMPT_DIGEST: ${{ vars.FIRST_PRINCIPLES_EXPECTED_PROMPT_DIGEST }}
+        run: |
+          node .github/scripts/verify-first-principles-adjudication.mjs \
+            --request first-principles-request.json \
+            --response first-principles-response.json \
+            --require-approve
+
+      - name: Upload signed TEE adjudication
+        uses: actions/upload-artifact@v4
+        with:
+          name: tee-first-principles-adjudication
+          path: |
+            first-principles-request.json
+            first-principles-response.json
+          retention-days: 90
+
+  build-and-sign:
+    name: build, sign, attest
+    needs:
+      - compliance
+      - tee-first-principles-review
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image_digest: ${{ steps.compare.outputs.digest }}
+      image_ref: ${{ steps.compare.outputs.image_ref }}
+      repair_worker_image_digest: ${{ steps.build_repair_worker.outputs.digest }}
+      repair_worker_image_ref: ${{ steps.build_repair_worker.outputs.image_ref }}
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download compliance summary from gate job
+        uses: actions/download-artifact@v4
+        with:
+          name: compliance-summary
+          path: .compliance-results/
+
+      - name: Authenticate to GCP via WIF
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          # WIF principal for the build-and-attest workflow on master only.
+          # The workload_identity_provider must match the resource defined
+          # in terraform/main.tf (google_iam_workload_identity_pool_provider.github_oidc).
+          workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
+          service_account: gh-actions-publisher@prod-femled-couple-router.iam.gserviceaccount.com
+          access_token_lifetime: 1200s
+
+      - name: Configure docker for Artifact Registry
+        run: |
+          echo "${{ steps.gcp-auth.outputs.access_token }}" \
+            | docker login -u oauth2accesstoken --password-stdin ${IMAGE_REGISTRY}
+
+      - name: Setup buildx (docker-container driver, matches reproducible build)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1
+
+      - name: Build image -- attempt 1
+        id: build1
+        run: |
+          IMAGE_PATH="${IMAGE_REGISTRY}/${GCP_PROJECT_ID}/${IMAGE_REPO}/${IMAGE_NAME}"
+          STAGING_TAG="${IMAGE_PATH}:staging-${{ github.run_id }}-${{ github.run_attempt }}-1"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --no-cache \
+            --build-arg SOURCE_DATE_EPOCH=0 \
+            --build-arg COMMIT_SHA=${{ github.sha }} \
+            --output "type=registry,rewrite-timestamp=true,name=${STAGING_TAG}" \
+            --metadata-file metadata-1.json \
+            .
+          digest=$(jq -r '."containerimage.digest"' metadata-1.json)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_path=${IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Build 1 digest: ${digest}"
+
+      - name: Build image -- attempt 2 (independent runner stage)
+        id: build2
+        run: |
+          IMAGE_PATH="${{ steps.build1.outputs.image_path }}"
+          STAGING_TAG="${IMAGE_PATH}:staging-${{ github.run_id }}-${{ github.run_attempt }}-2"
+          # Fresh builder to avoid any cached layers
+          docker buildx prune -af >/dev/null 2>&1 || true
+          docker buildx rm builder-2 >/dev/null 2>&1 || true
+          docker buildx create --name builder-2 \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:buildx-stable-1 \
+            --use
+          docker buildx build \
+            --builder builder-2 \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --no-cache \
+            --build-arg SOURCE_DATE_EPOCH=0 \
+            --build-arg COMMIT_SHA=${{ github.sha }} \
+            --output "type=registry,rewrite-timestamp=true,name=${STAGING_TAG}" \
+            --metadata-file metadata-2.json \
+            .
+          digest=$(jq -r '."containerimage.digest"' metadata-2.json)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Build 2 digest: ${digest}"
+
+      - name: Compare reproducible-build digests
+        id: compare
+        run: |
+          d1='${{ steps.build1.outputs.digest }}'
+          d2='${{ steps.build2.outputs.digest }}'
+          if [[ -z "${d1}" || -z "${d2}" || "${d1}" != "${d2}" ]]; then
+            echo "::error::Reproducible build mismatch: ${d1} vs ${d2}"
+            exit 1
+          fi
+          echo "Reproducible build PASSED: ${d1}"
+          echo "digest=${d1}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${{ steps.build1.outputs.image_path }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install crane
+        run: |
+          CRANE_VERSION="0.20.2"
+          curl -sSL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin crane
+          crane version
+
+      - name: Promote staging digest to immutable tags
+        run: |
+          IMAGE_PATH='${{ steps.compare.outputs.image_ref }}'
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-12)
+          crane copy "${IMAGE_PATH}@${DIGEST}" "${IMAGE_PATH}:${SHORT_SHA}"
+          crane copy "${IMAGE_PATH}@${DIGEST}" "${IMAGE_PATH}:latest"
+          # Clean up staging tags
+          crane delete "${{ steps.build1.outputs.staging_tag }}" || true
+          crane delete "${{ steps.build2.outputs.staging_tag }}" || true
+
+      - name: Build and push repair-worker image
+        id: build_repair_worker
+        run: |
+          REPAIR_IMAGE_PATH="${IMAGE_REGISTRY}/${GCP_PROJECT_ID}/${IMAGE_REPO}/${REPAIR_WORKER_IMAGE_NAME}"
+          SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-12)
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --no-cache \
+            -f Dockerfile.repair-worker \
+            -t "${REPAIR_IMAGE_PATH}:${SHORT_SHA}" \
+            -t "${REPAIR_IMAGE_PATH}:latest" \
+            --push \
+            --metadata-file repair-worker-metadata.json \
+            .
+          digest=$(jq -r '."containerimage.digest"' repair-worker-metadata.json)
+          if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+            echo "::error::Failed to resolve repair-worker image digest"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${REPAIR_IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Repair-worker digest: ${digest}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Cosign keyless sign image (Fulcio + Rekor, public chain)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE_PATH='${{ steps.compare.outputs.image_ref }}'
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          cosign sign --yes \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${IMAGE_PATH}@${DIGEST}"
+
+      - name: Capture Cosign KMS public key + fingerprint
+        id: kms_fp
+        run: |
+          # Pulls the PRIMARY-version public key from KMS. Confidential
+          # Space's launcher uses `key_id` (this fingerprint) to
+          # identify which `image_signatures[]` entry came from which
+          # key; the WIF CEL condition pins exactly that key_id.
+          cosign public-key --key "${COSIGN_KMS_KEY_URI}" > cosign-kms.pub
+          fingerprint=$(openssl pkey -pubin -in cosign-kms.pub -outform DER \
+            | openssl dgst -sha256 \
+            | awk '{print $2}')
+          # Base64-encode the PEM for the cosign annotation in the
+          # unpadded, single-line form used by Google's signed-container
+          # codelab. macOS / GNU base64 differ on -w, so normalize with
+          # tr/sed instead of relying on base64 flags.
+          pub_b64=$(base64 < cosign-kms.pub | tr -d '\n' | sed 's/=*$//')
+          echo "fingerprint=${fingerprint}" >> "$GITHUB_OUTPUT"
+          echo "pub_b64=${pub_b64}" >> "$GITHUB_OUTPUT"
+          echo "Cosign KMS key fingerprint: ${fingerprint}"
+
+      - name: Cosign KMS sign image (Confidential Space enforcement chain)
+        run: |
+          IMAGE_PATH='${{ steps.compare.outputs.image_ref }}'
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          # Two Confidential Space-required annotations on the
+          # signature payload: the launcher refuses to honor signatures
+          # that do not carry both
+          # `dev.cosignproject.cosign/sigalg` (algorithm enum) and
+          # `dev.cosignproject.cosign/pub` (base64-encoded PEM of the
+          # public key). Without these, the signature still ends up in
+          # the Cosign signature OCI artifact but does NOT show up as a
+          # verified entry in `assertion.submods.container.image_signatures`,
+          # so the WIF condition rejects every token.
+          #
+          # The keyless signature created above is unaffected -- it
+          # remains the source of truth for the public Rekor chain
+          # checked by the standalone verifier. These annotations are
+          # specific to the KMS-signed signature only.
+          cosign sign --yes \
+            --key "${COSIGN_KMS_KEY_URI}" \
+            -a "dev.cosignproject.cosign/sigalg=${COSIGN_SIG_ALGORITHM}" \
+            -a "dev.cosignproject.cosign/pub=${{ steps.kms_fp.outputs.pub_b64 }}" \
+            --tlog-upload=false \
+            "${IMAGE_PATH}@${DIGEST}"
+
+      - name: Build in-toto compliance predicate
+        id: predicate
+        run: |
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          # cosign attest --predicate <file> takes JUST the predicate body;
+          # it wraps the file in the in-toto statement itself.
+          cp .compliance-results/summary.json predicate.json
+
+          # Inject runtime context absent from the local-run summary,
+          # including the tee-first-principles-review decision (either
+          # APPROVE from the active TEE or BOOTSTRAP_WITHOUT_ACTIVE_TEE
+          # from the operator-authorized bypass) so external verifiers can
+          # see exactly which path this build took.
+          jq --arg image_digest "${DIGEST}" \
+             --arg image_ref '${{ steps.compare.outputs.image_ref }}' \
+             --arg sha '${{ github.sha }}' \
+             --arg ref '${{ github.ref }}' \
+             --arg run_id '${{ github.run_id }}' \
+             --arg run_attempt '${{ github.run_attempt }}' \
+             --arg workflow_ref '${{ github.workflow_ref }}' \
+             --arg sbom_digest_b1 "$(sha256sum metadata-1.json | cut -d' ' -f1)" \
+             --arg kms_fingerprint '${{ steps.kms_fp.outputs.fingerprint }}' \
+             --arg kms_algorithm 'ECDSA_P256_SHA256' \
+             --arg tee_review_decision '${{ needs.tee-first-principles-review.outputs.decision }}' \
+             --arg tee_review_mode '${{ needs.tee-first-principles-review.outputs.mode }}' \
+             '.image_digest = $image_digest
+              | .image_reference = $image_ref
+              | .commit_sha = $sha
+              | .ref = $ref
+              | .workflow_ref = $workflow_ref
+              | .run_id = $run_id
+              | .run_attempt = $run_attempt
+              | .reproducible_build = {status: "passed", digest_attempts_matched: 2}
+              | .cosign_kms_signature = {
+                  status: "passed",
+                  key_fingerprint: $kms_fingerprint,
+                  signature_algorithm: $kms_algorithm
+                }
+              | .tee_first_principles_review = {
+                  status: $tee_review_decision,
+                  mode: $tee_review_mode
+                }
+             ' predicate.json > predicate.tmp && mv predicate.tmp predicate.json
+
+          echo "Predicate body:"
+          cat predicate.json
+
+      - name: Cosign attest compliance predicate
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          IMAGE_PATH='${{ steps.compare.outputs.image_ref }}'
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          cosign attest --yes \
+            --predicate predicate.json \
+            --type "https://femled.ai/attestations/auth-broker-compliance/v1" \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${IMAGE_PATH}@${DIGEST}"
+
+      - name: Emit deploy-ready summary
+        run: |
+          IMAGE_PATH='${{ steps.compare.outputs.image_ref }}'
+          DIGEST='${{ steps.compare.outputs.digest }}'
+          REPAIR_IMAGE_PATH='${{ steps.build_repair_worker.outputs.image_ref }}'
+          REPAIR_DIGEST='${{ steps.build_repair_worker.outputs.digest }}'
+          SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-12)
+          {
+            echo "## Build attested"
+            echo ""
+            echo "**Image digest:** \`${DIGEST}\`"
+            echo "**Repair-worker image digest:** \`${REPAIR_DIGEST}\`"
+            echo "**Tags pushed:** \`${SHORT_SHA}\`, \`latest\`"
+            echo "**Compliance rules digest:** \`${{ needs.compliance.outputs.rules_digest }}\`"
+            echo ""
+            echo "### Verify from any non-FemLed machine"
+            echo ""
+            echo "\`\`\`bash"
+            echo "verifier --pinned-image-digest ${DIGEST} --pinned-rules-digest ${{ needs.compliance.outputs.rules_digest }}"
+            echo "\`\`\`"
+            echo ""
+            echo "### Look up in Rekor"
+            echo ""
+            echo "\`\`\`bash"
+            echo "rekor-cli search --sha ${DIGEST#sha256:}"
+            echo "\`\`\`"
+            echo ""
+            echo "### Deploy"
+            echo ""
+            echo "Update terraform.tfvars with:"
+            echo "\`\`\`hcl"
+            echo "container_image        = \"${IMAGE_PATH}:${SHORT_SHA}\""
+            echo "container_image_digest = \"${DIGEST}\""
+            echo "repair_worker_image   = \"${REPAIR_IMAGE_PATH}\""
+            echo "repair_worker_image_digest = \"${REPAIR_DIGEST}\""
+            echo "\`\`\`"
+            echo ""
+            echo "Then run \`terraform apply\` and recreate the Confidential VM."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  successor-activation:
+    name: successor activation
+    needs:
+      - compliance
+      - build-and-sign
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/master' &&
+      vars.ENABLE_SUCCESSOR_ACTIVATION == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download compliance summary from gate job
+        uses: actions/download-artifact@v4
+        with:
+          name: compliance-summary
+          path: .compliance-results/
+
+      - name: Validate activation inputs
+        id: activation-inputs
+        env:
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+          SUCCESSOR_CANDIDATE_IP: ${{ vars.SUCCESSOR_CANDIDATE_IP }}
+          SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
+          ENABLE_SUCCESSOR_CANDIDATE_CREATE: ${{ vars.ENABLE_SUCCESSOR_CANDIDATE_CREATE }}
+        run: |
+          if [[ -z "${CANDIDATE_IMAGE_DIGEST}" ]]; then
+            echo "::error::build-and-sign did not expose an image digest"
+            exit 1
+          fi
+          if [[ -z "${SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT}" ]]; then
+            echo "::error::SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT must name the deploy/activation service account"
+            exit 1
+          fi
+          if [[ "${SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT}" == "gh-actions-publisher@prod-femled-couple-router.iam.gserviceaccount.com" ]]; then
+            echo "::error::Do not use gh-actions-publisher for successor activation; keep image publishing separate from deploy authority"
+            exit 1
+          fi
+          digest_hex="${CANDIDATE_IMAGE_DIGEST#sha256:}"
+          candidate_vm_name="auth-broker-tee-candidate-${digest_hex:0:12}"
+          if [[ -n "${SUCCESSOR_CANDIDATE_IP}" ]]; then
+            if [[ ! "${SUCCESSOR_CANDIDATE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::SUCCESSOR_CANDIDATE_IP must be an IPv4 address"
+              exit 1
+            fi
+            echo "mode=prepared" >> "$GITHUB_OUTPUT"
+            echo "candidate_ip=${SUCCESSOR_CANDIDATE_IP}" >> "$GITHUB_OUTPUT"
+          elif [[ "${ENABLE_SUCCESSOR_CANDIDATE_CREATE}" == "true" ]]; then
+            echo "mode=managed" >> "$GITHUB_OUTPUT"
+            echo "candidate_vm_name=${candidate_vm_name}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::SUCCESSOR_CANDIDATE_IP is required unless ENABLE_SUCCESSOR_CANDIDATE_CREATE is true"
+            exit 1
+          fi
+          test -s .compliance-results/summary.json
+
+      - name: Authenticate to GCP for activation evidence
+        id: activation-gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
+          service_account: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
+          access_token_lifetime: 1200s
+
+      - name: Setup gcloud for activation evidence
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Open resource-level candidate IAM
+        if: steps.activation-inputs.outputs.mode == 'managed'
+        env:
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+        run: |
+          node scripts/reconcile-candidate-resource-iam.mjs \
+            --operation grant \
+            --candidate-image-digest "${CANDIDATE_IMAGE_DIGEST}"
+
+      - name: Open constrained project-level candidate IAM
+        if: steps.activation-inputs.outputs.mode == 'managed'
+        env:
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+        run: |
+          gcloud run jobs execute auth-broker-candidate-role-reconciler \
+            --project="${GCP_PROJECT_ID}" \
+            --region=us-west1 \
+            --wait \
+            --update-env-vars="RECONCILE_OPERATION=grant,CANDIDATE_IMAGE_DIGEST=${CANDIDATE_IMAGE_DIGEST}"
+
+      - name: Create inactive candidate VM
+        if: steps.activation-inputs.outputs.mode == 'managed'
+        id: create-candidate
+        env:
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+          CANDIDATE_IMAGE_REF: ${{ needs.build-and-sign.outputs.image_ref }}
+          CANDIDATE_VM_NAME: ${{ steps.activation-inputs.outputs.candidate_vm_name }}
+        run: |
+          if gcloud compute instances describe "${CANDIDATE_VM_NAME}" \
+              --project="${GCP_PROJECT_ID}" \
+              --zone=us-west1-b >/dev/null 2>&1; then
+            echo "::error::Candidate VM ${CANDIDATE_VM_NAME} already exists"
+            exit 1
+          fi
+          gcloud compute instances create "${CANDIDATE_VM_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone=us-west1-b \
+            --machine-type=n2d-standard-2 \
+            --confidential-compute \
+            --maintenance-policy=TERMINATE \
+            --image-family=confidential-space \
+            --image-project=confidential-space-images \
+            --boot-disk-size=20GB \
+            --boot-disk-type=pd-balanced \
+            --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+            --scopes=cloud-platform \
+            --tags=auth-broker-tee \
+            --shielded-secure-boot \
+            --shielded-vtpm \
+            --shielded-integrity-monitoring \
+            --metadata="tee-image-reference=${CANDIDATE_IMAGE_REF}@${CANDIDATE_IMAGE_DIGEST},tee-restart-policy=Always,tee-signed-image-repos=${CANDIDATE_IMAGE_REF},tee-env-GCP_PROJECT_ID=${GCP_PROJECT_ID},tee-env-GCP_PROJECT_NUMBER=125139120897,tee-env-REDIRECT_URI=https://oauth-tee.femled.ai/callback,tee-env-GOOGLE_SCOPES=openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify,tee-env-AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION=auth_broker_route_documents"
+          candidate_ip=$(gcloud compute instances describe "${CANDIDATE_VM_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone=us-west1-b \
+            --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+          if [[ -z "${candidate_ip}" ]]; then
+            echo "::error::Candidate VM did not receive an external IP"
+            exit 1
+          fi
+          echo "candidate_ip=${candidate_ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve candidate IP
+        id: candidate
+        env:
+          PREPARED_CANDIDATE_IP: ${{ steps.activation-inputs.outputs.candidate_ip }}
+          MANAGED_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
+        run: |
+          candidate_ip="${PREPARED_CANDIDATE_IP:-${MANAGED_CANDIDATE_IP:-}}"
+          if [[ -z "${candidate_ip}" ]]; then
+            echo "::error::Unable to resolve candidate IP"
+            exit 1
+          fi
+          echo "ip=${candidate_ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Request governance OIDC token for active TEE
+        id: governance-oidc
+        env:
+          AUDIENCE: https://oauth-tee.femled.ai/governance
+        run: |
+          token_json=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(echo "${token_json}" | jq -r .value)
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC token for TEE governance"
+            exit 1
+          fi
+          {
+            echo "token<<EOF"
+            echo "${token}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sanity-check prepared candidate
+        env:
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.candidate.outputs.ip }}
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+        run: |
+          # Confidential Space VMs need 2-5 min to boot (cosign verify ->
+          # container start -> secret loading -> HTTPS bind). Poll /health
+          # until 200 before running the actual sanity assertions, with a
+          # generous 8 min cap; a real boot failure shows up as repeated
+          # connection refused and the cap fires.
+          deadline=$(( $(date +%s) + 480 ))
+          attempt=0
+          until curl -fsS --max-time 10 \
+              --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
+              "https://oauth-tee.femled.ai/health" >/dev/null 2>&1; do
+            attempt=$((attempt + 1))
+            if [[ $(date +%s) -ge ${deadline} ]]; then
+              echo "::error::candidate ${SUCCESSOR_CANDIDATE_IP} did not become reachable on https://oauth-tee.femled.ai/health within 8m (${attempt} attempts)"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "candidate reachable after ${attempt} attempts"
+          curl -fsS --max-time 20 \
+            --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
+            "https://oauth-tee.femled.ai/health"
+          curl -fsS --max-time 20 \
+            --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
+            "https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json" \
+            > candidate-governance.json
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const expected = process.env.CANDIDATE_IMAGE_DIGEST;
+          const doc = JSON.parse(fs.readFileSync('candidate-governance.json', 'utf8'));
+          const payload = doc.payload || {};
+          if (payload.status !== 'inactive') {
+            throw new Error(`candidate governance status must be inactive, got ${payload.status || 'missing'}`);
+          }
+          if (payload.imageDigest !== expected) {
+            throw new Error(`candidate imageDigest mismatch: expected ${expected}, got ${payload.imageDigest || 'missing'}`);
+          }
+          NODE
+
+      - name: Activate successor through current TEE
+        env:
+          AUTH_BROKER_GOVERNANCE_OIDC_TOKEN: ${{ steps.governance-oidc.outputs.token }}
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.candidate.outputs.ip }}
+          WORK_DIR: ${{ runner.temp }}/tee-successor-activation
+        run: |
+          mkdir -p "${WORK_DIR}"
+          node scripts/activate-successor.mjs \
+            --candidate-ip "${SUCCESSOR_CANDIDATE_IP}" \
+            --image-digest "${CANDIDATE_IMAGE_DIGEST}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --compliance-summary .compliance-results/summary.json \
+            --work-dir "${WORK_DIR}" \
+            > activation-report.json
+          cp activation-report.json "${WORK_DIR}/activation-report.json"
+          cat activation-report.json
+
+      - name: Cleanup failed managed candidate before activation-complete
+        if: failure() && steps.activation-inputs.outputs.mode == 'managed'
+        env:
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+          CANDIDATE_VM_NAME: ${{ steps.activation-inputs.outputs.candidate_vm_name }}
+          WORK_DIR: ${{ runner.temp }}/tee-successor-activation
+        run: |
+          if [[ -s "${WORK_DIR}/activation-complete-response.json" ]]; then
+            echo "activation-complete evidence exists; preserving candidate VM and IAM for manual apply/finalize recovery"
+            exit 0
+          fi
+          node scripts/reconcile-candidate-resource-iam.mjs \
+            --operation revoke \
+            --candidate-image-digest "${CANDIDATE_IMAGE_DIGEST}" || true
+          gcloud run jobs execute auth-broker-candidate-role-reconciler \
+            --project="${GCP_PROJECT_ID}" \
+            --region=us-west1 \
+            --wait \
+            --update-env-vars="RECONCILE_OPERATION=revoke,CANDIDATE_IMAGE_DIGEST=${CANDIDATE_IMAGE_DIGEST}" || true
+          gcloud compute instances delete "${CANDIDATE_VM_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone=us-west1-b \
+            --quiet || true
+
+      - name: Upload successor activation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: successor-activation-evidence
+          path: |
+            ${{ runner.temp }}/tee-successor-activation/
+            candidate-governance.json
+            activation-report.json
+          if-no-files-found: ignore
+          retention-days: 90

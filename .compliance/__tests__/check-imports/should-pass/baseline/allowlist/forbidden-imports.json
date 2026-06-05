@@ -1,0 +1,6 @@
+{
+  "node_builtins": ["node:crypto", "node:http"],
+  "external_npm": [],
+  "internal_relative_prefix": "./",
+  "_explicitly_forbidden_even_if_added_to_allowlist": ["node:child_process"]
+}

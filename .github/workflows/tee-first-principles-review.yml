@@ -1,0 +1,122 @@
+name: TEE First Principles Review
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: read
+
+jobs:
+  tee-first-principles-review:
+    name: tee-first-principles-review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # PR-level mirror of build-and-attest.yml's bootstrap bypass. When
+      # vars.ALLOW_AUTH_BROKER_TEE_BOOTSTRAP_BUILD == "true" AND
+      # vars.AUTH_BROKER_TEE_BOOTSTRAP_COMMIT_SHA matches the head SHA of
+      # the PR being reviewed, this PR-level check records the bypass and
+      # exits success so a merge can proceed. This is the same narrow
+      # operator-authorized override path (first bootstrap OR explicit
+      # broken-continuity re-genesis incompatible with the active TEE's
+      # current principles).
+      - name: Determine PR review mode
+        id: review-mode
+        env:
+          ALLOW_BOOTSTRAP_BUILD: ${{ vars.ALLOW_AUTH_BROKER_TEE_BOOTSTRAP_BUILD }}
+          BOOTSTRAP_COMMIT_SHA: ${{ vars.AUTH_BROKER_TEE_BOOTSTRAP_COMMIT_SHA }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "${ALLOW_BOOTSTRAP_BUILD}" == "true" && -n "${BOOTSTRAP_COMMIT_SHA}" && "${BOOTSTRAP_COMMIT_SHA}" == "${PR_HEAD_SHA}" ]]; then
+            echo "::warning::PR-level active TEE review bypassed for explicit commit-pinned bootstrap / operator-authorized re-genesis (head ${PR_HEAD_SHA})."
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=active-tee" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build adjudication request from GitHub API
+        if: steps.review-mode.outputs.mode == 'active-tee'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/create-first-principles-request.mjs first-principles-request.json
+
+      - name: Request GitHub OIDC token for TEE
+        if: steps.review-mode.outputs.mode == 'active-tee'
+        id: oidc
+        env:
+          AUDIENCE: https://oauth-tee.femled.ai/first-principles
+        run: |
+          token_json=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(echo "${token_json}" | jq -r .value)
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC token for TEE adjudication"
+            exit 1
+          fi
+          {
+            echo "token<<EOF"
+            echo "${token}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask TEE to adjudicate First Principles
+        if: steps.review-mode.outputs.mode == 'active-tee'
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          AUTH_BROKER_URL: ${{ vars.AUTH_BROKER_URL || 'https://oauth-tee.femled.ai' }}
+        run: |
+          curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @first-principles-request.json \
+            "${AUTH_BROKER_URL}/first-principles/adjudicate" \
+            > first-principles-response.json
+
+      - name: Verify signed TEE adjudication
+        if: steps.review-mode.outputs.mode == 'active-tee'
+        env:
+          FIRST_PRINCIPLES_TEE_EXPECTED_IMAGE_DIGEST: ${{ vars.FIRST_PRINCIPLES_TEE_EXPECTED_IMAGE_DIGEST }}
+          FIRST_PRINCIPLES_EXPECTED_PROMPT_DIGEST: ${{ vars.FIRST_PRINCIPLES_EXPECTED_PROMPT_DIGEST }}
+        run: |
+          node .github/scripts/verify-first-principles-adjudication.mjs \
+            --request first-principles-request.json \
+            --response first-principles-response.json \
+            --require-approve
+
+      - name: Record explicit bootstrap review bypass
+        if: steps.review-mode.outputs.mode == 'bootstrap'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          jq -n \
+            --arg schema "femled.auth_broker_tee.bootstrap_pr_review_bypass.v1" \
+            --arg reason "Operator-authorized broken-continuity review. Active TEE first-principles review intentionally bypassed for this specific PR head commit so the architectural change can land; operator-genesis.yml re-establishes a TEE under the new image." \
+            --arg head_sha "${PR_HEAD_SHA}" \
+            '{schema: $schema, decision: "BOOTSTRAP_WITHOUT_ACTIVE_TEE", reason: $reason, headSha: $head_sha}' \
+            > first-principles-response.json
+          jq -n \
+            --arg schema "femled.auth_broker_tee.bootstrap_pr_review_request.v1" \
+            --arg head_sha "${PR_HEAD_SHA}" \
+            '{schema: $schema, headSha: $head_sha}' \
+            > first-principles-request.json
+
+      - name: Upload signed TEE adjudication
+        uses: actions/upload-artifact@v4
+        with:
+          name: tee-first-principles-adjudication
+          path: |
+            first-principles-request.json
+            first-principles-response.json
+          retention-days: 90

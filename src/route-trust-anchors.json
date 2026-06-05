@@ -1,0 +1,15 @@
+{
+  "schema": "femled.auth_broker.route_trust_anchors.v1",
+  "tenants": {
+    "019a8314-3e69-7bb1-b8ee-19bc54723979": {
+      "routeSigningKeys": [
+        {
+          "keyId": "route-2026-05-primary-v2",
+          "alg": "Ed25519",
+          "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA1UIWj5+B1IWZomGTax4IQQApEe1rUq+SlrlsEEm+yt0=\n-----END PUBLIC KEY-----\n"
+        }
+      ],
+      "minRouteVersion": 2
+    }
+  }
+}

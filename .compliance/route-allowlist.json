@@ -1,0 +1,30 @@
+{
+  "_comment": "Mirrors the switch (url.pathname) block in src/server.js. Adding a new route requires updating BOTH this file AND server.js -- the diff is intentional friction so unaudited endpoints cannot slip in. Verifiers pin the rules digest, so any change is detectable.",
+  "_main_server_routes": [
+    "/login",
+    "/callback",
+    "/refresh",
+    "/push/send-silent",
+    "/push/send-alert",
+    "/github-app/installation-token",
+    "/github-app/repo-webhook",
+    "/first-principles/adjudicate",
+    "/.well-known/femled-tee-policy.json",
+    "/.well-known/femled-tee-governance.json",
+    "/governance/challenge",
+    "/governance/preapprove",
+    "/governance/genesis-bootstrap",
+    "/governance/activation-offer",
+    "/governance/activation-complete",
+    "/governance/activation-finalize",
+    "/governance/activation-apply",
+    "/governance/tenant-admission",
+    "/governance/repair-artifact",
+    "/governance/repair-candidate",
+    "/attestation",
+    "/health"
+  ],
+  "_health_server_routes": [
+    "/health"
+  ]
+}

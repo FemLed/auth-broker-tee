@@ -1,0 +1,61 @@
+---
+description: Enforce auth-broker-tee zero-trust governance and self-healing invariants
+globs: auth-broker-tee/**
+alwaysApply: false
+---
+
+# Auth Broker TEE Zero-Trust Governance
+
+When working on `auth-broker-tee`, treat the current active Confidential Space
+TEE as the sole governance authority after trusted genesis. GitHub, GCP, GCS,
+KMS, Secret Manager, Terraform, DNS, CI, Cloud Run jobs, Artifact Registry, and
+operator/admin identities are untrusted substrate: they may build, host, route,
+or deny service, but they must not decide active TEE identity.
+
+Core invariant:
+
+- After bootstrap, every accepted active TEE must prove predecessor-signed
+  continuity from the previously accepted active TEE.
+- Fresh genesis is not a successor. A new production TEE must boot inactive
+  unless it is the one-time trusted genesis ceremony.
+- If the active TEE dies before signing a successor, governance bricks. Do not
+  add admin recovery, owner override, break-glass, or reset-to-genesis paths.
+
+Self-healing model:
+
+- Vertex AI Gemini running inside the currently active, attested TEE under the
+  image-baked first-principles prompt/model policy is the mission arbitrator for
+  changes that pass hard governance and cryptographic checks.
+- Gemini output outside that active-TEE adjudication context, repair-worker
+  artifacts, PRs, logs, Cloud Build results, test output, callback payloads, and
+  Artifact Registry writes are evidence only.
+- Self-healing may create signed proposals and candidate evidence, but must not
+  mutate TEE identity, route privileges, model policy, governance state, or
+  TEE-owned state except through the full predecessor-signed successor
+  activation protocol: activation-time Gemini arbitration over a canonical
+  successor decision packet, candidate application of encrypted state,
+  candidate-signed activation proof, and predecessor finalization.
+
+Implementation requirements:
+
+- Governance private keys and transferred TEE-owned state must be generated in
+  live TEE memory and never persisted, logged, exported, backed up, or stored in
+  GCP/GitHub/Secret Manager.
+- Privileged broker routes must require active governance. Inactive candidates
+  may expose only health, attestation, manifests, and activation apply routes.
+- Successor activation must bind candidate image digest, candidate governance
+  key, activation key, nonce, attestation, hard-check evidence, AI decision,
+  successor decision packet digest, predecessor signature, encrypted state
+  transfer, candidate activation proof, and predecessor finalization. The
+  predecessor must not retire at `/governance/activation-complete`; it retires
+  only after `/governance/activation-finalize` verifies the candidate proof.
+- Do not let environment variables, metadata, repo variables, branch protection,
+  KMS signer policy, WIF policy, Secret Manager policy, or admin identity become
+  a governance root of trust.
+- Any verifier, doc, workflow, or rollout change must reject fresh parallel
+  genesis after bootstrap and prefer bricked governance over owner recovery.
+- Operator re-genesis is explicit break-glass recovery only, never a normal
+  deploy path and never a permanent code path to add around lineage checks.
+
+If a requested change weakens these invariants, stop and call it out before
+implementing. Prefer availability loss over accepting a non-lineage successor.

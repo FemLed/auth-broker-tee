@@ -1,0 +1,368 @@
+## Operator-authorized broken-continuity re-genesis for auth-broker-tee.
+##
+## Use this workflow ONLY when the active TEE's first-principles policy is
+## incompatible with the candidate image and the operator has explicitly
+## authorized a broken-continuity event (e.g., the governance state capsule
+## persistence rollout that moves governance signing keys to KMS and
+## persists predecessor-signed lineage to GCS).
+##
+## Pre-conditions (all must already be true before this runs):
+##   1. The candidate image has been built via build-and-attest.yml's
+##      ALLOW_AUTH_BROKER_TEE_BOOTSTRAP_BUILD path (no active TEE
+##      adjudication; bypass recorded in the compliance predicate).
+##   2. The new digest is in terraform's candidate_image_digests so WIF
+##      grants Secret Manager / KMS / GCS read access to the new principal.
+##   3. The KMS governance signer key and GCS capsule bucket exist
+##      (terraform/governance-state-capsule.tf applied).
+##
+## What this workflow does:
+##   1. Provisions a fresh inactive candidate VM with the new image and
+##      tee-env-GENESIS_RECOVERY_MODE=true so the new TEE can self-attest
+##      as its own genesis reviewer.
+##   2. Waits for the candidate VM HTTPS endpoint to be reachable.
+##   3. Builds the first-principles adjudication request (diff that
+##      describes the candidate image).
+##   4. Asks the new TEE to adjudicate per its own (updated) first-
+##      principles. The carve-outs in the new prompt explicitly permit the
+##      image-attested KMS-witnessed state capsule pattern, so a properly
+##      constructed candidate diff approves cleanly.
+##   5. POSTs the signed adjudication response to the new TEE's
+##      /governance/genesis-bootstrap. GENESIS_RECOVERY_MODE=true allows
+##      the self-attested reviewer (since the request and reviewer image
+##      digest match).
+##   6. Verifies the new TEE reports active + epoch 1 + the expected
+##      image digest, and that the governance state capsule was written.
+##
+## Operator follow-up after this workflow succeeds:
+##   - Update Cloudflare oauth-tee.femled.ai A record to the new VM's IP.
+##   - Update authoritative-dns-tee/src/zone-manifest.js to match.
+##   - When DNS has propagated and the new TEE is steady-state, decommission
+##     the old VM via gcloud compute instances delete.
+##   - Remove GENESIS_RECOVERY_MODE from the new VM's metadata via
+##     gcloud compute instances remove-metadata so future restarts use the
+##     standard capsule restore path rather than the self-attestation
+##     escape hatch.
+
+name: operator-genesis
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Pinned auth-broker-tee image digest (sha256:...)"
+        required: true
+        type: string
+      image_reference:
+        description: "Full image reference path without digest (e.g. us-west1-docker.pkg.dev/.../auth-broker-tee)"
+        required: false
+        default: "us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee"
+        type: string
+      source_revision:
+        description: "Git commit SHA bound to the candidate image"
+        required: true
+        type: string
+      operator_statement:
+        description: "Must explicitly contain 'operator-authorized re-genesis'"
+        required: true
+        type: string
+      ready_timeout_seconds:
+        description: "How long to wait for the candidate VM HTTPS endpoint to become reachable"
+        required: false
+        default: "240"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_REGISTRY: us-west1-docker.pkg.dev
+  IMAGE_REPO: auth-broker
+  IMAGE_NAME: auth-broker-tee
+  GCP_PROJECT_ID: prod-femled-couple-router
+  GCP_PROJECT_NUMBER: "125139120897"
+  CAPSULE_BUCKET_SUFFIX: auth-broker-tee-governance-capsules
+  GOVERNANCE_KMS_KEY_VERSION_TEMPLATE: projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/1
+
+jobs:
+  operator-genesis:
+    name: operator-authorized broken-continuity re-genesis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate inputs and operator statement
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          OPERATOR_STATEMENT: ${{ inputs.operator_statement }}
+        run: |
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::image_digest must be a sha256 digest"
+            exit 1
+          fi
+          if [[ ! "${SOURCE_REVISION}" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::source_revision must be a 40-char git SHA"
+            exit 1
+          fi
+          if ! echo "${OPERATOR_STATEMENT}" | grep -qiE 'operator-authorized.*re-genesis|operator authorized.*re-genesis'; then
+            echo "::error::operator_statement must explicitly contain 'operator-authorized re-genesis'"
+            exit 1
+          fi
+          if [[ "${SOURCE_REVISION}" != "${{ github.sha }}" ]]; then
+            echo "::warning::source_revision (${SOURCE_REVISION}) does not match this workflow's checkout SHA (${{ github.sha }}); the candidate image must have been built from source_revision"
+          fi
+
+      - name: Authenticate to GCP for VM provisioning
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
+          service_account: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
+          access_token_lifetime: 1800s
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve candidate VM name and check non-collision
+        id: vm
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          digest_hex="${IMAGE_DIGEST#sha256:}"
+          short="${digest_hex:0:12}"
+          vm_name="auth-broker-tee-genesis-${short}"
+          if gcloud compute instances describe "${vm_name}" \
+              --project="${GCP_PROJECT_ID}" \
+              --zone=us-west1-b >/dev/null 2>&1; then
+            echo "::error::candidate VM ${vm_name} already exists; delete it before re-running"
+            exit 1
+          fi
+          echo "vm_name=${vm_name}" >> "$GITHUB_OUTPUT"
+          echo "Candidate VM name: ${vm_name}"
+
+      - name: Provision inactive candidate VM with KMS+CAPSULE env
+        id: provision
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          IMAGE_REFERENCE: ${{ inputs.image_reference }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          # GENESIS_RECOVERY_MODE=true permits self-attested genesis since
+          # this is an explicit broken-continuity event under a new
+          # first-principles policy. The operator removes the metadata
+          # key after genesis succeeds so subsequent VM restarts go through
+          # the capsule restore path instead.
+          metadata="tee-image-reference=${IMAGE_REFERENCE}@${IMAGE_DIGEST}"
+          metadata="${metadata},tee-restart-policy=Always"
+          metadata="${metadata},tee-signed-image-repos=${IMAGE_REFERENCE}"
+          metadata="${metadata},tee-env-GCP_PROJECT_ID=${GCP_PROJECT_ID}"
+          metadata="${metadata},tee-env-GCP_PROJECT_NUMBER=${GCP_PROJECT_NUMBER}"
+          metadata="${metadata},tee-env-REDIRECT_URI=https://oauth-tee.femled.ai/callback"
+          metadata="${metadata},tee-env-GOOGLE_SCOPES=openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
+          metadata="${metadata},tee-env-AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION=auth_broker_route_documents"
+          # GOVERNANCE_KMS_SIGNER_KEY_VERSION and CAPSULE_BUCKET are now image-PINNED
+          # (Dockerfile ENV) and dropped from allow_env_override, so they must NOT
+          # be passed as overridable tee-env metadata (the launcher rejects env not
+          # in allow_env_override). GENESIS_RECOVERY_MODE was removed from the image
+          # (capsule restore is the steady-state recovery path), so it is gone too.
+          gcloud compute instances create "${VM_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone=us-west1-b \
+            --machine-type=n2d-standard-2 \
+            --confidential-compute \
+            --maintenance-policy=TERMINATE \
+            --image-family=confidential-space \
+            --image-project=confidential-space-images \
+            --boot-disk-size=20GB \
+            --boot-disk-type=pd-balanced \
+            --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+            --scopes=cloud-platform \
+            --tags=auth-broker-tee \
+            --shielded-secure-boot \
+            --shielded-vtpm \
+            --shielded-integrity-monitoring \
+            --metadata="${metadata}"
+          ip=$(gcloud compute instances describe "${VM_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone=us-west1-b \
+            --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+          if [[ -z "${ip}" ]]; then
+            echo "::error::candidate VM ${VM_NAME} did not receive an external IP"
+            exit 1
+          fi
+          echo "candidate_ip=${ip}" >> "$GITHUB_OUTPUT"
+          echo "Candidate VM IP: ${ip}"
+
+      - name: Wait for candidate VM HTTPS endpoint to become reachable
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          READY_TIMEOUT: ${{ inputs.ready_timeout_seconds }}
+        run: |
+          deadline=$(( $(date +%s) + READY_TIMEOUT ))
+          while [[ $(date +%s) -lt ${deadline} ]]; do
+            status=$(curl -sk --max-time 8 -o /tmp/health.json -w '%{http_code}' \
+              "https://${CANDIDATE_IP}/health" || echo "000")
+            if [[ "${status}" == "200" ]]; then
+              echo "Candidate is healthy"
+              cat /tmp/health.json
+              break
+            fi
+            echo "Candidate not ready yet (status=${status}); sleeping 10s"
+            sleep 10
+          done
+          if [[ "${status}" != "200" ]]; then
+            echo "::error::Candidate VM did not become reachable within ${READY_TIMEOUT}s"
+            exit 1
+          fi
+
+      - name: Fetch candidate inactive governance manifest
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          curl -fsSk --max-time 15 \
+            "https://${CANDIDATE_IP}/.well-known/femled-tee-governance.json" \
+            > inactive-manifest.json
+          jq -e '.payload.status == "inactive"' inactive-manifest.json \
+            || (echo "::error::Candidate is not inactive"; exit 1)
+          jq -e --arg digest "${IMAGE_DIGEST}" '.payload.imageDigest == $digest' inactive-manifest.json \
+            || (echo "::error::Candidate image digest mismatch"; exit 1)
+          echo "Candidate inactive manifest:"
+          jq '{status: .payload.status, imageDigest: .payload.imageDigest, governanceKeyId: .payload.governanceKeyId}' inactive-manifest.json
+
+      - name: Build first-principles adjudication request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_HEAD_SHA: ${{ inputs.source_revision }}
+        run: |
+          # The candidate TEE adjudicates the diff that produced its own
+          # image. With the updated first-principles carve-outs in that
+          # image, the diff (capsule code + carve-outs) is now permitted.
+          node .github/scripts/create-first-principles-request.mjs first-principles-request.json
+          echo "Request preview:"
+          jq '{repository, headSha, eventName, workflowRunId, changedFileCount: (.changedFiles | length)}' first-principles-request.json
+
+      - name: Mint GitHub OIDC token for candidate TEE
+        id: oidc
+        env:
+          AUDIENCE: https://oauth-tee.femled.ai/first-principles
+        run: |
+          token_json=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
+          token=$(echo "${token_json}" | jq -r .value)
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC token"
+            exit 1
+          fi
+          {
+            echo "token<<EOF"
+            echo "${token}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask candidate TEE to adjudicate per its own first-principles
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          curl -fsSk --max-time 120 \
+            -X POST \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @first-principles-request.json \
+            "https://${CANDIDATE_IP}/first-principles/adjudicate" \
+            > first-principles-response.json
+          jq -e '.payload.decision == "APPROVE"' first-principles-response.json \
+            || (echo "::error::candidate TEE did not approve"; jq . first-principles-response.json; exit 1)
+          echo "Candidate adjudication: APPROVE"
+
+      - name: POST genesis-bootstrap to candidate TEE
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+        run: |
+          jq -n \
+            --slurpfile request first-principles-request.json \
+            --slurpfile response first-principles-response.json \
+            '{request: $request[0], response: $response[0]}' \
+            > genesis-bootstrap-body.json
+          status=$(curl -sk --max-time 60 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary @genesis-bootstrap-body.json \
+            "https://${CANDIDATE_IP}/governance/genesis-bootstrap" \
+            --output genesis-bootstrap-response.json \
+            --write-out '%{http_code}')
+          if [[ "${status}" != "200" ]]; then
+            echo "::error::genesis-bootstrap failed (${status})"
+            cat genesis-bootstrap-response.json
+            exit 1
+          fi
+          jq -e '.status == "active"' genesis-bootstrap-response.json \
+            || (echo "::error::genesis-bootstrap did not return active"; jq . genesis-bootstrap-response.json; exit 1)
+          jq '{status, epoch: .manifest.epoch, lineageDigest: .manifest.lineageDigest, governanceKeyId: .manifest.governanceKeyId, authority}' genesis-bootstrap-response.json
+
+      - name: Verify candidate is active and report new endpoint
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          curl -fsSk --max-time 15 \
+            "https://${CANDIDATE_IP}/.well-known/femled-tee-governance.json" \
+            > active-manifest.json
+          jq -e '.payload.status == "active"' active-manifest.json \
+            || (echo "::error::Candidate did not transition to active"; exit 1)
+          jq -e '.payload.epoch == 1' active-manifest.json \
+            || (echo "::error::Candidate epoch is not 1 after genesis"; exit 1)
+          jq -e --arg digest "${IMAGE_DIGEST}" '.payload.imageDigest == $digest' active-manifest.json \
+            || (echo "::error::Candidate image digest mismatch after genesis"; exit 1)
+          {
+            echo "## Operator-authorized re-genesis complete"
+            echo ""
+            echo "**Candidate VM:** \`${VM_NAME}\`"
+            echo "**Candidate IP:** \`${CANDIDATE_IP}\`"
+            echo "**Image digest:** \`${IMAGE_DIGEST}\`"
+            echo ""
+            echo "### Next operator steps"
+            echo "1. Update Cloudflare DNS \`oauth-tee.femled.ai\` A record to \`${CANDIDATE_IP}\`."
+            echo "2. Update \`authoritative-dns-tee/src/zone-manifest.js\` to match."
+            echo "3. Verify the new TEE is steady-state, then remove \`tee-env-GENESIS_RECOVERY_MODE\` metadata via:"
+            echo "   \`\`\`"
+            echo "   gcloud compute instances remove-metadata ${VM_NAME} \\"
+            echo "     --keys=tee-env-GENESIS_RECOVERY_MODE \\"
+            echo "     --zone=us-west1-b --project=${GCP_PROJECT_ID}"
+            echo "   \`\`\`"
+            echo "4. Decommission the old recovery VM \`auth-broker-tee-recovery-ac7192275ce2\` once cutover is confirmed."
+            echo ""
+            echo "### Active manifest"
+            echo "\`\`\`json"
+            jq '.payload | {status, epoch, imageDigest, governanceKeyId, lineageDigest, routePolicyStateDigest}' active-manifest.json
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload genesis evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-genesis-evidence
+          path: |
+            inactive-manifest.json
+            first-principles-request.json
+            first-principles-response.json
+            genesis-bootstrap-body.json
+            genesis-bootstrap-response.json
+            active-manifest.json
+          retention-days: 365

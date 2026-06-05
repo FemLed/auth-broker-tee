@@ -1,0 +1,4 @@
+{
+  "_main_server_routes": ["/login", "/health"],
+  "_health_server_routes": ["/health"]
+}

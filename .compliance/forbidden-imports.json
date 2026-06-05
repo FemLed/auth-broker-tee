@@ -1,0 +1,37 @@
+{
+  "_comment": "Allowlist (not forbiddenlist, despite the filename being kept for plan-doc consistency) of every module that any file in src/ may import. Listed by import specifier, supporting both bare and 'node:'-prefixed forms. Anything not present causes check-imports.mjs to fail. Updating this list is the audit point for new TEE-side dependencies.",
+  "node_builtins": [
+    "node:crypto",
+    "node:fs",
+    "node:fs/promises",
+    "node:http",
+    "node:http2",
+    "node:https",
+    "node:net",
+    "node:os",
+    "node:path",
+    "node:stream",
+    "node:url",
+    "node:util",
+    "node:buffer",
+    "node:events",
+    "node:querystring",
+    "node:timers",
+    "node:zlib"
+  ],
+  "external_npm": [
+    "@google/genai",
+    "acme-client",
+    "acorn",
+    "acorn-walk"
+  ],
+  "internal_relative_prefix": "./",
+  "_explicitly_forbidden_even_if_added_to_allowlist": [
+    "node:child_process",
+    "node:vm",
+    "node:worker_threads",
+    "node:dgram",
+    "node:dns",
+    "node:dns/promises"
+  ]
+}

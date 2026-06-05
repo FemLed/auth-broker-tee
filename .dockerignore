@@ -1,0 +1,13 @@
+node_modules
+.git
+.github
+.gitignore
+.compliance
+.compliance-results
+verifier
+terraform
+*.md
+cloudbuild.yaml
+cloudbuild.yaml.deprecated
+VERIFICATION.md
+SUPPLY_CHAIN_BOOTSTRAP.md

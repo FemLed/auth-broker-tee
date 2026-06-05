@@ -1,0 +1,44 @@
+# Copy this file to terraform.tfvars and fill in the values.
+# This file contains NO secrets -- all sensitive values are in GCP Secret Manager.
+
+# Container image digest -- the active TEE's image (workflow-managed VM).
+# Normally reconciled automatically by scripts/reconcile-active-tee-iam.mjs
+# into terraform/active-tee.reconciled.auto.tfvars.json after each
+# successor activation; only set here for first-time bootstrap or recovery.
+container_image_digest = "sha256:..."
+
+# Hex SHA-256 fingerprint of the Cosign public key the WIF principal
+# trusts. Copy this from the successful build-and-attest workflow's
+# "Cosign KMS key fingerprint" log, or compute it locally:
+#   cosign public-key --key gcpkms://... > cosign-kms.pub
+#   openssl pkey -pubin -in cosign-kms.pub -outform DER | openssl dgst -sha256
+expected_image_signer_fingerprint = ""
+
+# OPTIONAL: previous fingerprint, set ONLY during a key rotation
+# window (see SUPPLY_CHAIN_BOOTSTRAP.md Step 9). When non-empty, the
+# WIF condition accepts EITHER fingerprint. Drop back to "" once
+# every running image has been re-signed with the new key version.
+expected_image_signer_fingerprint_old = ""
+
+# Enforcement toggles -- start at false on first deploy and flip to
+# true per the bootstrap runbook AFTER you've sampled a live attestation
+# token and confirmed the WIF CEL condition matches the actual schema.
+enforce_signed_image_at_launch = false
+enforce_signed_image_in_wif    = false
+
+# Where Confidential Space should discover Cosign signatures.
+# Must include the image name because Cosign stores signatures as tags
+# on the image path, e.g. auth-broker-tee:sha256-<digest>.sig.
+image_signature_repo = "us-west1-docker.pkg.dev/prod-femled-couple-router/auth-broker/auth-broker-tee"
+
+# OPTIONAL: external destination for KMS Cloud Audit Logs. Strongly
+# recommended for production -- without it, an operator who can edit
+# Cloud Logging in this project can also delete the audit trail of
+# their own KMS IAM changes. Examples:
+#   - "storage.googleapis.com/<bucket-in-different-project-or-org>"
+#   - "pubsub.googleapis.com/projects/<other-project>/topics/<topic>"
+#   - "bigquery.googleapis.com/projects/<other-project>/datasets/<ds>"
+# After setting this and `terraform apply`, grant the sink's
+# writer_identity (printed by `terraform output`) `roles/storage.objectCreator`
+# (or matching role) on the destination.
+kms_audit_log_sink_destination = ""

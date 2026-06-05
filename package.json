@@ -1,0 +1,21 @@
+{
+  "name": "femled-auth-broker-tee",
+  "version": "1.0.0",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@google/genai": "^1.52.0",
+    "acme-client": "5.4.0",
+    "acorn": "^8.16.0",
+    "acorn-walk": "^8.3.5"
+  },
+  "overrides": {
+    "node-forge": "1.4.0",
+    "ws": "8.20.1"
+  }
+}

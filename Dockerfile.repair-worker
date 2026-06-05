@@ -1,0 +1,31 @@
+FROM python:3.12-slim@sha256:ec948fa5f90f4f8907e89f4800cfd2d2e91e391a4bce4a6afa77ba265bc3a2fe
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      jq \
+      ripgrep && \
+    pip install --no-cache-dir mini-swe-agent litellm google-auth google-cloud-aiplatform && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+ARG COMMIT_SHA=local
+LABEL org.opencontainers.image.source="https://github.com/FemLed/auth-broker-tee"
+LABEL org.opencontainers.image.revision="${COMMIT_SHA}"
+LABEL org.opencontainers.image.title="femled-auth-broker-tee-repair-worker"
+LABEL org.opencontainers.image.description="Repair worker for auth-broker TEE self-healing jobs. See https://github.com/FemLed/auth-broker-tee/blob/main/VERIFICATION.md to verify."
+LABEL org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
+
+COPY repair-worker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY repair-worker/repair-worker-run.py /usr/local/bin/repair-worker-run.py
+
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/repair-worker-run.py && \
+    useradd -m repair && chown -R repair:repair /workspace
+
+USER repair
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

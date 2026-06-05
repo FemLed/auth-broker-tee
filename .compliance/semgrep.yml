@@ -1,0 +1,194 @@
+## auth-broker-tee Semgrep ruleset
+##
+## These rules form one half of the compliance gate (the other half is the
+## .mjs AST checkers). They are intentionally narrow: each rule targets a
+## *specific* class of mistake that would defeat the TEE privacy properties
+## documented in VERIFICATION.md. Adding a new rule should always be paired
+## with a comment explaining the threat it defends against.
+##
+## When tightening or adding rules, also bump the rules digest by editing
+## any file in .compliance/ -- the digest is sha256 over the canonicalized
+## directory contents, so any change is visible to verifiers that pin a
+## specific digest.
+
+rules:
+  # -------------------------------------------------------------------------
+  # No console output of identifiers whose names suggest sensitive values.
+  #
+  # The TEE handles OAuth access/refresh/id tokens, GitHub App private keys,
+  # GitHub installation tokens, APNs auth keys, HMAC secrets, broker API
+  # keys, and TLS private keys. Logging any of these even at error level
+  # would defeat the "operator cannot enable logging" property because the
+  # secret value would be in the workload stdout that, while not captured
+  # by Cloud Logging today, is visible to any future-operator who edits the
+  # launch policy.
+  # -------------------------------------------------------------------------
+  - id: no-console-of-token-like-identifier
+    pattern-regex: "\\bconsole\\.(?:log|error|warn|info|debug|dir|trace|table)\\([^;\\n]*\\b(?:access_token|refresh_token|id_token|hmac_secret|broker_api_key|api_key|payload|depositPayload|plaintext|ciphertext|deviceToken|githubAppJwt|appJwt|installationToken|signingKey|authKeyPem|certPem|keyPem|webhookSecret|privateKey|sharedSecret|sessionToken|sealedKey|authorization|bearer)\\b"
+    message: |
+      Forbidden: console output of an identifier that is likely a sensitive value.
+      The TEE privacy guarantee depends on no token/secret/PII byte ever entering
+      stdout. If you need to log diagnostic info about this object, log a derived
+      non-sensitive property (length, count, status code) explicitly.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No console output of object property reads that look sensitive.
+  # Catches `console.log(tokens.access_token)`, `console.log(req.body)`, etc.
+  # -------------------------------------------------------------------------
+  - id: no-console-of-token-like-property
+    pattern-regex: "\\bconsole\\.(?:log|error|warn|info|debug|dir)\\([^;\\n]*\\.(?:access_token|refresh_token|id_token|password|secret|api_key|credential|signature|private_key|privateKey|payload|plaintext|ciphertext|authorization|cookie)\\b"
+    message: |
+      Forbidden: console output of an object property that is likely a sensitive value.
+      Log a non-sensitive derived field instead.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No JSON.stringify of likely-sensitive objects reaching console.*.
+  # Catches the common "console.log('foo:', JSON.stringify(tokens))" anti-pattern.
+  # -------------------------------------------------------------------------
+  - id: no-console-stringify-sensitive
+    pattern-either:
+      - pattern: console.log(..., JSON.stringify($X), ...)
+      - pattern: console.error(..., JSON.stringify($X), ...)
+      - pattern: console.warn(..., JSON.stringify($X), ...)
+      - pattern: console.info(..., JSON.stringify($X), ...)
+    metavariable-regex:
+      metavariable: $X
+      regex: ^(body|payload|tokens|tokenResponse|depositPayload|message|plaintext|ciphertext|requestBody|responseData|req|res|headers)$
+    message: |
+      Forbidden: JSON.stringify of '$X' inside a console call. Stringifying a
+      request/response/token object exposes every sensitive value it contains.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # Same intent, but for member-access stringification: catches the
+  # `console.log(JSON.stringify(req.body))` / `console.log(JSON.stringify(tokens.access_token))`
+  # patterns that the bare-identifier rule above can miss because Semgrep
+  # binds metavariables across the AST node type, not the surface text.
+  # -------------------------------------------------------------------------
+  - id: no-console-stringify-sensitive-member
+    pattern-either:
+      - pattern: console.log(..., JSON.stringify($X.$Y), ...)
+      - pattern: console.error(..., JSON.stringify($X.$Y), ...)
+      - pattern: console.warn(..., JSON.stringify($X.$Y), ...)
+      - pattern: console.info(..., JSON.stringify($X.$Y), ...)
+      - pattern: console.debug(..., JSON.stringify($X.$Y), ...)
+      - pattern: console.dir(..., JSON.stringify($X.$Y), ...)
+    metavariable-regex:
+      metavariable: $Y
+      regex: ^(body|headers|payload|access_token|refresh_token|id_token|password|secret|api_key|credential|signature|private_key|privateKey|plaintext|ciphertext|authorization|cookie|tokens|tokenResponse|depositPayload|requestBody|responseData)$
+    message: |
+      Forbidden: JSON.stringify of '$X.$Y' inside a console call. The
+      property name '$Y' looks sensitive; stringifying it exposes every
+      value it contains.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No filesystem writes anywhere outside src/tls.js.
+  #
+  # The TEE is supposed to keep all secrets in encrypted memory or in
+  # Secret Manager; nothing should be written to disk. The src/tls.js
+  # exception exists in case future TLS code legitimately needs to stage
+  # cert/key bytes locally before persisting via Secret Manager. Today
+  # tls.js performs no fs writes -- the exclusion is a future-proofing
+  # carve-out, not a present need.
+  # -------------------------------------------------------------------------
+  - id: no-fs-write
+    pattern-either:
+      - pattern: fs.writeFile(...)
+      - pattern: fs.writeFileSync(...)
+      - pattern: fs.appendFile(...)
+      - pattern: fs.appendFileSync(...)
+      - pattern: fs.createWriteStream(...)
+      - pattern: fs.write(...)
+      - pattern: fs.writeSync(...)
+      - pattern: fs.promises.writeFile(...)
+      - pattern: fs.promises.appendFile(...)
+      - pattern: fsPromises.writeFile(...)
+      - pattern: fsPromises.appendFile(...)
+    paths:
+      exclude:
+        - "src/tls.js"
+    message: |
+      Forbidden: filesystem write outside src/tls.js. The TEE must not persist
+      data to disk -- secrets belong in Secret Manager (audit-logged, IAM-gated)
+      and in-flight state belongs in encrypted memory.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # Forbidden imports: anything that could turn the TEE into a code-execution
+  # gadget or open an unaudited network channel.
+  #
+  # - child_process: spawn arbitrary binaries
+  # - vm:           dynamic eval of strings
+  # - worker_threads: fork untracked threads with own memory
+  # - dgram:        raw UDP/TCP -- bypasses our HTTPS-only auditable channels
+  # - dns/promises: direct DNS, used to bypass the metadata-server-only auth flow
+  # -------------------------------------------------------------------------
+  - id: forbidden-import
+    pattern-regex: "\\b(?:from\\s+|require\\(\\s*|import\\(\\s*)['\"](?:node:)?(?:child_process|vm|worker_threads|dgram|dns/promises)['\"]"
+    message: |
+      Forbidden import. This module would let the TEE spawn processes,
+      eval untrusted code, fork untracked threads, or open raw network sockets
+      that bypass the audited request paths.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No new HTTP/HTTPS servers outside src/server.js.
+  #
+  # All routes are defined in the switch statement in server.js, which is
+  # mirrored in .compliance/route-allowlist.json. Creating a server elsewhere
+  # would let a contributor add an unaudited endpoint that bypasses the
+  # allowlist check.
+  # -------------------------------------------------------------------------
+  - id: no-server-creation-outside-server-js
+    pattern-either:
+      - pattern: https.createServer(...)
+      - pattern: http.createServer(...)
+      - pattern: http2.createServer(...)
+      - pattern: http2.createSecureServer(...)
+    paths:
+      exclude:
+        - "src/server.js"
+    message: |
+      Forbidden: HTTP/HTTPS server creation outside src/server.js. All routes
+      must be defined in the audited switch in server.js and mirrored in
+      .compliance/route-allowlist.json.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No raw eval / Function constructor.
+  # -------------------------------------------------------------------------
+  - id: no-eval-or-function-constructor
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: Function(...)
+    message: |
+      Forbidden: dynamic code evaluation. Future-operator could exploit eval
+      to load arbitrary code into the running TEE without rebuilding.
+    languages: [javascript]
+    severity: ERROR
+
+  # -------------------------------------------------------------------------
+  # No process.binding / require.cache manipulation -- common evasion tricks.
+  # -------------------------------------------------------------------------
+  - id: no-process-binding
+    pattern-either:
+      - pattern: process.binding(...)
+      - pattern: process.dlopen(...)
+      - pattern: require.cache[...]
+      - pattern: require.cache.$X = ...
+    message: |
+      Forbidden: low-level Node internals access (process.binding / process.dlopen
+      / require.cache mutation). These bypass the audited module graph.
+    languages: [javascript]
+    severity: ERROR
