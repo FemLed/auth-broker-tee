@@ -966,9 +966,18 @@ function githubHeaders(bearerToken) {
 // POST /github-app/repo-webhook
 // ---------------------------------------------------------------------------
 // Receives GitHub org-level push webhooks and fans them out to the correct
-// couple's Cloud Build webhook trigger. The broker verifies the webhook
-// signature and resolves repo_name -> trigger URL only through verified,
-// tenant-signed deployment webhook route records.
+// couple's deploy authority. The broker verifies the webhook signature and
+// resolves repo_name -> deploy target only through verified, tenant-signed
+// deployment webhook route records.
+//
+// Deploy target precedence (both carried in the SAME signed route record, so
+// they share the existing trust model):
+//   1. adjudicatorDeployUrl  -> tenant-adjudicator-tee /tenant/deploy. The TEE
+//      adjudicates the merged change against the FemLed mission and applies it
+//      under its own attested, image-digest-bound deploy identity. This is the
+//      deploy authority once a couple's tenant has entrusted the adjudicator.
+//   2. cloudBuildDeployTriggerUrl -> legacy Cloud Build trigger (Phase-1
+//      break-glass fallback when no adjudicator target is present).
 
 export async function handleGitHubRepoWebhook(req, res) {
   if (req.method !== "POST") {
@@ -1026,13 +1035,34 @@ export async function handleGitHubRepoWebhook(req, res) {
     console.error(`[RepoWebhook] No deploy trigger URL found for repo: ${repoName}`);
     return jsonResponse(res, 404, { error: "No couple found for this repository" });
   }
-  const triggerUrl = deployRoute.payload.cloudBuildDeployTriggerUrl;
+  const adjudicatorDeployUrl = deployRoute.payload.adjudicatorDeployUrl;
+  const triggerUrl = adjudicatorDeployUrl || deployRoute.payload.cloudBuildDeployTriggerUrl;
+  const target = adjudicatorDeployUrl ? "tenant-adjudicator-tee" : "Cloud Build trigger";
+
+  let forwardHeaders = { "Content-Type": "application/json" };
+  let forwardBody = body;
+  if (adjudicatorDeployUrl) {
+    // Forward normalized push metadata + the per-route adjudicator deploy
+    // trigger token (carried in the same tenant-signed route record). The TEE
+    // re-derives and adjudicates the merged change and applies it under its own
+    // image-digest-bound deploy identity.
+    if (deployRoute.payload.adjudicatorDeployToken) {
+      forwardHeaders["X-Adjudicator-Deploy-Token"] = deployRoute.payload.adjudicatorDeployToken;
+    }
+    forwardBody = JSON.stringify({
+      tenant: deployRoute.payload.tenant || null,
+      repository: repoName,
+      changeKind: "tenant_code_deploy",
+      commitSha: payload.after || null,
+      ref: payload.ref || null,
+    });
+  }
 
   try {
     const forwardResponse = await fetch(triggerUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
+      headers: forwardHeaders,
+      body: forwardBody,
     });
 
     const status = forwardResponse.status;
@@ -1041,12 +1071,12 @@ export async function handleGitHubRepoWebhook(req, res) {
     } else {
       recordDeployWebhook({ routeDigest: deployRoute.payloadDigest, status: "success", httpStatus: status });
     }
-    console.log(`[RepoWebhook] Forwarded to Cloud Build trigger for ${repoName}: ${status}`);
-    return jsonResponse(res, 200, { forwarded: true, repo: repoName, triggerStatus: status });
+    console.log(`[RepoWebhook] Forwarded to ${target} for ${repoName}: ${status}`);
+    return jsonResponse(res, 200, { forwarded: true, repo: repoName, target, triggerStatus: status });
   } catch (error) {
     recordDeployWebhook({ routeDigest: deployRoute.payloadDigest, status: "failed", error });
-    console.error(`[RepoWebhook] Failed to forward to Cloud Build trigger:`, error.message);
-    return jsonResponse(res, 502, { error: "Failed to forward to Cloud Build trigger" });
+    console.error(`[RepoWebhook] Failed to forward to ${target}:`, error.message);
+    return jsonResponse(res, 502, { error: `Failed to forward to ${target}` });
   }
 }
 
