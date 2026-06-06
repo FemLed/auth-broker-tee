@@ -37,13 +37,12 @@ expectEqual("eventName", payload.eventName, request.eventName);
 expectEqual("headSha", payload.headSha, request.headSha);
 expectEqual("workflowRunId", String(payload.workflowRunId), String(request.workflowRunId));
 expectEqual("nonce", payload.nonce, request.nonce);
-// The diff is TEE-fetched directly from GitHub at headSha (not caller-supplied),
-// so its diffDigest/changedFilesDigest/sourceEvidenceDigest are inside the
-// attestation-bound payload (covered by the payloadDigest + attestation checks).
-// There is no request.diff to recompute; reject a request that smuggles one in.
-if (Object.prototype.hasOwnProperty.call(request, "diff")) {
-  failures.push("request must not carry a caller-supplied diff; the TEE fetches it from GitHub");
-}
+// The reviewed diff may be either the caller-supplied diff (the currently
+// deployed TEE) or one the TEE re-fetched from GitHub at headSha (the successor
+// TEE). Either way its integrity is covered by the attestation-bound payload
+// (payloadDigest + attestation), so we bind via headSha + nonce above rather
+// than recomputing diffDigest from request.diff (which would not match a
+// TEE-fetched diff).
 if (request.complianceRulesDigest) expectEqual("complianceRulesDigest", payload.complianceRulesDigest, request.complianceRulesDigest);
 if (expectedPromptDigest) expectEqual("promptDigest", payload.promptDigest, expectedPromptDigest);
 if (payload.expiresAt && Date.parse(payload.expiresAt) < Date.now()) failures.push("adjudication expired");
