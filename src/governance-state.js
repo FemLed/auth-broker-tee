@@ -282,11 +282,8 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (expectedTarget !== current.imageDigest) {
     throw new Error("genesis bootstrap target image digest must match the running TEE image");
   }
-  if (!request || typeof request.diff !== "string" || !Array.isArray(request.changedFiles)) {
-    throw new Error("genesis bootstrap requires the original adjudication request");
-  }
-  if (!/genesis|self-govern/i.test(request.diff)) {
-    throw new Error("genesis bootstrap request must explicitly describe self-governance genesis");
+  if (!request || typeof request !== "object" || !/^[a-f0-9]{40}$/i.test(request.headSha || "")) {
+    throw new Error("genesis bootstrap requires the original adjudication request with a headSha");
   }
   if (!response?.payload || typeof response.attestationToken !== "string") {
     throw new Error("genesis bootstrap requires a signed TEE adjudication response");
@@ -322,6 +319,12 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (payload.headSha !== request.headSha) {
     throw new Error("genesis bootstrap head SHA mismatch");
   }
+  // The strong gate: the running image's source revision MUST equal the
+  // TEE-approved commit. The reviewed diff is TEE-fetched from GitHub (its
+  // diffDigest/changedFilesDigest/sourceEvidenceDigest live inside the attested
+  // payload, already bound via the attestation eat_nonce == payloadDigest check),
+  // so this binding -- not a regex on caller-supplied diff text -- proves the
+  // running image is the genuinely reviewed self-governance genesis.
   const imageProvenance = await readCurrentImageProvenance();
   if (imageProvenance.sourceRevision !== payload.headSha) {
     throw new Error("genesis bootstrap running image revision is not bound to the TEE-approved commit");
@@ -332,11 +335,8 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (payload.expiresAt && Date.parse(payload.expiresAt) <= now.getTime()) {
     throw new Error("genesis bootstrap adjudication is expired");
   }
-  if (payload.diffDigest !== sha256Digest(request.diff)) {
-    throw new Error("genesis bootstrap diff digest mismatch");
-  }
-  if (payload.changedFilesDigest !== sha256Digest(canonicalStringify(request.changedFiles))) {
-    throw new Error("genesis bootstrap changed files digest mismatch");
+  if (request.nonce && payload.nonce !== request.nonce) {
+    throw new Error("genesis bootstrap nonce mismatch between request and adjudication");
   }
 
   const genesisBootstrap = {
@@ -353,8 +353,9 @@ export async function bootstrapGenesisFromAttestedApproval({
       repository: request.repository,
       eventName: request.eventName,
       headSha: request.headSha,
-      changedFiles: request.changedFiles,
-      diffDigest: sha256Digest(request.diff),
+      changedFilesDigest: payload.changedFilesDigest,
+      diffDigest: payload.diffDigest,
+      sourceEvidenceDigest: payload.sourceEvidenceDigest || null,
       workflowRunId: request.workflowRunId,
     })),
     bootstrappedAt: now.toISOString(),

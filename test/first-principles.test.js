@@ -9,6 +9,7 @@ import {
   verifyCanonicalPayload,
 } from "../src/canonical-json.js";
 import {
+  buildFirstPrinciplesPrompt,
   buildGovernanceSuccessorPrompt,
   buildSuccessorAcceptancePrompt,
   FIRST_PRINCIPLES_GENERATION_TEMPERATURE,
@@ -60,6 +61,37 @@ test("unparseable Gemini output fails closed", () => {
 test("First Principles prompt digest is pinned", () => {
   assert.match(FIRST_PRINCIPLES_PROMPT_DIGEST, /^sha256:[0-9a-f]{64}$/);
   assert.match(FIRST_PRINCIPLES_MODEL_POLICY_DIGEST, /^sha256:[0-9a-f]{64}$/);
+});
+
+test("buildFirstPrinciplesPrompt renders whole-file contents + evidence manifest, digest-stable", () => {
+  const prompt = buildFirstPrinciplesPrompt({
+    repository: "FemLed/auth-broker-tee",
+    eventName: "push",
+    headSha: "a".repeat(40),
+    diff: "diff --git a/src/routes.js b/src/routes.js\n+ tighten token scope",
+    diffDigest: "sha256:" + "1".repeat(64),
+    changedFiles: ["src/routes.js"],
+    sourceFiles: { "src/routes.js": "export function mintToken() { return scopedReadOnly(); }" },
+    truncated: false,
+  });
+  assert.match(prompt, /<changed_file_contents>/);
+  assert.match(prompt, /scopedReadOnly/);
+  assert.match(prompt, /<evidence_manifest>/);
+  assert.match(prompt, /"wholeFileContentsAttached":1/);
+  // Dynamic evidence never mutates the image-baked, digest-bound prompt text.
+  assert.ok(prompt.startsWith(FIRST_PRINCIPLES_PROMPT_TEXT));
+});
+
+test("buildFirstPrinciplesPrompt renders changed files in FULL with no truncation", () => {
+  const big = `// HEAD\n${"x".repeat(50000)}\n// SENTINEL_TAIL_MARKER`;
+  const prompt = buildFirstPrinciplesPrompt({
+    repository: "FemLed/auth-broker-tee", eventName: "push", headSha: "b".repeat(40),
+    diff: "x", diffDigest: "sha256:" + "2".repeat(64), changedFiles: ["big.js"],
+    sourceFiles: { "big.js": big },
+  });
+  assert.match(prompt, /SENTINEL_TAIL_MARKER/);
+  assert.ok(prompt.includes(big));
+  assert.doesNotMatch(prompt, /sourceEvidenceTruncated/);
 });
 
 test("First Principles avoid hijackable product codenames", () => {
@@ -246,6 +278,37 @@ test("successor acceptance prompt renders final decision packet context", () => 
   assert.match(prompt, /Decision packet digest: sha256:/);
   assert.match(prompt, /<successor_decision_packet>/);
   assert.match(prompt, /femled\.tee\.governance\.successor_decision_packet\.v1/);
+});
+
+test("successor prompts render candidate source, structure, and packet in FULL (no truncation)", () => {
+  // Larger than the old 12,000-char per-file / 24,000-char structure /
+  // 60,000-char packet caps; everything must render whole.
+  const bigFile = `// HEAD\n${"x".repeat(50000)}\n// SOURCE_TAIL_MARKER`;
+  const manyFindings = Array.from({ length: 600 }, (_, i) => `high-risk-finding-${i}-STRUCTURE_TAIL_MARKER`);
+  const successorPrompt = buildGovernanceSuccessorPrompt({
+    candidate: {
+      candidateImageDigest: digestOf("image"),
+      candidateSourceStructure: {
+        schema: "femled.tee.source_structure_evidence.v1",
+        status: "passed",
+        highRiskFindings: manyFindings,
+        files: [],
+      },
+    },
+    hardCheckResults: { status: "passed", failures: [], warnings: [] },
+    sourceBundle: { files: { "src/governance-state.js": bigFile } },
+  });
+  assert.ok(successorPrompt.includes(bigFile));
+  assert.match(successorPrompt, /SOURCE_TAIL_MARKER/);
+  assert.match(successorPrompt, /high-risk-finding-599-STRUCTURE_TAIL_MARKER/);
+  assert.doesNotMatch(successorPrompt, /structure evidence truncated/);
+
+  const acceptancePrompt = buildSuccessorAcceptancePrompt({
+    decisionPacket: { schema: "femled.tee.governance.successor_decision_packet.v1", filler: "y".repeat(80000), tail: "PACKET_TAIL_MARKER" },
+    hardVetoResults: { status: "passed", failures: [], warnings: [] },
+  });
+  assert.match(acceptancePrompt, /PACKET_TAIL_MARKER/);
+  assert.doesNotMatch(acceptancePrompt, /structure evidence truncated/);
 });
 
 function digestOf(value) {
