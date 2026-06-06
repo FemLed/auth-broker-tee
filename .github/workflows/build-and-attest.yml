@@ -159,7 +159,13 @@ jobs:
             });
 
   tee-first-principles-review:
-    name: tee-first-principles-review
+    # Post-merge (push) genesis-bootstrap gate. Named distinctly from the
+    # dedicated pull_request_target "TEE First Principles Review" workflow so the
+    # two do NOT share a status-check context: on PRs this job is skipped and an
+    # ambiguous skipped "tee-first-principles-review" context would otherwise block
+    # the merge even when the required dedicated review passed. The job id is
+    # unchanged so downstream needs: tee-first-principles-review still resolves.
+    name: tee-first-principles-review (post-merge push)
     needs: compliance
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
