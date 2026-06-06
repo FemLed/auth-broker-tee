@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+// Build a first-principles adjudication request for a change to auth-broker-tee.
+//
+// The caller only PROPOSES a commit SHA (plus CI-produced compliance digests).
+// It deliberately does NOT send a diff or changed-file list: the active TEE pulls
+// the proposed change DIRECTLY FROM GITHUB at the OIDC-bound commit using the
+// FemLed GitHub App installation token it mints in-process, so the reviewed bytes
+// are GitHub's source of truth, never operator-submitted input.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -14,14 +21,11 @@ let baseSha = isPullRequestEvent
   ? event.pull_request.base.sha
   : event.before;
 
+// baseSha is only the compare base the TEE diffs against; it is metadata, not the
+// reviewed content. The TEE re-fetches and diffs both commits from GitHub itself.
 if (!baseSha || /^0{40}$/.test(baseSha)) {
-  baseSha = `${headSha}^`;
+  baseSha = resolveParentSha(headSha);
 }
-
-const range = `${baseSha}...${headSha}`;
-const { diff, changedFiles } = eventName === "pull_request_target"
-  ? await fetchPullRequestDiff(event.pull_request.number)
-  : readLocalDiff(range);
 
 const summaryPath = ".compliance-results/summary.json";
 const complianceSummary = fs.existsSync(summaryPath)
@@ -38,10 +42,9 @@ const request = {
   repository,
   eventName,
   pullNumber: event.pull_request?.number || null,
-  baseSha: /^[a-f0-9]{40}$/i.test(baseSha) ? baseSha : null,
+  baseSha: /^[a-f0-9]{40}$/i.test(baseSha || "") ? baseSha : null,
   headSha,
-  changedFiles,
-  diff,
+  complianceSummary,
   complianceSummaryDigest: sha256Digest(complianceSummary),
   complianceRulesDigest,
   workflowRunId: process.env.GITHUB_RUN_ID,
@@ -52,69 +55,17 @@ const request = {
 const out = process.argv[2] || "first-principles-request.json";
 fs.writeFileSync(out, `${JSON.stringify(request, null, 2)}\n`);
 
-function git(args, maxBuffer) {
-  return execFileSync("git", args, {
-    encoding: "utf8",
-    maxBuffer,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+function resolveParentSha(sha) {
+  try {
+    return execFileSync("git", ["rev-parse", `${sha}^`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
 }
 
 function sha256Digest(input) {
   return `sha256:${crypto.createHash("sha256").update(input).digest("hex")}`;
-}
-
-function readLocalDiff(range) {
-  return {
-    diff: git(["diff", "--unified=80", range], 900 * 1024) || "No textual diff was produced.",
-    changedFiles: git(["diff", "--name-only", range], 256 * 1024)
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean),
-  };
-}
-
-async function fetchPullRequestDiff(pullNumber) {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) {
-    throw new Error("GITHUB_TOKEN is required for pull_request_target diff retrieval");
-  }
-
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "auth-broker-tee-first-principles",
-  };
-
-  const diffResponse = await fetch(`https://api.github.com/repos/${repository}/pulls/${pullNumber}`, {
-    headers: {
-      ...headers,
-      Accept: "application/vnd.github.v3.diff",
-    },
-  });
-  if (!diffResponse.ok) {
-    throw new Error(`Failed to fetch PR diff: ${diffResponse.status}`);
-  }
-  const diff = await diffResponse.text();
-
-  const changedFiles = [];
-  for (let page = 1; page <= 10; page += 1) {
-    const filesResponse = await fetch(
-      `https://api.github.com/repos/${repository}/pulls/${pullNumber}/files?per_page=100&page=${page}`,
-      {
-        headers: {
-          ...headers,
-          Accept: "application/vnd.github+json",
-        },
-      }
-    );
-    if (!filesResponse.ok) {
-      throw new Error(`Failed to fetch PR files: ${filesResponse.status}`);
-    }
-    const files = await filesResponse.json();
-    changedFiles.push(...files.map((file) => file.filename));
-    if (files.length < 100) break;
-  }
-
-  return { diff, changedFiles };
 }
