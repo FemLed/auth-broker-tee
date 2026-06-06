@@ -331,8 +331,6 @@ export const FIRST_PRINCIPLES_MODEL_POLICY_DIGEST = sha256Digest(canonicalString
 }));
 
 export function buildFirstPrinciplesPrompt(context) {
-  const sourceFiles = context.sourceFiles || {};
-  const changedFiles = context.changedFiles || [];
   return `${FIRST_PRINCIPLES_PROMPT_TEXT}
 
 <adjudication_context>
@@ -345,65 +343,21 @@ Workflow run ID: ${context.workflowRunId}
 Workflow run URL: ${context.workflowRunUrl ?? "n/a"}
 Compliance rules digest: ${context.complianceRulesDigest ?? "n/a"}
 Compliance summary digest: ${context.complianceSummaryDigest ?? "n/a"}
-Changed files: ${changedFiles.join(", ")}
+Changed files: ${(context.changedFiles || []).join(", ")}
 Diff digest: ${context.diffDigest}
 </adjudication_context>
 
-${renderEvidenceManifest({ context, sourceFiles, changedFiles })}
-
 <diff>
 ${context.diff}
-</diff>
-
-<changed_file_contents>
-${renderChangedFileContents(sourceFiles)}
-</changed_file_contents>`;
-}
-
-// The diff alone is only the changed hunks. The active TEE additionally pulls the
-// FULL contents of the changed files directly from GitHub at the reviewed commit
-// (sourceEvidenceDigest binds them) so the model judges whole files, not
-// fragments. Rendered in full -- no per-file or file-count truncation: the
-// collector already fails closed on pathologically large change sets, and a
-// change that overflows the model context window fails closed on the Gemini call.
-function renderChangedFileContents(sourceFiles = {}) {
-  const fileList = Object.keys(sourceFiles).sort();
-  if (fileList.length === 0) {
-    return "No whole-file contents were attached for this change (diff-only review).";
-  }
-  return fileList
-    .map((file) => `\n--- ${file} ---\n${sourceFiles[file]}`)
-    .join("\n");
-}
-
-// Make evidence completeness machine-legible to the model WITHOUT editing the
-// image-baked prompt text: list which evidence the active TEE actually attached.
-// There is no truncation flag: evidence is either sent whole or the collector /
-// Gemini call has already failed closed.
-function renderEvidenceManifest({ context, sourceFiles, changedFiles }) {
-  const manifest = {
-    schema: "femled.auth_broker_tee.first_principles.evidence_manifest.v1",
-    teeFetchedDiff: typeof context.diff === "string" && context.diff.length > 0,
-    changedFileCount: changedFiles.length,
-    wholeFileContentsAttached: Object.keys(sourceFiles).length,
-    // Vendored deps / build artifacts (node_modules, .terraform, .venv, dist,
-    // build, ...) the TEE excluded from review by directory. A change whose only
-    // effect is in excluded paths warrants suspicion.
-    dependencyArtifactFilesExcluded: context.excludedPathCount ?? 0,
-    note: "Reviewable changed files were fetched whole from GitHub at the reviewed commit; nothing was truncated (vendored dependencies and build artifacts are excluded by directory). If evidence is incomplete, inconsistent, or contradictory, REQUEST_CHANGES.",
-  };
-  return `<evidence_manifest>\n${canonicalStringify(manifest)}\n</evidence_manifest>`;
+</diff>`;
 }
 
 export function buildGovernanceSuccessorPrompt({ candidate, hardCheckResults, sourceBundle }) {
   const files = sourceBundle?.files || sourceBundle?.sourceFiles || {};
   const fileList = Object.keys(files).sort();
-  // Render every candidate source file in full -- no per-file or file-count
-  // truncation. The candidate sourceBundle is bounded by the governance route's
-  // MAX_GOVERNANCE_BODY_BYTES request cap (the fail-closed guard), and a Gemini
-  // call that still overflows fails closed at the route (no successor cert).
   const renderedFiles = fileList
-    .map((file) => `\n--- ${file} ---\n${files[file]}`)
+    .slice(0, 80)
+    .map((file) => `\n--- ${file} ---\n${String(files[file]).slice(0, 12000)}`)
     .join("\n");
   const renderedStructureEvidence = renderSourceStructureEvidence(candidate.candidateSourceStructure);
   return `${FIRST_PRINCIPLES_PROMPT_TEXT}
@@ -470,27 +424,8 @@ Hard veto warnings: ${(hardVetoResults?.warnings || []).join("; ") || "none"}
 </successor_acceptance_context>
 
 <successor_decision_packet>
-${canonicalStringify(decisionPacket)}
+${truncateForPrompt(canonicalStringify(decisionPacket), 60000)}
 </successor_decision_packet>`;
-}
-
-// Deterministic fail-closed verdict (all risks critical, REQUEST_CHANGES). Used
-// both when Gemini returns unparseable JSON AND when the Gemini call itself fails
-// (e.g. the assembled evidence overflows the model's context window). The TEE
-// must never convert an absent/failed adjudication into an APPROVE.
-export function failClosedDecision({
-  reasoning = "The TEE failed closed because it could not obtain a valid adjudication.",
-} = {}) {
-  return {
-    decision: "REQUEST_CHANGES",
-    reasoning,
-    violatedPrinciples: ["TEE adjudication must produce a machine-verifiable decision"],
-    remediation: ["Resubmit a smaller change or retry once the adjudication can complete"],
-    governanceRiskLevel: "critical",
-    stateTransferRisk: "critical",
-    imageInspectionSummary: "",
-    mustNotApproveIf: ["adjudication unavailable"],
-  };
 }
 
 export function parseFirstPrinciplesDecision(text) {
@@ -499,7 +434,13 @@ export function parseFirstPrinciplesDecision(text) {
     parsed = JSON.parse(text);
   } catch {
     recordVertexParseFailure({ reason: "Gemini returned unparseable JSON" });
-    return failClosedDecision({ reasoning: "Gemini returned unparseable JSON, so the TEE failed closed." });
+    return {
+      decision: "REQUEST_CHANGES",
+      reasoning: "Gemini returned unparseable JSON, so the TEE failed closed.",
+      violatedPrinciples: ["TEE adjudication output must be machine-verifiable JSON"],
+      remediation: ["Retry after fixing the adjudication prompt or model response parsing"],
+      rawText: text.slice(0, 2000),
+    };
   }
 
   const decision = parsed.decision === "APPROVE" ? "APPROVE" : "REQUEST_CHANGES";
@@ -531,9 +472,7 @@ function normalizeRisk(value) {
 
 function renderSourceStructureEvidence(evidence) {
   if (!evidence) return "No candidate source structure evidence was provided.";
-  // Full structure evidence (no truncation) so governance-critical findings,
-  // parse failures, and risk hints are never silently dropped from the review.
-  return canonicalStringify({
+  return truncateForPrompt(canonicalStringify({
     schema: evidence.schema,
     status: evidence.status,
     fileCount: evidence.fileCount,
@@ -558,5 +497,10 @@ function renderSourceStructureEvidence(evidence) {
       semanticRiskHints: file.semanticRiskHints || [],
       governanceSurfaces: file.governanceSurfaces || [],
     })),
-  });
+  }), 24000);
+}
+
+function truncateForPrompt(value, limit) {
+  const text = String(value || "");
+  return text.length <= limit ? text : `${text.slice(0, limit - 32)}\n...[structure evidence truncated]`;
 }

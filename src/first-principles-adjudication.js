@@ -8,7 +8,6 @@ import { requestAttestationToken } from "./attestation.js";
 import { verifyGitHubActionsOidc } from "./github-oidc.js";
 import {
   buildFirstPrinciplesPrompt,
-  failClosedDecision,
   FIRST_PRINCIPLES_GENERATION_TEMPERATURE,
   FIRST_PRINCIPLES_MODEL,
   FIRST_PRINCIPLES_MODEL_POLICY_DIGEST,
@@ -20,13 +19,13 @@ import {
   parseFirstPrinciplesDecision,
 } from "./first-principles-review.js";
 import { generateFirstPrinciplesContent } from "./vertex-gemini.js";
-import { collectGitHubSourceEvidence } from "./github-source-evidence.js";
 import { getRouteRegistryStatus } from "./route-registry.js";
 import { buildGovernanceManifestPayload } from "./governance-state.js";
 import { recordManifestAttestation } from "./governance-monitor.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const REPOSITORY = "FemLed/auth-broker-tee";
+const MAX_DIFF_BYTES = 850 * 1024;
+const MAX_CHANGED_FILES = 300;
 const ADJUDICATION_SCHEMA = "femled.first_principles.adjudication.v1";
 const POLICY_SCHEMA = "femled.tee.policy.v1";
 const FIRST_PRINCIPLES_WORKFLOW_IDENTITY =
@@ -86,60 +85,12 @@ export async function handleFirstPrinciplesPolicy(url, req, res) {
   }
 }
 
-export async function adjudicate(request, oidcClaims, {
-  collectEvidence = collectGitHubSourceEvidence,
-  generate = generateFirstPrinciplesContent,
-  attest = attestPayload,
-} = {}) {
-  // Never trust a caller-submitted diff. The broker holds the FemLed GitHub App
-  // key, so it mints its own read-only token and pulls the proposed change
-  // DIRECTLY FROM GITHUB at the OIDC-bound commit, then reviews those bytes.
-  // Because git commit SHAs are content-addressed, the reviewed tree is the
-  // merged tree.
-  const [repoOwner, repoName] = REPOSITORY.split("/");
-  const sourceEvidence = await collectEvidence({
-    repoOwner,
-    repoName,
-    commitSha: request.headSha,
-    baseSha: request.baseSha,
-  });
-  if (!sourceEvidence?.present) {
-    throw new Error(`could not collect auth-broker source evidence from GitHub: ${sourceEvidence?.error || "unknown"}`);
-  }
-  if (sourceEvidence.commitSha !== request.headSha) {
-    throw new Error("collected source evidence commit does not match the OIDC-bound headSha");
-  }
-
-  const diff = sourceEvidence.diff;
-  const changedFiles = sourceEvidence.changedFilePaths;
-  const diffDigest = sha256Digest(diff);
-  const changedFilesDigest = sha256Digest(canonicalStringify(changedFiles));
-  const prompt = buildFirstPrinciplesPrompt({
-    repository: request.repository,
-    eventName: request.eventName,
-    pullNumber: request.pullNumber,
-    baseSha: sourceEvidence.baseSha || request.baseSha,
-    headSha: request.headSha,
-    workflowRunId: request.workflowRunId,
-    workflowRunUrl: request.workflowRunUrl,
-    complianceRulesDigest: request.complianceRulesDigest,
-    complianceSummaryDigest: request.complianceSummaryDigest,
-    changedFiles,
-    diff,
-    diffDigest,
-    sourceFiles: sourceEvidence.sourceFiles || {},
-    excludedPathCount: sourceEvidence.excludedPathCount ?? 0,
-  });
-  // Fail closed on any Gemini error (e.g. the full-evidence prompt overflowing
-  // the model context window) rather than throwing or implying APPROVE.
-  let decision;
-  try {
-    decision = parseFirstPrinciplesDecision(await generate(prompt));
-  } catch (error) {
-    decision = failClosedDecision({
-      reasoning: `Gemini adjudication call failed (${error?.message || "unknown error"}); failing closed. If the change is large, split it so the full evidence fits the reviewer's context window.`,
-    });
-  }
+async function adjudicate(request, oidcClaims) {
+  const diffDigest = sha256Digest(request.diff);
+  const changedFilesDigest = sha256Digest(canonicalStringify(request.changedFiles));
+  const prompt = buildFirstPrinciplesPrompt({ ...request, diffDigest });
+  const rawDecision = await generateFirstPrinciplesContent(prompt);
+  const decision = parseFirstPrinciplesDecision(rawDecision);
 
   const issuedAt = new Date();
   const expiresAt = new Date(issuedAt.getTime() + 30 * 60 * 1000);
@@ -153,11 +104,9 @@ export async function adjudicate(request, oidcClaims, {
     workflowRunId: String(request.workflowRunId),
     workflowRunUrl: request.workflowRunUrl || null,
     nonce: request.nonce,
-    changedFiles,
+    changedFiles: request.changedFiles,
     changedFilesDigest,
     diffDigest,
-    sourceEvidenceDigest: sourceEvidence.evidenceDigest || null,
-    sourceFilesDigest: sha256Digest(canonicalStringify(sourceEvidence.sourceFiles || {})),
     complianceSummaryDigest: request.complianceSummaryDigest || null,
     complianceRulesDigest: request.complianceRulesDigest || null,
     decision: decision.decision,
@@ -186,7 +135,7 @@ export async function adjudicate(request, oidcClaims, {
     },
   };
 
-  return attest(payload);
+  return attestPayload(payload);
 }
 
 function buildPolicyPayload() {
@@ -257,19 +206,26 @@ function normalizeAdjudicationRequest(body) {
   const repository = body.repository || [body.owner, body.repo].filter(Boolean).join("/");
   const eventName = body.eventName || body.event_name;
   const headSha = body.headSha || body.head_sha;
+  const diff = body.diff;
   const workflowRunId = body.workflowRunId || body.workflow_run_id;
   const nonce = body.nonce;
+  const changedFiles = Array.isArray(body.changedFiles || body.changed_files)
+    ? body.changedFiles || body.changed_files
+    : [];
 
-  if (repository !== REPOSITORY) return { ok: false, error: `repository must be ${REPOSITORY}` };
+  if (repository !== "FemLed/auth-broker-tee") return { ok: false, error: "repository must be FemLed/auth-broker-tee" };
   if (!["pull_request", "pull_request_target", "push"].includes(eventName)) {
     return { ok: false, error: "eventName must be pull_request, pull_request_target, or push" };
   }
-  // The caller only PROPOSES a commit SHA. The TEE independently fetches and
-  // reviews that commit from GitHub; no caller-supplied diff is accepted.
   if (!/^[a-f0-9]{40}$/i.test(headSha || "")) return { ok: false, error: "headSha must be a 40 character git SHA" };
   if (body.baseSha && !/^[a-f0-9]{40}$/i.test(body.baseSha)) return { ok: false, error: "baseSha must be a 40 character git SHA" };
+  if (typeof diff !== "string" || diff.length === 0) return { ok: false, error: "diff must be a non-empty string" };
+  if (Buffer.byteLength(diff, "utf8") > MAX_DIFF_BYTES) return { ok: false, error: `diff must be <= ${MAX_DIFF_BYTES} bytes` };
   if (!workflowRunId) return { ok: false, error: "workflowRunId is required" };
   if (typeof nonce !== "string" || nonce.length < 16 || nonce.length > 128) return { ok: false, error: "nonce must be 16-128 characters" };
+  if (changedFiles.length > MAX_CHANGED_FILES || changedFiles.some((file) => typeof file !== "string" || file.length > 512)) {
+    return { ok: false, error: "changedFiles contains invalid entries" };
+  }
 
   return {
     ok: true,
@@ -279,6 +235,8 @@ function normalizeAdjudicationRequest(body) {
       pullNumber: body.pullNumber || body.pull_number || null,
       baseSha: body.baseSha || body.base_sha || null,
       headSha,
+      changedFiles,
+      diff,
       complianceSummaryDigest: body.complianceSummaryDigest || body.compliance_summary_digest || null,
       complianceRulesDigest: body.complianceRulesDigest || body.compliance_rules_digest || null,
       workflowRunId: String(workflowRunId),
