@@ -82,6 +82,49 @@ test("buildFirstPrinciplesPrompt renders whole-file contents + evidence manifest
   assert.ok(prompt.startsWith(FIRST_PRINCIPLES_PROMPT_TEXT));
 });
 
+test("evidence manifest marks docs-only changes not_applicable (diff-only review, not a completeness failure)", () => {
+  const prompt = buildFirstPrinciplesPrompt({
+    repository: "FemLed/auth-broker-tee",
+    eventName: "push",
+    headSha: "c".repeat(40),
+    diff: "diff --git a/.github/first-principles/README.md b/.github/first-principles/README.md\n+doc",
+    diffDigest: "sha256:" + "3".repeat(64),
+    changedFiles: [".github/first-principles/README.md"],
+    sourceFiles: {},
+    attachableChangedFileCount: 0,
+  });
+  assert.match(prompt, /"changedFileContents":"not_applicable"/);
+  assert.match(prompt, /"attachableChangedFileCount":0/);
+  assert.match(prompt, /"teeFetchedDiff":"attached"/);
+});
+
+test("evidence manifest still fails closed when attachable files exist but contents are missing", () => {
+  const prompt = buildFirstPrinciplesPrompt({
+    repository: "FemLed/auth-broker-tee",
+    eventName: "push",
+    headSha: "d".repeat(40),
+    diff: "diff --git a/src/routes.js b/src/routes.js\n+x",
+    diffDigest: "sha256:" + "4".repeat(64),
+    changedFiles: ["src/routes.js"],
+    sourceFiles: {},
+    attachableChangedFileCount: 1,
+  });
+  assert.match(prompt, /"changedFileContents":"required_missing"/);
+});
+
+test("evidence manifest assumes every changed file is attachable when the count is absent (strict default)", () => {
+  const prompt = buildFirstPrinciplesPrompt({
+    repository: "FemLed/auth-broker-tee",
+    eventName: "push",
+    headSha: "e".repeat(40),
+    diff: "diff --git a/src/routes.js b/src/routes.js\n+x",
+    diffDigest: "sha256:" + "5".repeat(64),
+    changedFiles: ["src/routes.js"],
+    sourceFiles: {},
+  });
+  assert.match(prompt, /"changedFileContents":"required_missing"/);
+});
+
 test("buildFirstPrinciplesPrompt renders changed files in FULL with no truncation", () => {
   const big = `// HEAD\n${"x".repeat(50000)}\n// SENTINEL_TAIL_MARKER`;
   const prompt = buildFirstPrinciplesPrompt({

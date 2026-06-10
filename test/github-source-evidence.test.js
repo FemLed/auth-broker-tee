@@ -35,6 +35,54 @@ test("collects full contents of changed source files directly from GitHub", asyn
   assert.match(evidence.evidenceDigest, /^sha256:/);
 });
 
+test("docs-only changes attach nothing and report zero attachable files (diff-only review)", async () => {
+  const fetchImpl = githubFetch([
+    [/\/commits\/a1b2c3/, () => jsonResponse({ sha: COMMIT, commit: { tree: { sha: "t" } }, parents: [], files: [] })],
+    [/\/compare\//, () => jsonResponse({ files: [
+      { filename: ".github/first-principles/README.md", status: "modified", patch: "@@ -1 +1 @@\n+doc", additions: 1, deletions: 0 },
+      { filename: "docs/runbook.md", status: "added", patch: "@@ -0 +1 @@\n+doc", additions: 1, deletions: 0 },
+    ] })],
+  ]);
+  const evidence = await collectGitHubSourceEvidence({ repoOwner: "FemLed", repoName: "auth-broker-tee", commitSha: COMMIT, baseSha: "b".repeat(40), getToken, fetchImpl });
+
+  assert.equal(evidence.present, true);
+  assert.deepEqual(evidence.changedFilePaths, [".github/first-principles/README.md", "docs/runbook.md"]);
+  assert.deepEqual(evidence.attachableChangedFilePaths, []);
+  assert.deepEqual(evidence.sourceFiles, {});
+  assert.match(evidence.diff, /first-principles\/README\.md/);
+});
+
+test("deletion-only changes are non-attachable (contents cannot exist at the reviewed commit)", async () => {
+  const fetchImpl = githubFetch([
+    [/\/commits\/a1b2c3/, () => jsonResponse({ sha: COMMIT, commit: { tree: { sha: "t" } }, parents: [], files: [] })],
+    [/\/compare\//, () => jsonResponse({ files: [
+      { filename: "src/dead-code.js", status: "removed", patch: "@@ -1 +0 @@\n-gone", additions: 0, deletions: 1 },
+    ] })],
+  ]);
+  const evidence = await collectGitHubSourceEvidence({ repoOwner: "FemLed", repoName: "auth-broker-tee", commitSha: COMMIT, baseSha: "b".repeat(40), getToken, fetchImpl });
+
+  assert.equal(evidence.present, true);
+  assert.deepEqual(evidence.attachableChangedFilePaths, []);
+  assert.deepEqual(evidence.sourceFiles, {});
+});
+
+test("mixed changes report only code/infra paths as attachable", async () => {
+  const fetchImpl = githubFetch([
+    [/\/commits\/a1b2c3/, () => jsonResponse({ sha: COMMIT, commit: { tree: { sha: "t" } }, parents: [], files: [] })],
+    [/\/compare\//, () => jsonResponse({ files: [
+      { filename: "src/routes.js", status: "modified", patch: "@@ -1 +1 @@\n+scope", additions: 1, deletions: 0 },
+      { filename: "README.md", status: "modified", patch: "@@ -1 +1 @@\n+doc", additions: 1, deletions: 0 },
+      { filename: "package-lock.json", status: "modified", patch: "@@ -1 +1 @@\n+lock", additions: 1, deletions: 0 },
+    ] })],
+    [/\/contents\/src\/routes\.js/, () => jsonResponse({ type: "file", encoding: "base64", content: Buffer.from("export const mint = () => 'scoped';\n").toString("base64") })],
+  ]);
+  const evidence = await collectGitHubSourceEvidence({ repoOwner: "FemLed", repoName: "auth-broker-tee", commitSha: COMMIT, baseSha: "b".repeat(40), getToken, fetchImpl });
+
+  assert.equal(evidence.present, true);
+  assert.deepEqual(evidence.attachableChangedFilePaths, ["src/routes.js"]);
+  assert.deepEqual(Object.keys(evidence.sourceFiles), ["src/routes.js"]);
+});
+
 test("excludes vendored deps / build artifacts (node_modules, .terraform, dist) from the review", async () => {
   const fetchImpl = githubFetch([
     [/\/commits\/a1b2c3/, () => jsonResponse({ sha: COMMIT, commit: { tree: { sha: "t" } }, parents: [], files: [] })],

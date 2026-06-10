@@ -139,20 +139,31 @@ export async function collectGitHubSourceEvidence({
     //    so the review sees whole files, not hunks. No per-file or total
     //    truncation: if a matching file cannot be fetched whole, or the aggregate
     //    is pathologically large, FAIL CLOSED rather than under-review.
+    //
+    //    Attachability is decided FIRST (by policy: not removed, matches
+    //    FULL_CONTENT_PATTERN, not excluded as lockfile/minified noise) and
+    //    reported alongside the contents, so the evidence manifest can
+    //    distinguish "nothing was attachable by design" (docs-only or
+    //    deletion-only changes, fully covered by the TEE-fetched diff) from
+    //    "attachable files exist but contents are missing" (an evidence
+    //    completeness failure).
+    const attachableChangedFilePaths = changedFiles
+      .filter((file) => file.status !== "removed"
+        && FULL_CONTENT_PATTERN.test(file.path)
+        && !FULL_CONTENT_EXCLUDE.test(file.path))
+      .map((file) => file.path);
     const sourceFiles = {};
     let totalSourceBytes = 0;
-    for (const file of changedFiles) {
-      if (file.status === "removed") continue;
-      if (!FULL_CONTENT_PATTERN.test(file.path) || FULL_CONTENT_EXCLUDE.test(file.path)) continue;
-      const content = await ghFileContent(fetchImpl, repoOwner, repoName, file.path, commitSha, headers, timeoutMs);
+    for (const path of attachableChangedFilePaths) {
+      const content = await ghFileContent(fetchImpl, repoOwner, repoName, path, commitSha, headers, timeoutMs);
       if (content === null) {
-        throw new Error(`could not fetch full contents of changed source file ${file.path}`);
+        throw new Error(`could not fetch full contents of changed source file ${path}`);
       }
       totalSourceBytes += Buffer.byteLength(content, "utf8");
       if (totalSourceBytes > MAX_TOTAL_SOURCE_BYTES) {
         throw new Error(`changed source bytes exceed fail-closed guard ${MAX_TOTAL_SOURCE_BYTES}`);
       }
-      sourceFiles[file.path] = content;
+      sourceFiles[path] = content;
     }
 
     const diffDigest = sha256Digest(diff);
@@ -166,6 +177,7 @@ export async function collectGitHubSourceEvidence({
       parentShas: (commit.parents || []).map((parent) => parent.sha),
       changedFiles,
       changedFilePaths,
+      attachableChangedFilePaths,
       diffDigest,
       sourceFilesDigest,
       excludedPathCount,
@@ -181,6 +193,7 @@ export async function collectGitHubSourceEvidence({
       treeSha,
       diff,
       changedFilePaths,
+      attachableChangedFilePaths,
       excludedPathCount,
       sourceFiles,
       evidenceDigest,
