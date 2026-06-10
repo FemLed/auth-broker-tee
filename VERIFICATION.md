@@ -110,9 +110,14 @@ Review the source code at the commit you want to verify. Confirm:
 - [ ] `Dockerfile` -- `LABEL "tee.launch_policy.allow_cmd_override"="false"`.
       This prevents the operator from changing the container entrypoint.
 - [ ] `Dockerfile` -- Base image pinned by SHA-256 digest (not a mutable tag).
-- [ ] `src/server.js` -- TLS server created with `https.createServer()`.
-- [ ] `src/tls.js` -- TLS cert/key loaded from Secret Manager (gated by
-      attestation), not from disk or environment variables.
+- [ ] `src/server.js` -- TLS server created with `https.createServer()` from
+      in-memory material only.
+- [ ] `src/tls-capsule.js` + `src/acme-renewal.js` -- the TLS private key is
+      minted in-enclave via ACME at genesis and carried across
+      lineage-continuity boots through the KMS-sealed, attestation-gated GCS
+      capsule. It is never read from or written to Secret Manager, disk, or
+      environment variables; renewals rotate in place via
+      `server.setSecureContext()`.
 - [ ] `src/first-principles-adjudication.js` -- The adjudication endpoint
       verifies GitHub Actions OIDC, binds the signed verdict to the exact
       repo/head SHA/diff digest/compliance digest/workflow run/nonce, and

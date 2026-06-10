@@ -1,26 +1,24 @@
 # ============================================================================
-# In-TEE ACME renewer (Path B + VM reset).
+# In-TEE ACME renewer (DNS-01 via authoritative-dns-tee) + sealed TLS capsule.
 #
-# The previous renewer talked to Cloudflare's DNS API directly via the
-# `auth-broker-cloudflare-dns-token` Secret Manager secret. After the DNS
-# authority cutover that token has no authority over `_acme-challenge.*`
-# records on `femled.ai`, so the renewer is being ported onto
-# authoritative-dns-tee's external-TEE-renewer trust path.
-#
-# This file provisions the new infrastructure:
+# This file provisions:
 #   - ECDSA P-256 governance signer key in Cloud KMS, image-baked-fingerprinted
 #     into authoritative-dns-tee's EXTERNAL_TEE_RENEWERS.
 #   - `auth-broker-tee-acme-account-key` Secret Manager secret for the
-#     persistent ACME account key (replaces the per-renewal fresh keys the
-#     old code generated).
-#   - Single-instance-conditioned compute.instanceAdmin.v1 binding so the
-#     renewer can reset its own VM at the end of a successful renewal.
+#     persistent ACME account key.
+#   - The `tls-sealing` ENCRYPT_DECRYPT KMS key that wraps the DEK of the
+#     sealed TLS capsule (src/tls-capsule.js). TLS private keys are NEVER
+#     stored in Secret Manager: the leaf key+cert live in enclave memory and
+#     the only at-rest form is the AES-256-GCM capsule in the governance
+#     state-capsule bucket (tls/ object). Decrypt IAM on the sealing key is
+#     granted ONLY to the attestation-pinned image-digest window, so unsealing
+#     requires a fresh Confidential Space attestation of a measured lineage
+#     image -- the Confidential Space equivalent of vTPM/measured-boot sealing
+#     (workloads have no direct vTPM access).
 #
-# It also DELETES the legacy `auth-broker-cloudflare-dns-token` Secret
-# Manager secret and its IAM binding -- the env var contract is no longer
-# read at boot, so leaving the secret around would be operator footgun.
-# Do this in a follow-up apply once dry-run has succeeded; until then keep
-# the secret to support the bridge path.
+# Renewals rotate the live listener in place via setSecureContext; the old
+# compute.instanceAdmin.v1 self-reset binding is gone (no VM reset anywhere
+# in the TLS path).
 # ============================================================================
 
 resource "google_kms_key_ring" "acme_renewer" {
@@ -81,35 +79,43 @@ resource "google_secret_manager_secret" "acme_account_key" {
   }
 }
 
-# compute.instances.reset on this VM only. Scoped via IAM Conditions so the
-# WIF principal cannot reset any other instance in the project.
-resource "google_project_iam_member" "renewer_self_reset" {
-  project = var.project_id
-  role    = "roles/compute.instanceAdmin.v1"
-  member  = local.wif_principal
+# TLS-sealing key: wraps the 32-byte DEK of the sealed TLS capsule (and ONLY
+# the DEK -- the TLS private key never reaches KMS). cryptoKeyEncrypterDecrypter
+# is the gate that makes the capsule "sealed to the TEE": only a workload whose
+# Confidential Space attestation carries an image digest in the current window
+# can unwrap, so a lineage-continuity boot (roll candidate, successor
+# activation, same-image restart) can carry the in-enclave cert forward while
+# nothing outside the measured lineage can ever decrypt it.
+resource "google_kms_crypto_key" "tls_sealing" {
+  name     = "tls-sealing"
+  key_ring = google_kms_key_ring.acme_renewer.id
+  purpose  = "ENCRYPT_DECRYPT"
 
-  # Live VMs are now created by the build-and-attest workflow with names of
-  # the form `auth-broker-tee-candidate-<digest12>`, not the historic fixed
-  # name `auth-broker-tee`. Match by prefix so the renewer can reset its own
-  # current candidate without widening the IAM grant beyond this VM family.
-  condition {
-    title       = "Reset only auth-broker-tee VM"
-    description = "Renewer may reset its own VM after successful TLS renewal"
-    expression  = "resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"projects/${var.project_id}/zones/${var.zone}/instances/auth-broker-tee\")"
+  # New primary every 90d; old versions stay decryptable so existing capsules
+  # keep unsealing, and every renewal/re-seal re-wraps under the new primary.
+  rotation_period = "7776000s"
+
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "SOFTWARE"
+  }
+
+  lifecycle {
+    prevent_destroy = true
   }
 }
 
-resource "google_project_iam_member" "renewer_self_reset_candidates" {
-  for_each = toset(local.candidate_wif_principals)
-  project  = var.project_id
-  role     = "roles/compute.instanceAdmin.v1"
-  member   = each.value
+resource "google_kms_crypto_key_iam_member" "tls_sealing_encrypter_decrypter" {
+  crypto_key_id = google_kms_crypto_key.tls_sealing.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = local.wif_principal
+}
 
-  condition {
-    title       = "Reset only auth-broker-tee VM (candidate)"
-    description = "Candidate renewer may reset its own VM after successful TLS renewal"
-    expression  = "resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"projects/${var.project_id}/zones/${var.zone}/instances/auth-broker-tee\")"
-  }
+resource "google_kms_crypto_key_iam_member" "tls_sealing_encrypter_decrypter_candidates" {
+  for_each      = toset(local.candidate_wif_principals)
+  crypto_key_id = google_kms_crypto_key.tls_sealing.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = each.value
 }
 
 # Surface the renewer signer key version so authoritative-dns-tee operators

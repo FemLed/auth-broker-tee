@@ -13,9 +13,7 @@ export const SECRET_ACCESSOR_SECRETS = Object.freeze([
   "cloudflare-access-google-oauth-client-secret",
   "auth-broker-hmac-secret",
   "broker-api-key",
-  "auth-broker-tls-cert",
-  "auth-broker-tls-key",
-  "auth-broker-cloudflare-dns-token",
+  "auth-broker-tee-acme-account-key",
   "femled-code-agent-github-app-id",
   "femled-code-agent-github-app-private-key",
   "github-org-webhook-secret",
@@ -26,9 +24,21 @@ export const SECRET_ACCESSOR_SECRETS = Object.freeze([
 ]);
 
 export const SECRET_VERSION_ADDER_SECRETS = Object.freeze([
-  "auth-broker-tls-cert",
-  "auth-broker-tls-key",
+  "auth-broker-tee-acme-account-key",
 ]);
+
+// Sealed TLS continuity: a candidate boot carries over the in-enclave cert by
+// unsealing the shared TLS capsule -- KMS unwrap of the capsule DEK plus a
+// conditioned objectAdmin on exactly the capsule object (it is overwritten in
+// place on every re-seal). TLS cert/key Secret Manager grants are gone;
+// plaintext TLS keys are never stored in Secret Manager.
+export const TLS_SEALING_KMS_KEY = Object.freeze({
+  keyRing: "auth-broker-acme-renewer",
+  key: "tls-sealing",
+  location: "us-west1",
+});
+export const TLS_CAPSULE_BUCKET = "prod-femled-couple-router-auth-broker-tee-governance-capsules";
+export const TLS_CAPSULE_OBJECT = "tls/oauth-tee.tls-capsule.v1.json";
 
 const VALID_OPERATIONS = new Set(["grant", "revoke"]);
 
@@ -102,6 +112,38 @@ export function buildIamOperations({ operation, candidateImageDigest }) {
         "--quiet",
       ],
     })),
+    {
+      kind: "kmsKey",
+      resource: `${TLS_SEALING_KMS_KEY.keyRing}/${TLS_SEALING_KMS_KEY.key}`,
+      role: "roles/cloudkms.cryptoKeyEncrypterDecrypter",
+      command: [
+        "kms",
+        "keys",
+        secretCommand,
+        TLS_SEALING_KMS_KEY.key,
+        `--keyring=${TLS_SEALING_KMS_KEY.keyRing}`,
+        `--location=${TLS_SEALING_KMS_KEY.location}`,
+        `--project=${PROJECT_ID}`,
+        `--member=${member}`,
+        "--role=roles/cloudkms.cryptoKeyEncrypterDecrypter",
+        "--quiet",
+      ],
+    },
+    {
+      kind: "bucket",
+      resource: `${TLS_CAPSULE_BUCKET}/${TLS_CAPSULE_OBJECT}`,
+      role: "roles/storage.objectAdmin",
+      command: [
+        "storage",
+        "buckets",
+        secretCommand,
+        `gs://${TLS_CAPSULE_BUCKET}`,
+        `--member=${member}`,
+        "--role=roles/storage.objectAdmin",
+        `--condition=expression=resource.name.endsWith("/objects/${TLS_CAPSULE_OBJECT}"),title=TLS capsule object only (candidate)`,
+        "--quiet",
+      ],
+    },
     {
       kind: "artifactRepository",
       resource: `${PROJECT_ID}/${ARTIFACT_LOCATION}/${ARTIFACT_REPOSITORY}`,

@@ -186,10 +186,15 @@ resource "google_iam_workload_identity_pool_provider" "attestation_verifier" {
 # ---------------------------------------------------------------------------
 locals {
   secret_ids = {
-    google_client_id       = "cloudflare-access-google-oauth-client-id"
-    google_client_secret   = "cloudflare-access-google-oauth-client-secret"
-    hmac_secret            = "auth-broker-hmac-secret"
-    broker_api_key         = "broker-api-key"
+    google_client_id     = "cloudflare-access-google-oauth-client-id"
+    google_client_secret = "cloudflare-access-google-oauth-client-secret"
+    hmac_secret          = "auth-broker-hmac-secret"
+    broker_api_key       = "broker-api-key"
+    # RETIRED (sealed-TLS cutover): the TLS pair is no longer read or written
+    # by any image -- TLS material lives only in enclave memory and the
+    # KMS-sealed capsule (src/tls-capsule.js + acme-renewer.tf tls_sealing).
+    # The names stay listed purely as documentation until the pre-existing
+    # secrets are deleted; NO IAM references them below anymore.
     tls_cert               = "auth-broker-tls-cert"
     tls_key                = "auth-broker-tls-key"
     acme_account_key       = "auth-broker-tee-acme-account-key"
@@ -222,8 +227,6 @@ locals {
     local.secret_ids.google_client_secret,
     local.secret_ids.hmac_secret,
     local.secret_ids.broker_api_key,
-    local.secret_ids.tls_cert,
-    local.secret_ids.tls_key,
     local.secret_ids.acme_account_key,
     local.secret_ids.github_app_id,
     local.secret_ids.github_app_private_key,
@@ -235,8 +238,6 @@ locals {
   ]
 
   secrets_needing_write = [
-    local.secret_ids.tls_cert,
-    local.secret_ids.tls_key,
     local.secret_ids.acme_account_key,
   ]
 

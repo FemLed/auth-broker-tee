@@ -213,20 +213,74 @@ export async function kmsGetPublicKey(keyVersionResource) {
   return data.pem;
 }
 
-// Reset this VM via the Compute Engine API. Used at the end of a successful
-// renewal to restart the TEE so it picks up the freshly-seeded TLS Secret
-// Manager versions on next boot. The IAM role is scoped to a single-instance
-// condition in Terraform so this principal can only reset its own VM.
-export async function resetComputeInstance({ project = GCP_PROJECT_ID, zone, instanceName }) {
+// Cloud KMS raw symmetric encrypt/decrypt on an ENCRYPT_DECRYPT key. Used to
+// wrap/unwrap the 32-byte DEK of the sealed TLS capsule (tls-capsule.js): only
+// the DEK ever reaches KMS, never the TLS private key itself. Decrypt IAM on
+// the sealing key is granted ONLY to the WIF principalSet pinned to this
+// service's attested image-digest window, so unwrapping requires a fresh
+// Confidential Space attestation of a measured lineage image.
+export async function kmsEncrypt(keyName, plaintextBuffer) {
   const accessToken = await getWifAccessToken();
-  const url = `https://compute.googleapis.com/compute/v1/projects/${project}/zones/${zone}/instances/${instanceName}/reset`;
+  const url = `https://cloudkms.googleapis.com/v1/${keyName}:encrypt`;
   const response = await fetch(url, {
     method: "POST",
-    headers: { Authorization: `Bearer ${accessToken}` },
-    signal: AbortSignal.timeout(30000),
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ plaintext: plaintextBuffer.toString("base64") }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!response.ok) {
-    throw new Error(`compute.instances.reset failed for ${instanceName} (${response.status}): ${await response.text()}`);
+    throw new Error(`Cloud KMS encrypt failed (${response.status}): ${await response.text()}`);
+  }
+  const data = await response.json();
+  if (typeof data.ciphertext !== "string") throw new Error("Cloud KMS encrypt returned no ciphertext");
+  return Buffer.from(data.ciphertext, "base64");
+}
+
+export async function kmsDecrypt(keyName, ciphertextBuffer) {
+  const accessToken = await getWifAccessToken();
+  const url = `https://cloudkms.googleapis.com/v1/${keyName}:decrypt`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ ciphertext: ciphertextBuffer.toString("base64") }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    throw new Error(`Cloud KMS decrypt failed (${response.status}): ${await response.text()}`);
+  }
+  const data = await response.json();
+  if (typeof data.plaintext !== "string") throw new Error("Cloud KMS decrypt returned no plaintext");
+  return Buffer.from(data.plaintext, "base64");
+}
+
+// Minimal GCS JSON object read/write via the WIF principal. The capsule bucket
+// is untrusted transport: it only ever holds AES-256-GCM ciphertext sealed
+// in-enclave, never plaintext key material.
+export async function readGcsObjectJson(bucket, objectName) {
+  const accessToken = await getWifAccessToken();
+  const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?alt=media`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`GCS read failed for gs://${bucket}/${objectName} (${response.status}): ${await response.text()}`);
+  }
+  return response.json();
+}
+
+export async function writeGcsObjectJson(bucket, objectName, value) {
+  const accessToken = await getWifAccessToken();
+  const url = `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(objectName)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(value),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    throw new Error(`GCS write failed for gs://${bucket}/${objectName} (${response.status}): ${await response.text()}`);
   }
   return response.json();
 }

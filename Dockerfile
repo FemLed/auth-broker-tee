@@ -20,9 +20,23 @@ ENV NODE_ENV=production
 ENV GOVERNANCE_KMS_SIGNER_KEY_VERSION="projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/1"
 ENV CAPSULE_BUCKET="prod-femled-couple-router-auth-broker-tee-governance-capsules"
 
+# Sealed in-enclave TLS trust roots, image-PINNED like the governance config
+# above. The renewer signer key authenticates this caller to the
+# authoritative-dns-tee renewer route for ACME DNS-01; the renewer itself is
+# baked ON because sealed TLS makes in-enclave minting mandatory at genesis
+# (there is no Secret Manager TLS pair to seed). Lineage-continuity boots
+# (candidates, successor activations, restarts) unseal the TLS capsule from
+# CAPSULE_BUCKET (tls/ object) and never spend a Let's Encrypt order. The
+# sealing KMS key name is image-baked in src/tls-capsule.js.
+ENV RENEWER_KMS_SIGNER_KEY_VERSION="projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-acme-renewer/cryptoKeys/renewer-governance-signer/cryptoKeyVersions/1"
+ENV ACME_RENEWER_ENABLED="true"
+
 LABEL "tee.launch_policy.log_redirect"="never"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-LABEL "tee.launch_policy.allow_env_override"="GCP_PROJECT_ID,GCP_PROJECT_NUMBER,REDIRECT_URI,GOOGLE_SCOPES,AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION"
+# ACME_RENEWER_DRY_RUN is the only renewer toggle exposed for staged
+# validation via add-metadata; it is not a trust root (every renewer
+# trust-root value is image-baked above / in src).
+LABEL "tee.launch_policy.allow_env_override"="GCP_PROJECT_ID,GCP_PROJECT_NUMBER,REDIRECT_URI,GOOGLE_SCOPES,AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION,ACME_RENEWER_DRY_RUN"
 
 # OCI source/revision labels so Cosign and the verifier can correlate
 # image -> commit at a glance. COMMIT_SHA is set by the build-and-attest

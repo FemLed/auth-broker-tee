@@ -181,6 +181,7 @@ export async function initializeGovernanceAsync({ mode = "inactive", keyMaterial
     current.epoch = 1;
     current.lineage = [genesisCertificate];
     await persistGovernanceCapsuleBestEffort({ now });
+    scheduleTlsLineageReconcile({ lineageId: genesisCertificate.payloadDigest, event: "genesis" });
     return state;
   }
   initializeGovernance({ mode, keyMaterial, now });
@@ -373,7 +374,29 @@ export async function bootstrapGenesisFromAttestedApproval({
   current.epoch = 1;
   current.lineage = [genesisCertificate];
   await persistGovernanceCapsuleBestEffort();
+
+  // Fire-and-forget: a genesis event ALWAYS requires a new ACME cert. If the
+  // running TLS material was carried over from a sealed capsule (a previous
+  // lineage's cert), the renewer force-mints a fresh one and re-seals the
+  // capsule under THIS genesis's lineage anchor (the genesis certificate's
+  // payloadDigest); material this enclave minted itself during this boot is
+  // already fresh and is only re-bound. Never blocks or fails the genesis
+  // response.
+  scheduleTlsLineageReconcile({ lineageId: genesisCertificate.payloadDigest, event: "genesis" });
+
   return buildGovernanceManifestPayload();
+}
+
+// Fire-and-forget bridge into the sealed-TLS supervisor (acme-renewal.js):
+// genesis events force a fresh ACME cert; continuity events (successor
+// activation, cold-start capsule restore) keep the carried-over in-enclave
+// cert after verifying the TLS capsule's lineage anchor.
+function scheduleTlsLineageReconcile({ lineageId, event }) {
+  queueMicrotask(() => {
+    import("./acme-renewal.js")
+      .then(({ reconcileTlsWithLineage }) => reconcileTlsWithLineage({ lineageId, event }))
+      .catch((error) => console.error(`[governance] TLS lineage reconcile (${event}) failed to start:`, error.message));
+  });
 }
 
 export async function issueSelfHealingProposal({ proposal, healthSnapshot = null, internalEventDigests = [], industryTelemetryDigest = null, now = new Date() }) {
@@ -705,6 +728,18 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
     now,
   });
   await persistGovernanceCapsuleBestEffort();
+
+  // Fire-and-forget: lineage continuity KEEPS the carried-over in-enclave TLS
+  // cert (no new ACME order for a successor activation). The renewer only
+  // verifies the sealed TLS capsule's lineage anchor (the genesis
+  // certificate's payloadDigest, stable across successors) matches the
+  // transferred lineage, re-binding or force-re-minting on mismatch. Never
+  // blocks or fails the activation-apply response.
+  scheduleTlsLineageReconcile({
+    lineageId: current.lineage[0]?.payloadDigest || null,
+    event: "successor_activation",
+  });
+
   return {
     ...buildGovernanceManifestPayload(),
     activationProof,
@@ -1237,6 +1272,15 @@ export async function tryRestoreGovernanceFromCapsule({ now = new Date() } = {})
   };
   capsuleSerial = pointer.capsuleSerial || 0;
   console.info(`[governance] capsule restore: restored ${current.status} governance at epoch ${current.epoch} (capsule ${pointer.capsuleDigest})`);
+
+  // Fire-and-forget: a cold-start restore is lineage continuity -- the
+  // carried-over in-enclave TLS cert is kept; only the TLS capsule's lineage
+  // anchor is verified/re-bound against the restored lineage.
+  scheduleTlsLineageReconcile({
+    lineageId: current.lineage[0]?.payloadDigest || null,
+    event: "lineage_restore",
+  });
+
   return {
     restored: true,
     capsuleDigest: pointer.capsuleDigest,

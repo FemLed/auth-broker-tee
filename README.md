@@ -163,46 +163,58 @@ check (JWT signature -> Sigstore signature -> Fulcio cert SAN -> Rekor
 entry -> compliance predicate). Run it from a machine you control to
 continuously prove the chain is intact.
 
-## In-TEE TLS renewal
+## Sealed in-enclave TLS (ACME at genesis, carried over on continuity)
 
-The public TLS cert for `oauth-tee.femled.ai` is renewed in-TEE via
-authoritative-dns-tee's external-TEE-renewer trust path:
+The TLS private key for `oauth-tee.femled.ai` **lives only in enclave
+memory**; its sole at-rest form is a **sealed TLS capsule**
+([`src/tls-capsule.js`](src/tls-capsule.js)) stored in the governance
+state-capsule bucket under `tls/oauth-tee.tls-capsule.v1.json`: AES-256-GCM
+ciphertext whose 32-byte DEK is wrapped by the `tls-sealing` KMS key, with
+decrypt IAM granted only to the WIF `principalSet` pinned to the attested
+image-digest window (active image + roll candidates). Confidential Space
+exposes no vTPM to workloads, so this attestation-gated KMS unwrap is the
+measured-boot sealing equivalent. **Plaintext TLS keys are never written to
+Secret Manager** (the old `auth-broker-tls-cert`/`-tls-key` pair is retired
+along with the manual seed flow).
 
-- [`src/acme-renewal.js`](src/acme-renewal.js) drives an ACME DNS-01 order
-  against Let's Encrypt; the leaf private key is generated in-TEE and never
-  leaves it.
-- [`src/renewer-governance-signer.js`](src/renewer-governance-signer.js)
+Boot (`bootstrapTls` in [`src/acme-renewal.js`](src/acme-renewal.js)) is
+unseal-first and runs before the listener binds:
+
+- **Lineage continuity** (successor activation, candidate VM, same-image
+  restart, capsule-restored cold start): unseal the TLS capsule and carry the
+  existing in-enclave cert forward -- **no Let's Encrypt order**. After
+  `activation-apply` (and after a governance capsule restore), the renewer
+  verifies the TLS capsule's lineage anchor (the genesis certificate's
+  `payloadDigest`) matches the governance lineage.
+- **Mint** only when no usable capsule exists (first genesis boot) or the
+  carried cert is expired/inside the 30-day renewal window. The ACME DNS-01
+  order rides authoritative-dns-tee's external-TEE-renewer trust path:
+  [`src/renewer-governance-signer.js`](src/renewer-governance-signer.js)
   builds a KMS-signed envelope bound to a fresh Confidential Space
-  attestation token (audience `https://ns1.femled.ai/renewer`), which
-  authoritative-dns-tee's `/governance/routine-zone-change-renewer` route
-  accepts for the narrow `_acme-challenge.oauth-tee.femled.ai.` TXT
-  add/remove pair.
-- On success, the renewer writes new versions of `auth-broker-tls-cert`
-  and `auth-broker-tls-key` and resets this VM via
-  `compute.instances.reset` so the next boot loads the fresh material.
-- The previous `setSecureContext()` hot reload was removed in favor of the
-  full VM reset; this aligns the reload contract with `coach-email-tee`
-  and removes in-process mutability.
-- Governance state survives the renewal-driven reset (and any
-  host-maintenance reset that is outside operator control) via the
-  KMS-sealed, GCS-backed state capsule documented below. The
-  capsule restore path lands the same lineage and tenant route
-  policy on the new VM without operator intervention.
+  attestation token (audience `https://ns1.femled.ai/renewer`), which the
+  `/governance/routine-zone-change-renewer` route accepts for the narrow
+  `_acme-challenge.oauth-tee.femled.ai.` TXT add/remove pair. The leaf
+  private key is generated in-TEE and never leaves it.
+- **Genesis events always mint a fresh cert**: after
+  `/governance/genesis-bootstrap`, material carried over from a previous
+  lineage's capsule is force-re-minted and the capsule re-sealed under the
+  new lineage anchor (the capsule's GCM AAD binds the anchor, so a stale
+  capsule can never silently impersonate a new lineage).
 
-The renewer is gated by `ACME_RENEWER_ENABLED=true`. Until the DNS-TEE
-cutover is complete and the new path has succeeded once in dry-run mode
-(`ACME_RENEWER_DRY_RUN=true`), keep `ACME_RENEWER_ENABLED=false`. The
-old Cloudflare-DNS-01 code path was removed in this change set, so there
-is no in-process bridge while the flag is false: the running image will
-serve TLS from the cert and key already sealed in the broker's secret
-store, with no automatic rotation. Operators must therefore renew the
-cert manually -- typically with an out-of-band ACME run against Cloudflare
-DNS, sealed back into `auth-broker-tls-cert` / `auth-broker-tls-key`
-through the existing seed flow -- and reset the VM, exactly once before
-the existing certificate expires. The `auth-broker-cloudflare-dns-token`
-secret stays available for that manual run until the new in-TEE renewer
-has succeeded at least once; only then can it be removed by follow-up
-Terraform apply.
+Renewals rotate **in place**: `server.setSecureContext()` is back (the
+interim `compute.instances.reset` reload contract is gone, together with its
+`compute.instanceAdmin.v1` IAM grant), and the capsule is re-sealed after
+every rotation. A candidate VM whose cert is due first re-reads the shared
+capsule and adopts a sibling's fresher cert before spending an order against
+Let's Encrypt's 5/week duplicate-certificate quota. `/health` surfaces the
+runtime TLS state (origin, expiry, lineage anchor, capsule seal status,
+pending re-mint).
+
+`ACME_RENEWER_ENABLED=true` and `RENEWER_KMS_SIGNER_KEY_VERSION` are baked
+into the image (sealed TLS makes in-enclave minting mandatory at genesis;
+there is no Secret Manager TLS pair to seed). `ACME_RENEWER_DRY_RUN` remains
+the only operator toggle (allow_env_override) for staged validation of the
+order round-trip; the boot path refuses to mint under dry-run.
 
 The fingerprint is not listed in this file because any change to this
 file would change the fingerprint -- a self-referential impossibility.

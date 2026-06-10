@@ -166,6 +166,37 @@ resource "google_storage_bucket_iam_member" "governance_capsules_pointer_admin" 
   }
 }
 
+# The sealed TLS capsule (src/tls-capsule.js) also lives in this bucket under
+# `tls/oauth-tee.tls-capsule.v1.json` and is overwritten in place on every
+# renewal/re-seal. Like the latest-pointer, grant objectAdmin restricted to
+# exactly that object; the AES-256-GCM contents are sealed to the
+# attestation-gated `tls_sealing` KMS key (acme-renewer.tf), so the bucket
+# remains untrusted ciphertext transport.
+resource "google_storage_bucket_iam_member" "tls_capsule_object_admin" {
+  bucket = google_storage_bucket.governance_state_capsules.name
+  role   = "roles/storage.objectAdmin"
+  member = local.wif_principal
+
+  condition {
+    title       = "TLS capsule object only"
+    description = "Restrict objectAdmin to the sealed TLS capsule object so it can be re-sealed in place."
+    expression  = "resource.name.endsWith(\"/objects/tls/oauth-tee.tls-capsule.v1.json\")"
+  }
+}
+
+resource "google_storage_bucket_iam_member" "tls_capsule_object_admin_candidates" {
+  for_each = toset(local.candidate_wif_principals)
+  bucket   = google_storage_bucket.governance_state_capsules.name
+  role     = "roles/storage.objectAdmin"
+  member   = each.value
+
+  condition {
+    title       = "TLS capsule object only (candidate)"
+    description = "Restrict objectAdmin to the sealed TLS capsule object for the candidate image digest."
+    expression  = "resource.name.endsWith(\"/objects/tls/oauth-tee.tls-capsule.v1.json\")"
+  }
+}
+
 resource "google_storage_bucket_iam_member" "governance_capsules_reader_candidates" {
   for_each = toset(local.candidate_wif_principals)
   bucket   = google_storage_bucket.governance_state_capsules.name
