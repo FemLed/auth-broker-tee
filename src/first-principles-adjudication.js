@@ -130,6 +130,9 @@ export async function adjudicate(request, oidcClaims, {
     diffDigest,
     sourceFiles: sourceEvidence.sourceFiles || {},
     excludedPathCount: sourceEvidence.excludedPathCount ?? 0,
+    attachableChangedFileCount: Array.isArray(sourceEvidence.attachableChangedFilePaths)
+      ? sourceEvidence.attachableChangedFilePaths.length
+      : null,
   });
   // Fail closed on any Gemini error (e.g. the full-evidence prompt overflowing
   // the model context window) rather than throwing or implying APPROVE.

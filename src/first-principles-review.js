@@ -384,13 +384,28 @@ function renderChangedFileContents(sourceFiles = {}) {
 // change review, so they are not_applicable here -- their absence is by design,
 // not a completeness failure. No truncation flag: evidence is sent whole or the
 // collector / Gemini call has already failed closed.
+//
+// changedFileContents is judged against ATTACHABILITY, not the raw changed-file
+// count: the collector attaches whole files only for code/infra paths
+// (FULL_CONTENT_PATTERN, minus lockfile/minified noise and removed files). A
+// change whose files are all non-attachable by that policy -- docs-only or
+// deletion-only -- has nothing to attach BY DESIGN and is still reviewed in
+// full through the TEE-fetched diff, so it is "not_applicable", not a
+// completeness failure. "required_missing" remains the fail-closed verdict
+// whenever attachable files exist but no contents arrived. When the caller
+// cannot say how many files were attachable (count is not a number), every
+// changed file is assumed attachable -- preserving the strict behavior.
 function renderEvidenceManifest({ context, sourceFiles, changedFiles }) {
   const wholeFileContentsAttached = Object.keys(sourceFiles).length;
+  const attachableChangedFileCount = typeof context.attachableChangedFileCount === "number"
+    ? context.attachableChangedFileCount
+    : changedFiles.length;
   const categories = {
     teeFetchedDiff: (typeof context.diff === "string" && context.diff.length > 0)
       ? "attached" : "required_missing",
-    changedFileContents: (wholeFileContentsAttached > 0 || changedFiles.length === 0)
-      ? "attached" : "required_missing",
+    changedFileContents: wholeFileContentsAttached > 0
+      ? "attached"
+      : (attachableChangedFileCount === 0 ? "not_applicable" : "required_missing"),
     complianceSummary: context.complianceSummary ? "attached" : "required_missing",
     signedGovernanceManifest: "not_applicable",
     imageInspectionHardCheck: "not_applicable",
@@ -400,12 +415,13 @@ function renderEvidenceManifest({ context, sourceFiles, changedFiles }) {
     reviewType: "source_change",
     categories,
     changedFileCount: changedFiles.length,
+    attachableChangedFileCount,
     wholeFileContentsAttached,
     // Vendored deps / build artifacts (node_modules, .terraform, .venv, dist,
     // build, ...) the TEE excluded from review by directory. A change whose only
     // effect is in excluded paths warrants suspicion.
     dependencyArtifactFilesExcluded: context.excludedPathCount ?? 0,
-    note: "categories is authoritative for this source-change review: only 'required_missing' is an evidence-completeness failure; 'not_applicable' categories (successor-activation evidence) are N/A by design. Reviewable changed files were fetched whole from GitHub at the reviewed commit; nothing was truncated.",
+    note: "categories is authoritative for this source-change review: only 'required_missing' is an evidence-completeness failure; 'not_applicable' categories (successor-activation evidence, or whole-file contents when no changed file is attachable by collector policy) are N/A by design. Reviewable changed files were fetched whole from GitHub at the reviewed commit; nothing was truncated; non-attachable files (docs, deletions) are reviewed via the TEE-fetched diff.",
   };
   return `<evidence_manifest>\n${canonicalStringify(manifest)}\n</evidence_manifest>`;
 }
