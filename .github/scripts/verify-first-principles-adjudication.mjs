@@ -37,20 +37,12 @@ expectEqual("eventName", payload.eventName, request.eventName);
 expectEqual("headSha", payload.headSha, request.headSha);
 expectEqual("workflowRunId", String(payload.workflowRunId), String(request.workflowRunId));
 expectEqual("nonce", payload.nonce, request.nonce);
-// TRANSITIONAL DUAL-MODE diff binding -- remove right after the reviewer roll.
-// - The legacy deployed reviewer (pre-#1 image) adjudicates the caller-supplied
-//   request.diff and echoes sha256(request.diff) back as payload.diffDigest. When
-//   that relationship holds, also require the changedFiles binding so the verified
-//   decision provably covers exactly the bytes this run submitted.
-// - The post-#5 reviewer ignores caller-supplied diff fields and fetches the diff
-//   from GitHub itself at headSha; its diffDigest/changedFilesDigest/
-//   sourceEvidenceDigest describe TEE-fetched evidence and are attestation-bound
-//   (payloadDigest + eat_nonce + image-pin checks), so there is no caller-diff
-//   relationship to recompute.
-// After the roll, restore the strict guard rejecting any caller-supplied diff.
-const callerDiffDigest = typeof request.diff === "string" ? sha256Digest(request.diff) : null;
-if (callerDiffDigest && payload.diffDigest === callerDiffDigest) {
-  expectEqual("changedFilesDigest", payload.changedFilesDigest, sha256Digest(canonicalStringify(request.changedFiles)));
+// The diff is TEE-fetched directly from GitHub at headSha (not caller-supplied),
+// so its diffDigest/changedFilesDigest/sourceEvidenceDigest are inside the
+// attestation-bound payload (covered by the payloadDigest + attestation checks).
+// There is no request.diff to recompute; reject a request that smuggles one in.
+if (Object.prototype.hasOwnProperty.call(request, "diff")) {
+  failures.push("request must not carry a caller-supplied diff; the TEE fetches it from GitHub");
 }
 if (request.complianceRulesDigest) expectEqual("complianceRulesDigest", payload.complianceRulesDigest, request.complianceRulesDigest);
 if (expectedPromptDigest) expectEqual("promptDigest", payload.promptDigest, expectedPromptDigest);
