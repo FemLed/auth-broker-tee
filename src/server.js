@@ -37,8 +37,8 @@ import {
   verifyTenantAdmissionEnvelope,
 } from "./governance-state.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
-import { loadTlsCredentials } from "./tls.js";
-import { startRenewalLoop } from "./acme-renewal.js";
+import { startRenewalLoop, bootstrapTls, getTlsRuntimeStatus } from "./acme-renewal.js";
+import { getCurrentTlsMaterial, setTlsServer } from "./tls-material.js";
 import {
   initializeRouteRegistry,
   setAcceptedRouteRecorder,
@@ -80,13 +80,23 @@ async function loadSecrets() {
 
 async function main() {
   await loadSecrets();
+  // Self-bootstrap TLS before the listener binds AND before governance
+  // initialization (so the post-restore lineage reconcile sees the adopted
+  // material). Lineage-continuity boots (successor activations, roll
+  // candidates, same-image restarts) unseal the attestation-gated capsule and
+  // carry the existing in-enclave cert forward; an ACME mint runs only when
+  // no usable capsule exists or the carried cert is expired/due. The key+cert
+  // live ONLY in process memory afterward -- there is no Secret Manager TLS
+  // pair anymore.
+  await bootstrapTls();
   // initializeGovernanceAsync wires up KMS-backed key material (when
   // GOVERNANCE_KMS_SIGNER_KEY_VERSION is configured) and attempts to
   // restore governance state from the latest GCS-backed capsule so a
-  // VM reset (ACME renewal, host maintenance) does not surface as
-  // governance loss. On any restore-time integrity mismatch we fall
-  // back to inactive and require the standard genesis or successor
-  // flow to re-activate.
+  // VM restart (host maintenance) does not surface as governance loss.
+  // On any restore-time integrity mismatch we fall back to inactive and
+  // require the standard genesis or successor flow to re-activate. A
+  // successful restore fires the TLS lineage reconcile (carry-over kept;
+  // anchor verified).
   await initializeGovernanceAsync();
   setTenantAdmissionVerifier(verifyTenantAdmissionEnvelope);
   setAcceptedRouteRecorder(recordAcceptedRouteVersion);
@@ -102,9 +112,9 @@ async function main() {
     console.warn("[Server] APNs secrets not available -- /push/send-silent and /push/send-alert will be unavailable");
   }
 
-  const { key, cert } = await loadTlsCredentials();
+  const material = getCurrentTlsMaterial();
 
-  const server = https.createServer({ key, cert }, async (req, res) => {
+  const server = https.createServer({ key: material.keyPem, cert: material.certPem }, async (req, res) => {
     const url = new URL(req.url, `https://${req.headers.host}`);
 
     try {
@@ -158,7 +168,7 @@ async function main() {
         case "/attestation":
           return await handleAttestation(url, req, res);
         case "/health":
-          return jsonResponse(res, 200, { status: "ok" });
+          return jsonResponse(res, 200, { status: "ok", tls: getTlsRuntimeStatus() });
         default:
           return textResponse(res, 404, "Not found");
       }
@@ -177,6 +187,10 @@ async function main() {
       res.end();
     }
   });
+
+  // Hand the listener to the TLS holder so renewals and lineage-driven
+  // re-mints rotate the secure context in place (no VM reset).
+  setTlsServer(server);
 
   server.listen(PORT, () => {
     console.log(`Auth broker listening on port ${PORT} (HTTPS)`);

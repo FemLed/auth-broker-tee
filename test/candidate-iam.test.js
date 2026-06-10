@@ -18,14 +18,31 @@ test("candidate resource IAM script constructs only expected bindings", () => {
   });
   const member = candidateWifPrincipal(DIGEST);
 
-  assert.equal(operations.length, SECRET_ACCESSOR_SECRETS.length + SECRET_VERSION_ADDER_SECRETS.length + 1);
+  // secrets + sealed-TLS continuity (KMS sealing key + capsule object) + AR.
+  assert.equal(operations.length, SECRET_ACCESSOR_SECRETS.length + SECRET_VERSION_ADDER_SECRETS.length + 3);
   assert.ok(operations.every((operation) => operation.command.some((part) => part === `--member=${member}`)));
 
   const secretAccessorOps = operations.filter((operation) => operation.role === "roles/secretmanager.secretAccessor");
   assert.deepEqual(secretAccessorOps.map((operation) => operation.resource), [...SECRET_ACCESSOR_SECRETS]);
+  assert.ok(!secretAccessorOps.some((operation) => /tls/.test(operation.resource)),
+    "TLS material must never be granted via Secret Manager");
 
   const secretWriterOps = operations.filter((operation) => operation.role === "roles/secretmanager.secretVersionAdder");
   assert.deepEqual(secretWriterOps.map((operation) => operation.resource), [...SECRET_VERSION_ADDER_SECRETS]);
+  assert.ok(!secretWriterOps.some((operation) => /tls/.test(operation.resource)),
+    "TLS material must never be written to Secret Manager");
+
+  const kmsOps = operations.filter((operation) => operation.kind === "kmsKey");
+  assert.equal(kmsOps.length, 1);
+  assert.equal(kmsOps[0].role, "roles/cloudkms.cryptoKeyEncrypterDecrypter");
+  assert.match(kmsOps[0].resource, /tls-sealing$/);
+
+  const bucketOps = operations.filter((operation) => operation.kind === "bucket");
+  assert.equal(bucketOps.length, 1);
+  assert.equal(bucketOps[0].role, "roles/storage.objectAdmin");
+  assert.match(bucketOps[0].resource, /tls\/oauth-tee\.tls-capsule\.v1\.json$/);
+  assert.ok(bucketOps[0].command.some((part) => part.includes("resource.name.endsWith")),
+    "capsule objectAdmin must stay conditioned to the single TLS capsule object");
 
   const artifactOps = operations.filter((operation) => operation.kind === "artifactRepository");
   assert.equal(artifactOps.length, 1);
