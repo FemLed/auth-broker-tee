@@ -979,6 +979,15 @@ function githubHeaders(bearerToken) {
 //   2. cloudBuildDeployTriggerUrl -> legacy Cloud Build trigger (Phase-1
 //      break-glass fallback when no adjudicator target is present).
 
+// COEXISTENCE-ONLY (deprecated, removal gated on the operator's deploy
+// cutover): master-push forwarding for tenants still deployed by the legacy
+// Cloud Build path. tenant-adjudicator-tee now receives GitHub webhooks
+// DIRECTLY at /tenant/github-webhook and fans out to every admitted deploy
+// target, so deploy routing no longer belongs to this identity broker. Once
+// the last tenant flips to executionMode=auto, this handler, the
+// deploy_webhook_route schema in route-registry.js, and the relay's renewal of
+// {tenant}-deploy-webhook documents are all deleted together (see the
+// TEE-owned deploy fan-out plan, Phase C).
 export async function handleGitHubRepoWebhook(req, res) {
   if (req.method !== "POST") {
     return textResponse(res, 405, "Method not allowed");
