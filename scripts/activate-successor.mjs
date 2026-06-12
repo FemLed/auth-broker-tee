@@ -310,9 +310,16 @@ async function fetchJson(url, { method = "GET", body = null, resolveIp = "", hea
   return JSON.parse(text);
 }
 
+// Governance mutations through the active TEE include full-evidence Gemini
+// arbitrations (image preapproval over the whole source bundle, activation
+// acceptance) that routinely exceed 60s. Match coach-email-tee's
+// activate-successor budget so a slow-but-healthy arbitration is not
+// aborted mid-flight (the epoch-5 roll's first attempt died exactly here).
+const GOVERNANCE_CALL_TIMEOUT_MS = 600_000;
+
 async function fetchText(url, { method = "GET", body = null, resolveIp = "", headers = {} } = {}) {
   if (resolveIp) {
-    const args = ["-fsS", "--max-time", "60", "--resolve", `oauth-tee.femled.ai:443:${resolveIp}`];
+    const args = ["-fsS", "--max-time", String(GOVERNANCE_CALL_TIMEOUT_MS / 1000), "--resolve", `oauth-tee.femled.ai:443:${resolveIp}`];
     for (const [name, value] of Object.entries(headers)) args.push("-H", `${name}: ${value}`);
     if (method !== "GET") args.push("-X", method);
     if (body) args.push("--data-binary", JSON.stringify(body));
@@ -323,7 +330,7 @@ async function fetchText(url, { method = "GET", body = null, resolveIp = "", hea
     method,
     headers,
     body: body ? JSON.stringify(body) : null,
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(GOVERNANCE_CALL_TIMEOUT_MS),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`${url} returned ${response.status}: ${text}`);
