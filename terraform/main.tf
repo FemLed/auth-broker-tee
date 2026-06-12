@@ -190,13 +190,11 @@ locals {
     google_client_secret = "cloudflare-access-google-oauth-client-secret"
     hmac_secret          = "auth-broker-hmac-secret"
     broker_api_key       = "broker-api-key"
-    # RETIRED (sealed-TLS cutover): the TLS pair is no longer read or written
-    # by any image -- TLS material lives only in enclave memory and the
-    # KMS-sealed capsule (src/tls-capsule.js + acme-renewer.tf tls_sealing).
-    # The names stay listed purely as documentation until the pre-existing
-    # secrets are deleted; NO IAM references them below anymore.
-    tls_cert               = "auth-broker-tls-cert"
-    tls_key                = "auth-broker-tls-key"
+    # The old auth-broker-tls-cert/-tls-key pair is fully retired AND deleted
+    # (sealed-TLS cutover verified at epoch 5): TLS material lives only in
+    # enclave memory and the KMS-sealed capsule (src/tls-capsule.js +
+    # acme-renewer.tf tls_sealing); plaintext TLS keys are never stored in
+    # Secret Manager.
     acme_account_key       = "auth-broker-tee-acme-account-key"
     github_app_id          = "femled-code-agent-github-app-id"
     github_app_private_key = "femled-code-agent-github-app-private-key"
