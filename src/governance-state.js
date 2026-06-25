@@ -327,15 +327,29 @@ export async function bootstrapGenesisFromAttestedApproval({
     expectedNonce: payloadDigest,
   });
   const reviewerImageDigest = reviewerAttestation.submods?.container?.image_digest || null;
-  // Genesis bootstrap requires an attested reviewer whose image digest is
-  // hardcoded in TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS. The previous
-  // env-gated GENESIS_RECOVERY_MODE escape hatch was removed once governance
-  // state persistence via KMS-sealed GCS capsules (see state-capsule.js +
-  // capsule-store.js) made unplanned VM resets recoverable without operator
-  // intervention. The capsule restore path on cold start is the steady-state
-  // recovery; reaching genesis bootstrap now strictly means broken-continuity
-  // re-genesis (e.g., a deliberate operator-authorized reset).
-  if (!TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS.has(reviewerImageDigest)) {
+  // Genesis bootstrap accepts a reviewer in one of two ways:
+  //
+  //   1. A pre-trusted seed reviewer whose attested image digest is hardcoded
+  //      in TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS (a previously-blessed image
+  //      reviews the candidate -- continuity-preserving seed review).
+  //   2. Operator-authorized self-attested re-genesis: the candidate attests
+  //      its OWN running image digest. This is the explicit broken-continuity
+  //      lineage-reset path (governance rulebook "Operator-authorized
+  //      re-genesis"), used when no live trusted reviewer is available -- e.g.
+  //      the active TEE is unrecoverably inactive and cannot adjudicate.
+  //
+  // The self-attested path is deliberately narrow: genesis bootstrap is only
+  // reachable on a fresh INACTIVE TEE with an empty lineage (enforced above),
+  // and the running image's source revision must equal the TEE-approved commit
+  // (enforced below), so the self-review is still bound to a specific
+  // GitHub-reviewed image -- not arbitrary code. Continuity IS broken: the new
+  // lineage starts at this genesis and is NOT trusted by tenants until they
+  // re-admit it. Tenant lineage-pinning plus freshly issued admission envelopes
+  // are the trust boundary for a self-attested re-genesis, not an external
+  // reviewer. An arbitrary third-party reviewer image (neither self nor a
+  // trusted seed) is still rejected.
+  const isSelfAttestedGenesis = reviewerImageDigest !== null && reviewerImageDigest === current.imageDigest;
+  if (!isSelfAttestedGenesis && !TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS.has(reviewerImageDigest)) {
     throw new Error(`genesis bootstrap reviewer image ${reviewerImageDigest || "unknown"} is not trusted for genesis`);
   }
 
