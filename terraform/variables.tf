@@ -23,9 +23,12 @@ variable "zone" {
 }
 
 variable "machine_type" {
-  description = "Machine type for the Confidential VM (must be n2d for AMD SEV)"
+  # Vestigial: the auth-broker-tee VM is created by the build-and-attest /
+  # operator-genesis workflows (Intel TDX, c3), not by Terraform. Kept only
+  # for documentation; changing it here does not provision the VM.
+  description = "Workflow-managed Confidential VM machine type (Intel TDX, c3-standard family)"
   type        = string
-  default     = "n2d-standard-2"
+  default     = "c3-standard-4"
 }
 
 variable "container_image_digest" {
