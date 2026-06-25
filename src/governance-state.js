@@ -226,6 +226,10 @@ export function isGovernanceActive() {
   return getGovernanceState().status === ACTIVE;
 }
 
+export function isGovernanceInactive() {
+  return getGovernanceState().status === INACTIVE;
+}
+
 export function isGovernanceRetired() {
   return getGovernanceState().status === RETIRED;
 }
@@ -244,6 +248,12 @@ export function mayServePath(pathname) {
   if (pathname === "/governance/genesis-bootstrap") return true;
   if (pathname.startsWith("/governance/activation-")) return true;
   if (current.status === INACTIVE && pathname === "/.well-known/femled-tee-policy.json") return true;
+  // Operator-authorized self-attested genesis: a fresh INACTIVE candidate must
+  // serve its own first-principles adjudication so operator-genesis.yml can obtain
+  // the signed APPROVE that /governance/genesis-bootstrap consumes. Auth is still
+  // enforced in the handler (genesis-scoped GitHub OIDC); the adjudication mutates
+  // no state and releases no secrets.
+  if (current.status === INACTIVE && pathname === "/first-principles/adjudicate") return true;
   recordRouteGateDenied({ pathname });
   return false;
 }

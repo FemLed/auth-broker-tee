@@ -16,12 +16,39 @@ Before changing, deploying, or reviewing `auth-broker-tee`, classify the task as
      predecessor finalization/retirement.
    - Do not replace the active VM directly for a normal update.
 
-2. **Operator-authorized re-genesis**
-   - Explicit lineage reset.
-   - Only valid when the user explicitly says to abandon the current lineage or start a new genesis.
-   - Do not describe this as predecessor-approved.
-   - State clearly that continuity is broken and the new TEE is trusted from genesis onward.
-   - Pin exact image digest, source revision, prompt digest, model policy digest, and verification evidence.
+2. **Operator-authorized re-genesis (first-class, repeatable)**
+   - Explicit lineage RESET (broken continuity). Only valid when the operator
+     explicitly authorizes abandoning the current lineage (e.g. the active TEE is
+     unrecoverably inactive, or its first-principles policy is incompatible with
+     the candidate). Do NOT describe this as predecessor-approved.
+   - State clearly that continuity is broken and the new TEE is trusted from
+     genesis onward.
+   - Trust model is SELF-ATTESTED: on a fresh INACTIVE candidate,
+     `/first-principles/adjudicate` and `/governance/genesis-bootstrap` accept the
+     candidate's OWN attested image digest as the reviewer
+     (`bootstrapGenesisFromAttestedApproval` -> `isSelfAttestedGenesis`); there is
+     no env escape hatch. `TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS` remains an
+     optional pre-blessed-seed reviewer path.
+   - The security boundary is DOWNSTREAM. A genesis lineage is length-1, epoch-1,
+     `femled.tee.governance.genesis.v1` with no predecessor link, so it is rejected
+     by default by the external verifier (`--require-successor-lineage`), by tenants
+     (they accept only lineages extending their previously-accepted broker state),
+     and by sibling TEEs, until each EXPLICITLY re-admits it. Re-admission (fresh
+     tenant admission envelopes + adding the new digest to authoritative-dns-tee
+     `EXTERNAL_TEE_RENEWERS`) is the trust opt-in.
+   - Build authorization is a logged HUMAN gate: the genesis image is built+signed
+     by `.github/workflows/genesis-build.yml` under the `genesis` GitHub Environment
+     (required reviewers), never a repo variable. `build-and-attest.yml` keeps its
+     no-CI-signing-bypass invariant.
+   - Orchestration: `.github/workflows/operator-genesis.yml` opens the complete
+     candidate WIF window (`scripts/reconcile-candidate-resource-iam.mjs --genesis`
+     + the project-role reconciler), provisions a fresh INACTIVE TDX candidate,
+     self-adjudicates, genesis-bootstraps, and verifies. Promotion + candidate-window
+     revoke is `scripts/promote-genesis.sh`. See `GENESIS.md`.
+   - Pin exact image digest, source revision, prompt digest, model policy digest,
+     and verification evidence.
+   - The active-TEE PR/push review path and the lineage-continuation (successor)
+     flow are UNCHANGED; every genesis relaxation is gated on `status === INACTIVE`.
 
 ## Lineage Continuation Handoff
 

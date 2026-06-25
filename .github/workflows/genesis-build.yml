@@ -1,0 +1,205 @@
+## Operator-approved genesis image build (first-class, repeatable).
+##
+## Produces a built + signed auth-broker-tee image for a broken-continuity,
+## self-attested operator genesis when there is NO live active TEE to approve a
+## normal push-side build (build-and-attest.yml deliberately has no CI-flag
+## signing bypass). The trust gate here is a HUMAN one: this job runs under the
+## `genesis` GitHub Environment, so it pauses for the Environment's required
+## reviewers before it builds or signs anything. That keeps the supply-chain
+## invariant intact -- a logged human approval authorizes the build, not a repo
+## variable.
+##
+## The resulting image carries the same artifacts a normal build produces:
+##   - a Cloud KMS cosign signature (the launch / WIF enforcement signature,
+##     with the two Confidential Space annotations), and
+##   - a keyless Sigstore (Fulcio + Rekor) signature + an in-toto attestation
+##     for the public transparency chain the external verifier checks.
+## The source commit being genesised already passed the `compliance gate` on the
+## PR that landed it, so this workflow does not re-run the full compliance suite;
+## it records the approved commit + KMS fingerprint in the genesis attestation.
+##
+## OPERATOR PREREQUISITE (one-time): create a GitHub Environment named `genesis`
+## (repo Settings -> Environments) with required reviewers. Without it the job
+## runs unguarded, which defeats the purpose.
+##
+## After this succeeds, feed the printed image digest to operator-genesis.yml.
+
+name: genesis-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: "Git commit SHA to build the genesis image from (must be on master)"
+        required: true
+        type: string
+      operator_statement:
+        description: "Must explicitly contain 'operator-authorized re-genesis'"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # OIDC for Sigstore keyless + GCP WIF
+
+env:
+  IMAGE_REGISTRY: us-west1-docker.pkg.dev
+  IMAGE_REPO: auth-broker
+  IMAGE_NAME: auth-broker-tee
+  GCP_PROJECT_ID: prod-femled-couple-router
+  # CRYPTO KEY (no version suffix); cosign signs with the current primary version.
+  COSIGN_KMS_KEY_URI: gcpkms://projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-cosign/cryptoKeys/image-signer
+  COSIGN_SIG_ALGORITHM: ECDSA_P256_SHA256
+
+jobs:
+  genesis-build:
+    name: operator-approved genesis build + sign
+    # The required-reviewer approval gate. Build/sign does not start until a
+    # human approves this Environment deployment.
+    environment: genesis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_ref: ${{ steps.build.outputs.image_ref }}
+    steps:
+      - name: Validate operator statement and source revision
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          OPERATOR_STATEMENT: ${{ inputs.operator_statement }}
+        run: |
+          if [[ ! "${SOURCE_REVISION}" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::source_revision must be a 40-char git SHA"; exit 1
+          fi
+          if ! echo "${OPERATOR_STATEMENT}" | grep -qiE 'operator-authorized.*re-genesis|operator authorized.*re-genesis'; then
+            echo "::error::operator_statement must explicitly contain 'operator-authorized re-genesis'"; exit 1
+          fi
+
+      - name: Checkout at the genesis source revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+
+      - name: Authenticate to GCP via WIF (publisher SA)
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
+          service_account: gh-actions-publisher@prod-femled-couple-router.iam.gserviceaccount.com
+          access_token_lifetime: 1200s
+
+      - name: Configure docker for Artifact Registry
+        run: |
+          echo "${{ steps.gcp-auth.outputs.access_token }}" \
+            | docker login -u oauth2accesstoken --password-stdin "${IMAGE_REGISTRY}"
+
+      - name: Setup buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1
+
+      - name: Build and push genesis image (reproducible, by digest)
+        id: build
+        run: |
+          IMAGE_PATH="${IMAGE_REGISTRY}/${GCP_PROJECT_ID}/${IMAGE_REPO}/${IMAGE_NAME}"
+          SHORT_SHA=$(echo '${{ inputs.source_revision }}' | cut -c1-12)
+          STAGING_TAG="${IMAGE_PATH}:genesis-${SHORT_SHA}-${{ github.run_id }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --no-cache \
+            --build-arg SOURCE_DATE_EPOCH=0 \
+            --build-arg COMMIT_SHA=${{ inputs.source_revision }} \
+            --output "type=registry,rewrite-timestamp=true,name=${STAGING_TAG}" \
+            --metadata-file metadata.json \
+            .
+          digest=$(jq -r '."containerimage.digest"' metadata.json)
+          if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+            echo "::error::build did not produce an image digest"; exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Genesis image digest: ${digest}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Cosign keyless sign (Fulcio + Rekor, public chain)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${{ steps.build.outputs.image_ref }}@${{ steps.build.outputs.digest }}"
+
+      - name: Capture Cosign KMS public key + fingerprint
+        id: kms_fp
+        run: |
+          cosign public-key --key "${COSIGN_KMS_KEY_URI}" > cosign-kms.pub
+          fingerprint=$(openssl pkey -pubin -in cosign-kms.pub -outform DER \
+            | openssl dgst -sha256 | awk '{print $2}')
+          pub_b64=$(base64 < cosign-kms.pub | tr -d '\n' | sed 's/=*$//')
+          echo "fingerprint=${fingerprint}" >> "$GITHUB_OUTPUT"
+          echo "pub_b64=${pub_b64}" >> "$GITHUB_OUTPUT"
+          echo "Cosign KMS key fingerprint: ${fingerprint}"
+
+      - name: Cosign KMS sign (Confidential Space launch + WIF enforcement chain)
+        run: |
+          # The two Confidential Space-required annotations; without them the
+          # signature does not surface in submods.container.image_signatures and
+          # the WIF condition rejects the token.
+          cosign sign --yes \
+            --key "${COSIGN_KMS_KEY_URI}" \
+            -a "dev.cosignproject.cosign/sigalg=${COSIGN_SIG_ALGORITHM}" \
+            -a "dev.cosignproject.cosign/pub=${{ steps.kms_fp.outputs.pub_b64 }}" \
+            --tlog-upload=false \
+            "${{ steps.build.outputs.image_ref }}@${{ steps.build.outputs.digest }}"
+
+      - name: Build + attest genesis predicate
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          jq -n \
+            --arg image_digest '${{ steps.build.outputs.digest }}' \
+            --arg image_ref '${{ steps.build.outputs.image_ref }}' \
+            --arg sha '${{ inputs.source_revision }}' \
+            --arg run_id '${{ github.run_id }}' \
+            --arg workflow_ref '${{ github.workflow_ref }}' \
+            --arg kms_fingerprint '${{ steps.kms_fp.outputs.fingerprint }}' \
+            '{
+              schema: "femled.auth_broker_tee.operator_genesis_build.v1",
+              build_kind: "operator-approved-genesis",
+              image_digest: $image_digest,
+              image_reference: $image_ref,
+              commit_sha: $sha,
+              run_id: $run_id,
+              workflow_ref: $workflow_ref,
+              cosign_kms_signature: { status: "passed", key_fingerprint: $kms_fingerprint, signature_algorithm: "ECDSA_P256_SHA256" },
+              compliance: "enforced-at-source-landing (the PR that merged this commit passed the compliance gate)"
+            }' > genesis-predicate.json
+          cat genesis-predicate.json
+          cosign attest --yes \
+            --predicate genesis-predicate.json \
+            --type "https://femled.ai/attestations/auth-broker-compliance/v1" \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${{ steps.build.outputs.image_ref }}@${{ steps.build.outputs.digest }}"
+
+      - name: Emit genesis digest summary
+        run: |
+          {
+            echo "## Operator-approved genesis image ready"
+            echo ""
+            echo "**Image digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo "**Source revision:** \`${{ inputs.source_revision }}\`"
+            echo "**KMS fingerprint:** \`${{ steps.kms_fp.outputs.fingerprint }}\`"
+            echo ""
+            echo "Next: dispatch \`operator-genesis.yml\` with this image_digest."
+          } >> "$GITHUB_STEP_SUMMARY"

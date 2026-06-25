@@ -22,7 +22,7 @@ import {
 import { generateFirstPrinciplesContent } from "./vertex-gemini.js";
 import { collectGitHubSourceEvidence } from "./github-source-evidence.js";
 import { getRouteRegistryStatus } from "./route-registry.js";
-import { buildGovernanceManifestPayload } from "./governance-state.js";
+import { buildGovernanceManifestPayload, isGovernanceInactive } from "./governance-state.js";
 import { recordManifestAttestation } from "./governance-monitor.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -51,11 +51,21 @@ export async function handleFirstPrinciplesAdjudicate(req, res) {
 
   let oidcClaims;
   try {
+    // Genesis self-adjudication presents an operator-genesis.yml workflow_dispatch
+    // OIDC token. Accept that workflow ref + event ONLY while INACTIVE; an active
+    // broker keeps the strict default workflow-ref/event allow-list in github-oidc.js.
+    const genesisOidcExpectations = isGovernanceInactive()
+      ? {
+          allowedEvents: new Set(["workflow_dispatch"]),
+          workflowRefs: ["FemLed/auth-broker-tee/.github/workflows/operator-genesis.yml@refs/heads/master"],
+        }
+      : {};
     oidcClaims = await verifyGitHubActionsOidc(req.headers.authorization, {
       eventName: normalized.request.eventName,
       workflowRunId: normalized.request.workflowRunId,
       baseSha: normalized.request.baseSha,
       headSha: normalized.request.headSha,
+      ...genesisOidcExpectations,
     });
   } catch (error) {
     return jsonResponse(res, 401, { error: error.message });
@@ -253,7 +263,7 @@ async function attestPayload(payload) {
   };
 }
 
-function normalizeAdjudicationRequest(body) {
+export function normalizeAdjudicationRequest(body) {
   if (!body || typeof body !== "object") {
     return { ok: false, error: "Request body must be a JSON object" };
   }
@@ -265,8 +275,14 @@ function normalizeAdjudicationRequest(body) {
   const nonce = body.nonce;
 
   if (repository !== REPOSITORY) return { ok: false, error: `repository must be ${REPOSITORY}` };
-  if (!["pull_request", "pull_request_target", "push"].includes(eventName)) {
-    return { ok: false, error: "eventName must be pull_request, pull_request_target, or push" };
+  // Genesis (broken-continuity) self-adjudication runs from operator-genesis.yml
+  // as a workflow_dispatch; accept that event ONLY on a fresh INACTIVE TEE. An
+  // active broker keeps the original PR/push-only allow-list.
+  const allowedEventNames = isGovernanceInactive()
+    ? ["pull_request", "pull_request_target", "push", "workflow_dispatch"]
+    : ["pull_request", "pull_request_target", "push"];
+  if (!allowedEventNames.includes(eventName)) {
+    return { ok: false, error: "eventName must be pull_request, pull_request_target, push, or (genesis) workflow_dispatch" };
   }
   // The caller only PROPOSES a commit SHA. The TEE independently fetches and
   // reviews that commit from GitHub; no caller-supplied diff is accepted.
