@@ -34,7 +34,9 @@ import {
   isGovernanceActive,
   mayServePath,
   recordAcceptedRouteVersion,
+  retryGovernanceRestoreIfDegraded,
   verifyTenantAdmissionEnvelope,
+  getGovernanceState,
 } from "./governance-state.js";
 import { jsonResponse, textResponse } from "./http-helpers.js";
 import { startRenewalLoop, bootstrapTls, getTlsRuntimeStatus } from "./acme-renewal.js";
@@ -167,8 +169,17 @@ async function main() {
           return await handleRepairCandidate(req, res);
         case "/attestation":
           return await handleAttestation(url, req, res);
-        case "/health":
-          return jsonResponse(res, 200, { status: "ok", tls: getTlsRuntimeStatus() });
+        case "/health": {
+          // Surface governance status/epoch so an external uptime probe can
+          // alert on a broker that booted but failed to (re)activate governance
+          // (e.g. fail-closed on a KMS outage), instead of it going unnoticed.
+          const gov = getGovernanceState();
+          return jsonResponse(res, 200, {
+            status: "ok",
+            governance: { status: gov.status, epoch: gov.epoch },
+            tls: getTlsRuntimeStatus(),
+          });
+        }
         default:
           return textResponse(res, 404, "Not found");
       }
@@ -201,7 +212,10 @@ async function main() {
   });
 
   startRenewalLoop();
-  startAttestationRefreshLoop();
+  // Inject the governance-restore retry so a boot-time KMS outage that left
+  // governance inactive (fail-closed) self-heals on the attestation refresh
+  // cadence without operator action or a re-genesis.
+  startAttestationRefreshLoop({ onTick: () => retryGovernanceRestoreIfDegraded() });
   startSelfImprovementLoop();
 }
 

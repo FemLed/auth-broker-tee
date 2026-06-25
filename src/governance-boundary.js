@@ -17,7 +17,7 @@ export const GOVERNANCE_SECURITY_BOUNDARY = {
     "AI first-principles approval is required but cannot override failed hard checks.",
     "Killing the active TEE before successor handoff bricks governance instead of enabling recovery.",
     "Governance state capsules persisted to GCS are encrypted application-side (AES-GCM with HKDF-derived key over a KMS witness signature bound to the AAD); the bucket is untrusted storage and the capsule AAD pins running image digest, KMS key version, lineage digest, epoch, and transferred state digest.",
-    "Capsule restore requires the same image digest to attest via WIF, fetch the KMS public key, and observe that the lineage tail's signingKeyId equals the KMS-bound governanceKeyId; any mismatch falls back to inactive rather than restoring partial state.",
+    "Capsule restore requires the same image digest to attest via WIF, fetch the KMS public key, verify the lineage chain, and observe that the lineage's ACTIVE governance key (the successor key after the last activation) equals the KMS-bound governanceKeyId; any mismatch falls back to inactive rather than restoring partial state.",
   ],
   nonGoals: [
     "Availability against a hostile GCP owner.",

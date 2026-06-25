@@ -21,7 +21,15 @@ import {
   buildPersistableState,
   persistGovernanceCapsule,
   tryRestoreGovernanceFromCapsule,
+  retryGovernanceRestoreIfDegraded,
+  bootstrapGenesisFromAttestedApproval,
+  completeActivation,
+  applyActivationBundle,
 } from "../src/governance-state.js";
+import {
+  signGenesisCertificate,
+  signSuccessorCertificate,
+} from "../src/governance-certificates.js";
 import { resetGovernanceMonitorForTests } from "../src/governance-monitor.js";
 import {
   buildLatestPointer,
@@ -214,7 +222,7 @@ test("persist and restore: capsule with mismatched KMS key version is refused", 
 
   // Phase 2: cold start with a different KMS key version (and therefore a
   // different governance public key). The pointer's governanceKmsKeyVersion
-  // must match the live key material, and the lineage tail's signingKeyId
+  // must match the live key material, and the lineage's ACTIVE governance key
   // must match the KMS-bound governanceKeyId. Both fail here.
   const km2 = createMockKmsBackedKeyMaterial({
     keyVersion: "projects/test-project/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/2",
@@ -263,3 +271,187 @@ test("buildLatestPointer enforces field types", () => {
   });
   assert.equal(pointer.schema, "femled.auth_broker_tee.governance_state_capsule.latest_pointer.v1");
 });
+
+// ---------------------------------------------------------------------------
+// Successor-activated lineage restore (regression for the inactive-broker
+// incident). A successor certificate is signed by the PREDECESSOR and only
+// NAMES the new active key, so the lineage TAIL's signingKeyId is never the
+// current key once the broker has activated past genesis. The restore gate
+// must therefore check the lineage's ACTIVE key, not the tail signer.
+// ---------------------------------------------------------------------------
+
+const DUMMY_DIGEST = "sha256:" + "11".repeat(32);
+const kmsKeyVersion = (n) =>
+  `projects/test-project/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/${n}`;
+
+// Build a 2-epoch lineage: genesis (epoch 1, self-signed by predecessorKey)
+// followed by a successor cert (epoch 2) that the PREDECESSOR signs to hand off
+// to successorKey. verifyLineage's active key is then successorKey's public key.
+async function buildSuccessorLineage({ predecessorKey, successorKey, imageDigest, now }) {
+  const genesis = await signGenesisCertificate({
+    keyMaterial: predecessorKey,
+    imageDigest,
+    routeRegistryStatus: { trustAnchorsDigest: null, routeBundleDigest: null },
+    attestationDigest: null,
+    now,
+  });
+  const successor = await signSuccessorCertificate({
+    keyMaterial: predecessorKey, // predecessor signs the successor certificate
+    predecessorEpoch: 1,
+    successorEpoch: 2,
+    candidateImageDigest: imageDigest,
+    candidateAttestationDigest: DUMMY_DIGEST,
+    candidateAttestationNonce: "successor-activation-nonce",
+    preapprovalPayloadDigest: DUMMY_DIGEST,
+    successorDecisionPacketDigest: DUMMY_DIGEST,
+    successorArbitrationDigest: DUMMY_DIGEST,
+    successorGovernancePublicKeyPem: successorKey.governancePublicKeyPem,
+    successorGovernanceKeyId: successorKey.governanceKeyId,
+    successorActivationPublicKeyPem: successorKey.activationPublicKeyPem,
+    now,
+  });
+  return [genesis, successor];
+}
+
+test("persist and restore: successor-activated lineage restores ACTIVE (predecessor-signed tail, active key == KMS key)", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const now = new Date();
+  const imageDigest = process.env.TEE_LOCAL_IMAGE_DIGEST;
+  // predecessorKey = epoch-1 (genesis) key that later signs the handoff.
+  // kmsKey = epoch-2 active key the cold-started VM mints from the SAME KMS
+  // key version (kmsKeyVersion 1 == GOVERNANCE_KMS_SIGNER_KEY_VERSION).
+  const predecessorKey = createMockKmsBackedKeyMaterial({ keyVersion: kmsKeyVersion(9) });
+  const kmsKey = createMockKmsBackedKeyMaterial();
+
+  const lineage = await buildSuccessorLineage({ predecessorKey, successorKey: kmsKey, imageDigest, now });
+
+  // Seal an ACTIVE epoch-2 capsule whose live key material is the KMS key but
+  // whose lineage tail is predecessor-signed.
+  initializeGovernance({ mode: "inactive", keyMaterial: kmsKey });
+  const live = getGovernanceState();
+  live.status = "active";
+  live.epoch = 2;
+  live.lineage = lineage;
+  const persisted = await persistGovernanceCapsule({ now });
+  assert.match(persisted.capsuleDigest, /^sha256:[a-f0-9]{64}$/);
+
+  // Cold start with the same KMS key, empty lineage, inactive.
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial: kmsKey });
+  const restored = await tryRestoreGovernanceFromCapsule({ now });
+
+  assert.ok(restored, "successor-activated capsule must restore (regression: the tail-signer gate refused it and forced re-genesis)");
+  assert.equal(restored.status, "active");
+  assert.equal(restored.epoch, 2);
+  const after = getGovernanceState();
+  assert.equal(after.status, "active");
+  assert.equal(after.epoch, 2);
+  assert.equal(after.lineage.length, 2);
+  assert.equal(after.keyMaterial.governanceKeyId, kmsKey.governanceKeyId);
+}));
+
+test("persist and restore: successor lineage whose active key != KMS key is refused", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const now = new Date();
+  const imageDigest = process.env.TEE_LOCAL_IMAGE_DIGEST;
+  const predecessorKey = createMockKmsBackedKeyMaterial({ keyVersion: kmsKeyVersion(9) });
+  const kmsKey = createMockKmsBackedKeyMaterial();                                   // live cold-start key
+  const foreignActiveKey = createMockKmsBackedKeyMaterial({ keyVersion: kmsKeyVersion(7) }); // lineage hands off here
+
+  // Lineage hands off to foreignActiveKey, NOT the live KMS key.
+  const lineage = await buildSuccessorLineage({ predecessorKey, successorKey: foreignActiveKey, imageDigest, now });
+
+  // Seal so the pointer/persistable governance key == the live KMS key (so the
+  // earlier public-key gate passes), while the lineage's ACTIVE key is foreign.
+  // The active-key gate must refuse rather than restore a mismatched lineage.
+  initializeGovernance({ mode: "inactive", keyMaterial: kmsKey });
+  const live = getGovernanceState();
+  live.status = "active";
+  live.epoch = 2;
+  live.lineage = lineage;
+  await persistGovernanceCapsule({ now });
+
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial: kmsKey });
+  const restored = await tryRestoreGovernanceFromCapsule({ now });
+  assert.equal(restored, null, "capsule whose lineage active key != KMS key must be refused");
+  assert.equal(getGovernanceState().status, "inactive");
+}));
+
+test("production refuses to establish active governance with non-KMS key material", withCapsuleEnv(async () => {
+  const prevEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    // applyActivationBundle: inactive candidate holding an in-memory key.
+    resetGovernanceMonitorForTests();
+    resetGovernanceForTests(null);
+    initializeGovernance({ mode: "inactive" });
+    await assert.rejects(
+      () => applyActivationBundle({ successorCertificate: {}, encryptedState: {}, predecessorActivationPublicKeyPem: "x", activationNonce: "n" }),
+      /non-KMS-backed key material in production/,
+    );
+
+    // bootstrapGenesisFromAttestedApproval: inactive, empty lineage, in-memory key.
+    resetGovernanceForTests(null);
+    initializeGovernance({ mode: "inactive" });
+    await assert.rejects(
+      () => bootstrapGenesisFromAttestedApproval({}),
+      /non-KMS-backed key material in production/,
+    );
+
+    // completeActivation: active in-memory predecessor signing a successor.
+    resetGovernanceForTests(null);
+    initializeGovernance({ mode: "genesis" });
+    await assert.rejects(
+      () => completeActivation({}),
+      /non-KMS-backed key material in production/,
+    );
+  } finally {
+    if (prevEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevEnv;
+  }
+}));
+
+test("retry restores ACTIVE after a transient KMS failure at boot (fail closed, then self-heal)", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const now = new Date();
+  const kmsKey = createMockKmsBackedKeyMaterial();
+
+  // Phase 1: steady-state ACTIVE genesis sealed under the KMS key.
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial: kmsKey });
+  assert.equal(getGovernanceState().status, "active");
+  await persistGovernanceCapsule({ now });
+
+  // Phase 2: cold start where KMS key init FAILS once. The broker must fail
+  // closed (stay inactive, in-memory shell) -- NOT silently activate/restore.
+  resetGovernanceForTests(null);
+  let kmsCalls = 0;
+  const flakyFactory = async () => {
+    kmsCalls += 1;
+    if (kmsCalls === 1) throw new Error("simulated transient KMS outage");
+    return kmsKey;
+  };
+  await initializeGovernanceAsync({ mode: "inactive", createKeyMaterial: flakyFactory });
+  assert.equal(getGovernanceState().status, "inactive", "must fail closed (inactive) when KMS init fails at boot");
+  assert.equal(getGovernanceState().keyMaterial.kind, "in-memory");
+
+  // Phase 3: retry on the refresh-loop cadence; KMS now succeeds -> restore.
+  const restored = await retryGovernanceRestoreIfDegraded({ now, createKeyMaterial: flakyFactory });
+  assert.ok(restored, "retry must restore once KMS recovers");
+  assert.equal(restored.status, "active");
+  assert.equal(getGovernanceState().status, "active");
+  assert.equal(getGovernanceState().keyMaterial.kind, "kms-backed");
+  assert.equal(kmsCalls, 2);
+
+  // A second retry once active is a no-op.
+  assert.equal(await retryGovernanceRestoreIfDegraded({ now, createKeyMaterial: flakyFactory }), null);
+  assert.equal(kmsCalls, 2);
+}));

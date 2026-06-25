@@ -70,6 +70,12 @@ const TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS = new Set([
 let state = null;
 let capsuleSerial = 0;
 let capsuleRestoreAttempted = false;
+// Set when KMS-backed governance key initialization failed at boot. We fail
+// closed (stay inactive; never activate or restore with an in-memory key) and
+// let retryGovernanceRestoreIfDegraded() re-attempt KMS init + capsule restore
+// on the refresh loop, so a transient KMS outage self-heals without operator
+// intervention or a re-genesis.
+let kmsUnavailable = false;
 
 export function initializeGovernance({ mode = "inactive", keyMaterial: providedKeyMaterial = null, now = new Date() } = {}) {
   if (state) return state;
@@ -152,14 +158,24 @@ export function initializeGovernance({ mode = "inactive", keyMaterial: providedK
 // `inactive` init. Recovery from that point is the standard
 // genesis-bootstrap path against a trusted-reviewer TEE; there is no
 // env-gated escape hatch.
-export async function initializeGovernanceAsync({ mode = "inactive", keyMaterial: providedKeyMaterial = null, now = new Date() } = {}) {
+export async function initializeGovernanceAsync({ mode = "inactive", keyMaterial: providedKeyMaterial = null, now = new Date(), createKeyMaterial = createKmsBackedGovernanceKeyMaterial } = {}) {
   if (state) return state;
   let keyMaterial = providedKeyMaterial;
   if (!keyMaterial && isKmsGovernanceKeyConfigured()) {
     try {
-      keyMaterial = await createKmsBackedGovernanceKeyMaterial();
+      keyMaterial = await createKeyMaterial();
+      kmsUnavailable = false;
     } catch (error) {
-      console.error("[governance] KMS-backed governance key initialization failed; falling back to in-memory key material:", error.message);
+      // FAIL CLOSED: do NOT silently fall back to an in-memory governance key.
+      // An in-memory key is not recoverable across restarts and is not the
+      // attested KMS-bound key, so activating or restoring with it yields a
+      // lineage that can never self-restore (the root cause of the inactive
+      // broker incident). Instead keep an inactive in-memory shell so /health,
+      // /attestation, and the governance manifest still serve, mark KMS
+      // unavailable, and skip restore. retryGovernanceRestoreIfDegraded()
+      // re-attempts KMS init + capsule restore until Cloud KMS recovers.
+      console.error("[governance] CRITICAL: KMS-backed governance key init failed; staying INACTIVE (no in-memory activation or restore) and will retry:", error.message);
+      kmsUnavailable = true;
       keyMaterial = null;
     }
   }
@@ -199,6 +215,7 @@ export function resetGovernanceForTests(nextState = null) {
   state = nextState;
   capsuleSerial = 0;
   capsuleRestoreAttempted = false;
+  kmsUnavailable = false;
 }
 
 export function getGovernanceState() {
@@ -268,6 +285,17 @@ export async function issuePreapprovalCertificate({
   return envelope;
 }
 
+// In production the active governance key MUST be the KMS-backed, attested,
+// restorable key. Refuse genesis / successor activation with an in-memory key:
+// an in-memory key is lost on restart and yields a lineage that can never
+// self-restore from the capsule (the root cause of the avoidable re-genesis).
+// Dev/test (NODE_ENV != production) may still use in-memory key material.
+function assertKmsBackedGovernanceKeyInProduction(current) {
+  if (process.env.NODE_ENV === "production" && current.keyMaterial.kind !== "kms-backed") {
+    throw new Error("refusing to establish active governance with non-KMS-backed key material in production");
+  }
+}
+
 export async function bootstrapGenesisFromAttestedApproval({
   request,
   response,
@@ -279,6 +307,7 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (current.status !== INACTIVE || current.lineage.length > 0) {
     throw new Error("genesis bootstrap requires inactive governance with empty lineage");
   }
+  assertKmsBackedGovernanceKeyInProduction(current);
   const expectedTarget = targetImageDigest || current.imageDigest;
   if (expectedTarget !== current.imageDigest) {
     throw new Error("genesis bootstrap target image digest must match the running TEE image");
@@ -532,6 +561,7 @@ export async function completeActivation({
 }) {
   assertActiveGovernance();
   const current = getGovernanceState();
+  assertKmsBackedGovernanceKeyInProduction(current);
   let challenge;
   let preapproval;
   let attestation;
@@ -672,6 +702,7 @@ export async function completeActivation({
 export async function applyActivationBundle({ successorCertificate, encryptedState, predecessorActivationPublicKeyPem, activationNonce, now = new Date() }) {
   const current = getGovernanceState();
   if (current.status !== INACTIVE) throw new Error("activation bundle can only be applied to inactive candidate");
+  assertKmsBackedGovernanceKeyInProduction(current);
   if (successorCertificate?.payload?.schema !== SUCCESSOR_SCHEMA) {
     throw new Error("activation bundle successor certificate missing");
   }
@@ -1236,26 +1267,29 @@ export async function tryRestoreGovernanceFromCapsule({ now = new Date() } = {})
     console.warn(`[governance] capsule restore: persistable governance public key does not match KMS public key; ignoring`);
     return null;
   }
-  // Verify lineage chain. If anything looks malformed, refuse the restore.
+  // Verify the full lineage chain: genesis (epoch 1) followed by each
+  // predecessor-signed successor. verifyLineage validates every envelope
+  // signature against its predecessor's key and returns the lineage's ACTIVE
+  // governance key (the successor key handed off by the last activation).
+  let verified;
   try {
-    verifyLineage(persistableState.lineage || [], { now, enforceTerminalExpiry: false });
+    verified = verifyLineage(persistableState.lineage || [], { now, enforceTerminalExpiry: false });
   } catch (error) {
     console.error("[governance] capsule restore: lineage verification failed:", error.message);
     return null;
   }
-  // Verify lineage tail's signingKeyId matches the KMS-bound governance key.
-  const tail = persistableState.lineage[persistableState.lineage.length - 1];
-  if (!tail || tail.signingKeyId !== current.keyMaterial.governanceKeyId) {
-    console.warn("[governance] capsule restore: lineage tail signingKeyId does not match KMS-bound governance key; ignoring");
-    return null;
-  }
-  // Re-verify the tail envelope with the KMS public key to ensure cross-restart
-  // signature continuity (this catches a capsule that names the right key but
-  // was signed under a different KMS version that has been rotated since).
-  try {
-    verifyGovernanceEnvelope(tail, current.keyMaterial.governancePublicKeyPem, { now, enforceExpiry: false });
-  } catch (error) {
-    console.error("[governance] capsule restore: lineage tail envelope verification failed:", error.message);
+  // The lineage's ACTIVE governance key must equal the running KMS-bound key.
+  // We deliberately check the lineage's active key (verifyLineage's
+  // currentGovernancePublicKeyPem) and NOT the lineage TAIL's signingKeyId: a
+  // successor certificate is signed by the PREDECESSOR and only NAMES the new
+  // active key, so once the broker has activated past genesis the tail signer
+  // is never the current key. Checking the tail signer falsely refused every
+  // legitimate successor-activated state, dropping the broker to inactive on
+  // routine host-maintenance cold boots and forcing an avoidable re-genesis.
+  const activeGovernanceKeyId = `sha256:${publicKeyFingerprint(verified.currentGovernancePublicKeyPem)}`;
+  if (activeGovernanceKeyId !== current.keyMaterial.governanceKeyId
+      || verified.currentGovernancePublicKeyPem !== current.keyMaterial.governancePublicKeyPem) {
+    console.warn("[governance] capsule restore: lineage active governance key does not match KMS-bound governance key; ignoring");
     return null;
   }
   current.status = persistableState.status === "retired" ? RETIRED
@@ -1287,4 +1321,37 @@ export async function tryRestoreGovernanceFromCapsule({ now = new Date() } = {})
     status: current.status,
     epoch: current.epoch,
   };
+}
+
+// Retry hook for the boot-time fail-closed path. When KMS-backed governance key
+// init failed at boot, initializeGovernanceAsync keeps an inactive in-memory
+// shell (kmsUnavailable=true) and never activates/restores with it. This
+// re-attempts KMS key init on the periodic refresh loop; on success it swaps in
+// the KMS-backed key material, re-arms the one-shot restore guard, and re-runs
+// the capsule restore -- so a transient Cloud KMS outage self-heals without
+// operator action or a re-genesis. No-op once governance is active, when KMS was
+// healthy at boot, or when KMS is still unavailable.
+export async function retryGovernanceRestoreIfDegraded({ now = new Date(), createKeyMaterial = createKmsBackedGovernanceKeyMaterial } = {}) {
+  if (!state || !kmsUnavailable) return null;
+  if (state.status !== INACTIVE || state.lineage.length > 0) return null;
+  if (!isKmsGovernanceKeyConfigured()) return null;
+  let keyMaterial;
+  try {
+    keyMaterial = await createKeyMaterial();
+  } catch (error) {
+    console.error("[governance] KMS retry still failing; remaining inactive:", error.message);
+    return null;
+  }
+  state.keyMaterial = keyMaterial;
+  kmsUnavailable = false;
+  // Re-arm the one-shot guard so the restore skipped at boot can run now that
+  // we hold the KMS-bound governance key.
+  capsuleRestoreAttempted = false;
+  console.info("[governance] KMS recovered; re-attempting governance capsule restore");
+  try {
+    return await tryRestoreGovernanceFromCapsule({ now });
+  } catch (error) {
+    console.error("[governance] capsule restore retry failed; remaining inactive:", error.message);
+    return null;
+  }
 }
