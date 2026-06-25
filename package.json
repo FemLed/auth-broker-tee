@@ -16,6 +16,8 @@
   },
   "overrides": {
     "node-forge": "1.4.0",
-    "ws": "8.20.1"
+    "ws": "8.21.0",
+    "form-data": "4.0.6",
+    "protobufjs": "7.6.4"
   }
 }
