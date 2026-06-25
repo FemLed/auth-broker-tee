@@ -23,9 +23,16 @@ locals {
   # continuity rollout of governance state capsule persistence).
   gh_operator_genesis_workflow_subject = "${var.gh_repo}/.github/workflows/operator-genesis.yml@${var.gh_branch_ref}"
 
+  # Operator-approved genesis image build workflow. Same repo+branch pin; allows
+  # the workflow_dispatch trigger. Unlike operator-genesis.yml (which impersonates
+  # the activation SA), this impersonates the PUBLISHER SA to build + KMS-sign the
+  # genesis image, gated by the `genesis` GitHub Environment's required reviewers.
+  # See .github/workflows/genesis-build.yml.
+  gh_genesis_build_workflow_subject = "${var.gh_repo}/.github/workflows/genesis-build.yml@${var.gh_branch_ref}"
+
   gh_publisher_workflow_subjects = [
     local.gh_workflow_subject,
-    local.gh_operator_genesis_workflow_subject,
+    local.gh_genesis_build_workflow_subject,
   ]
 
   # Sigstore keyless cert SAN that cosign embeds when GHA OIDC is the issuer.
@@ -76,10 +83,13 @@ resource "google_iam_workload_identity_pool_provider" "github_oidc" {
   #   - operator-genesis.yml on workflow_dispatch (operator-authorized
   #     broken-continuity re-genesis; carries the explicit operator_statement
   #     gate enforced inside the workflow body)
+  #   - genesis-build.yml on workflow_dispatch (operator-approved genesis image
+  #     build+sign; gated upstream by the `genesis` GitHub Environment reviewers
+  #     and carries the same operator_statement gate in the workflow body)
   attribute_condition = join(" && ", [
     "assertion.repository == '${var.gh_repo}'",
     "assertion.ref == '${var.gh_branch_ref}'",
-    "((assertion.job_workflow_ref == '${local.gh_workflow_subject}' && assertion.event_name == 'push') || (assertion.job_workflow_ref == '${local.gh_operator_genesis_workflow_subject}' && assertion.event_name == 'workflow_dispatch'))",
+    "((assertion.job_workflow_ref == '${local.gh_workflow_subject}' && assertion.event_name == 'push') || (assertion.job_workflow_ref == '${local.gh_operator_genesis_workflow_subject}' && assertion.event_name == 'workflow_dispatch') || (assertion.job_workflow_ref == '${local.gh_genesis_build_workflow_subject}' && assertion.event_name == 'workflow_dispatch'))",
   ])
 
   depends_on = [google_project_service.sts]
@@ -120,6 +130,22 @@ resource "google_service_account_iam_member" "gh_actions_token_creator" {
   service_account_id = google_service_account.gh_actions_publisher.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.gh_actions.workload_identity_pool_id}/attribute.workflow_ref/${local.gh_workflow_subject}"
+}
+
+# Allow the operator-approved genesis-build workflow to impersonate the publisher
+# SA (build + KMS-sign the genesis image). Scoped to that exact workflow ref;
+# gated upstream by the provider attribute_condition (repo+branch+workflow_dispatch)
+# and by the `genesis` GitHub Environment's required reviewers.
+resource "google_service_account_iam_member" "gh_actions_genesis_build_wif_user" {
+  service_account_id = google_service_account.gh_actions_publisher.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.gh_actions.workload_identity_pool_id}/attribute.workflow_ref/${local.gh_genesis_build_workflow_subject}"
+}
+
+resource "google_service_account_iam_member" "gh_actions_genesis_build_token_creator" {
+  service_account_id = google_service_account.gh_actions_publisher.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "principalSet://iam.googleapis.com/projects/${var.project_number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.gh_actions.workload_identity_pool_id}/attribute.workflow_ref/${local.gh_genesis_build_workflow_subject}"
 }
 
 # ---------------------------------------------------------------------------

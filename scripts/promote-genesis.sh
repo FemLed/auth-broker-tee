@@ -65,13 +65,116 @@ run() {
 
 echo "==> Promoting genesis digest ${NEW_DIGEST}; retiring ${RETIRE_DIGEST} (dry-run=${DRY_RUN})"
 
-# 1. Revoke the retired image's full WIF access (resource IAM + project roles).
-echo "--- revoke retired digest WIF access ---"
-run node "${SCRIPT_DIR}/reconcile-candidate-resource-iam.mjs" \
-  --operation revoke --genesis --candidate-image-digest "${RETIRE_DIGEST}"
-run gcloud run jobs execute auth-broker-candidate-role-reconciler \
-  --project="${PROJECT_ID}" --region=us-west1 --wait \
-  --update-env-vars="RECONCILE_OPERATION=revoke,CANDIDATE_IMAGE_DIGEST=${RETIRE_DIGEST}"
+# 1. Revoke the retired image's WIF access (shape-agnostic).
+#    The retired digest may have been granted via the active-tee path OR the
+#    candidate --genesis path, and an activated predecessor ACCUMULATES BOTH
+#    active- and candidate-titled conditioned bindings (e.g. "Latest pointer
+#    object only" AND "Latest pointer object only (candidate)"). So we cannot
+#    assume any single grant shape: instead of replaying a grant-shaped revoke
+#    (which aborts the moment one binding's condition/title does not match), we
+#    remove the retired principalSet member from EVERY binding on each resource
+#    regardless of role/condition/title, tolerate already-absent bindings, and
+#    verify zero residual references. The resource set is single-sourced from
+#    reconcile-candidate-resource-iam.mjs so it cannot drift.
+echo "--- revoke retired digest WIF access (shape-agnostic) ---"
+if [[ "${DRY_RUN}" == "true" ]]; then
+  echo "[dry-run] strip principalSet for ${RETIRE_DIGEST} from every binding across secrets/KMS/capsule-bucket/artifact/project, then verify 0 residual"
+else
+  RECONCILER_PATH="${SCRIPT_DIR}/reconcile-candidate-resource-iam.mjs" \
+  RETIRE_DIGEST="${RETIRE_DIGEST}" \
+  node --input-type=module <<'NODE'
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+
+const recon = await import(process.env.RECONCILER_PATH);
+const {
+  PROJECT_ID, ARTIFACT_LOCATION, ARTIFACT_REPOSITORY,
+  SECRET_ACCESSOR_SECRETS, SECRET_VERSION_ADDER_SECRETS,
+  TLS_SEALING_KMS_KEY, GOVERNANCE_SIGNER_KMS_KEY, RENEWER_SIGNER_KMS_KEY,
+  TLS_CAPSULE_BUCKET, candidateWifPrincipal,
+} = recon;
+
+const digest = process.env.RETIRE_DIGEST;
+const member = candidateWifPrincipal(digest);
+let failed = false;
+
+function gcloud(args) {
+  const r = spawnSync("gcloud", args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  return { ok: r.status === 0, stdout: r.stdout || "", stderr: r.stderr || "" };
+}
+const oneLine = (s) => String(s).replace(/\s+/g, " ").trim().slice(0, 200);
+
+// Resource-level IAM: get-iam-policy -> drop `member` from every binding ->
+// set-iam-policy. Each descriptor knows its own gcloud get/set forms.
+const secretNames = [...new Set([...SECRET_ACCESSOR_SECRETS, ...SECRET_VERSION_ADDER_SECRETS])];
+const resources = [
+  ...secretNames.map((s) => ({
+    label: `secret ${s}`,
+    get: ["secrets", "get-iam-policy", s, `--project=${PROJECT_ID}`],
+    set: (f) => ["secrets", "set-iam-policy", s, f, `--project=${PROJECT_ID}`],
+  })),
+  ...[TLS_SEALING_KMS_KEY, GOVERNANCE_SIGNER_KMS_KEY, RENEWER_SIGNER_KMS_KEY].map((k) => ({
+    label: `kms ${k.keyRing}/${k.key}`,
+    get: ["kms", "keys", "get-iam-policy", k.key, `--keyring=${k.keyRing}`, `--location=${k.location}`, `--project=${PROJECT_ID}`],
+    set: (f) => ["kms", "keys", "set-iam-policy", k.key, f, `--keyring=${k.keyRing}`, `--location=${k.location}`, `--project=${PROJECT_ID}`],
+  })),
+  {
+    label: `bucket ${TLS_CAPSULE_BUCKET}`,
+    get: ["storage", "buckets", "get-iam-policy", `gs://${TLS_CAPSULE_BUCKET}`],
+    set: (f) => ["storage", "buckets", "set-iam-policy", `gs://${TLS_CAPSULE_BUCKET}`, f],
+  },
+  {
+    label: `artifact ${ARTIFACT_REPOSITORY}`,
+    get: ["artifacts", "repositories", "get-iam-policy", ARTIFACT_REPOSITORY, `--location=${ARTIFACT_LOCATION}`, `--project=${PROJECT_ID}`],
+    set: (f) => ["artifacts", "repositories", "set-iam-policy", ARTIFACT_REPOSITORY, f, `--location=${ARTIFACT_LOCATION}`, `--project=${PROJECT_ID}`],
+  },
+];
+
+function stripFromResource(res) {
+  const got = gcloud([...res.get, "--format=json"]);
+  if (!got.ok) { console.log(`  [skip] ${res.label}: get-iam-policy failed: ${oneLine(got.stderr)}`); return; }
+  let policy;
+  try { policy = JSON.parse(got.stdout); } catch { console.log(`  [skip] ${res.label}: unparseable policy`); return; }
+  const before = JSON.stringify(policy.bindings || []);
+  policy.bindings = (policy.bindings || [])
+    .map((b) => ({ ...b, members: (b.members || []).filter((m) => m !== member) }))
+    .filter((b) => (b.members || []).length > 0);
+  if (JSON.stringify(policy.bindings) === before) { console.log(`  [ok] ${res.label}: no binding for retired digest`); return; }
+  const tmp = `/tmp/promote-revoke-${process.pid}-${Math.random().toString(36).slice(2)}.json`;
+  fs.writeFileSync(tmp, JSON.stringify(policy));
+  const set = gcloud([...res.set(tmp), "--format=none"]);
+  try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  if (!set.ok) { console.log(`  [FAIL] ${res.label}: set-iam-policy failed: ${oneLine(set.stderr)}`); failed = true; return; }
+  console.log(`  [revoked] ${res.label}`);
+}
+
+console.log(`Revoking WIF member for retired digest:\n  ${member}`);
+for (const res of resources) stripFromResource(res);
+
+// Project-level roles (unconditioned; mirrors reconcile-candidate-project-roles.sh).
+for (const role of ["roles/aiplatform.user", "roles/serviceusage.serviceUsageConsumer"]) {
+  const r = gcloud(["projects", "remove-iam-policy-binding", PROJECT_ID, `--member=${member}`, `--role=${role}`, "--condition=None", "--quiet", "--format=none"]);
+  if (r.ok) console.log(`  [revoked] project ${role}`);
+  else if (/not found/i.test(r.stderr)) console.log(`  [ok] project ${role}: no binding for retired digest`);
+  else { console.log(`  [FAIL] project ${role}: ${oneLine(r.stderr)}`); failed = true; }
+}
+
+// Verify zero residual references to the retired digest.
+let residual = 0;
+for (const res of resources) {
+  const got = gcloud([...res.get, "--format=json"]);
+  if (got.ok && got.stdout.includes(digest)) { console.log(`  [residual] ${res.label} still references ${digest}`); residual += 1; }
+}
+const proj = gcloud(["projects", "get-iam-policy", PROJECT_ID, "--format=json"]);
+if (proj.ok && proj.stdout.includes(digest)) { console.log(`  [residual] project policy still references ${digest}`); residual += 1; }
+
+if (failed || residual > 0) {
+  console.error(`Retire revoke INCOMPLETE (failed=${failed}, residual=${residual}); resolve before continuing promotion.`);
+  process.exit(1);
+}
+console.log("Retire revoke complete: 0 residual references to the retired digest.");
+NODE
+fi
 
 # 2. Repoint the first-principles expected-image-digest to the new live TEE.
 echo "--- repoint FIRST_PRINCIPLES_TEE_EXPECTED_IMAGE_DIGEST ---"
