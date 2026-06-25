@@ -181,8 +181,8 @@ jobs:
           gcloud compute instances create "${VM_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \
-            --machine-type=n2d-standard-2 \
-            --confidential-compute \
+            --machine-type=c3-standard-4 \
+            --confidential-compute-type=TDX \
             --maintenance-policy=TERMINATE \
             --image-family=confidential-space \
             --image-project=confidential-space-images \

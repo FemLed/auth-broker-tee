@@ -78,7 +78,7 @@ export async function handleAttestation(url, req, res) {
  * Starts a background loop that refreshes the cached attestation token
  * every 10 minutes. Called once from server.js after startup.
  */
-export function startAttestationRefreshLoop() {
+export function startAttestationRefreshLoop({ onTick } = {}) {
   async function refresh() {
     try {
       cachedToken = await requestAttestationToken([]);
@@ -87,6 +87,17 @@ export function startAttestationRefreshLoop() {
     } catch (err) {
       recordAttestationRefresh({ status: "failed", reason: err.message });
       console.error("[Attestation] Background refresh failed:", err.message);
+    }
+    // Optional governance-restore retry hook (injected by server.js). Runs on
+    // this existing periodic cadence so a boot-time KMS outage that left
+    // governance inactive self-heals without operator action. Isolated from the
+    // attestation refresh above: a failure here never affects attestation.
+    if (onTick) {
+      try {
+        await onTick();
+      } catch (err) {
+        console.error("[Attestation] refresh-loop onTick hook failed:", err.message);
+      }
     }
   }
 

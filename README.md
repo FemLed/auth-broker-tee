@@ -28,10 +28,10 @@ exposed.
 
 FemLed's OAuth broker runs inside
 [Google Cloud Confidential Space](https://docs.cloud.google.com/confidential-computing/confidential-space/docs/confidential-space-overview),
-a hardware-sealed environment powered by AMD SEV memory encryption.
+a hardware-sealed environment powered by Intel TDX memory encryption.
 
 Confidential Space is not a software policy or a corporate promise. It is
-a physical property of the hardware. The AMD processor encrypts the
+a physical property of the hardware. The Intel processor encrypts the
 broker's memory with keys that are inaccessible to the operating system,
 the hypervisor, Google Cloud itself, and FemLed's operators.
 
@@ -39,7 +39,7 @@ Concretely, this means:
 
 - **FemLed cannot SSH into the machine.** The Confidential Space production
   image blocks all remote access.
-- **FemLed cannot read the machine's memory.** AMD SEV encrypts it at the
+- **FemLed cannot read the machine's memory.** Intel TDX encrypts it at the
   hardware level. Not even the hypervisor can decrypt it.
 - **FemLed cannot enable logging.** The broker's code includes a hardware-
   enforced launch policy that blocks the operator from capturing any output.
