@@ -328,13 +328,14 @@ test("genesis bootstrap rejects untrusted reviewer image or unbound target", asy
   });
 });
 
-test("genesis bootstrap rejects self-attested reviewer without trusted-reviewer fallback", async () => {
-  // The previous GENESIS_RECOVERY_MODE escape hatch was removed once
-  // KMS-sealed governance state capsules made unplanned VM resets
-  // recoverable without operator intervention. Self-attestation as
-  // reviewer is no longer permitted under any environment variable;
-  // the only path to genesis is a reviewer whose attested image digest
-  // is in TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS.
+test("genesis bootstrap allows operator-authorized self-attested re-genesis", async () => {
+  // Broken-continuity re-genesis: when no live trusted reviewer is available
+  // (e.g. the active TEE is unrecoverably inactive and returns 423), a freshly
+  // provisioned INACTIVE TEE may self-attest its own genesis. The running
+  // image's source revision must still match the TEE-approved commit, and the
+  // resulting lineage is NOT trusted by tenants until they re-admit it --
+  // tenant lineage-pinning + fresh admission envelopes are the trust boundary,
+  // not an external reviewer.
   resetGovernanceForTests(null);
   resetGovernanceMonitorForTests();
   await withMockedImageProvenance({ sourceRevision: "b".repeat(40) }, async () => {
@@ -344,24 +345,19 @@ test("genesis bootstrap rejects self-attested reviewer without trusted-reviewer 
       decision: "APPROVE",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
-    // Even with the (removed) flag set, self-attestation must be refused.
-    const previousFlag = process.env.GENESIS_RECOVERY_MODE;
-    process.env.GENESIS_RECOVERY_MODE = "true";
-    try {
-      await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
-        request,
-        response,
-        verifyAttestation: async (_jwt, expected) => ({
-          dbgstat: "disabled-since-boot",
-          swname: "CONFIDENTIAL_SPACE",
-          eat_nonce: expected.expectedNonce,
-          submods: { container: { image_digest: current.imageDigest } },
-        }),
-      }), /not trusted/);
-    } finally {
-      if (previousFlag === undefined) delete process.env.GENESIS_RECOVERY_MODE;
-      else process.env.GENESIS_RECOVERY_MODE = previousFlag;
-    }
+    const manifest = await bootstrapGenesisFromAttestedApproval({
+      request,
+      response,
+      verifyAttestation: async (_jwt, expected) => ({
+        dbgstat: "disabled-since-boot",
+        swname: "CONFIDENTIAL_SPACE",
+        eat_nonce: expected.expectedNonce,
+        submods: { container: { image_digest: current.imageDigest } },
+      }),
+    });
+    assert.equal(manifest.status, "active");
+    assert.equal(manifest.epoch, 1);
+    assert.equal(manifest.lineage[0].payload.genesisBootstrap.reviewerImageDigest, current.imageDigest);
   });
 });
 
