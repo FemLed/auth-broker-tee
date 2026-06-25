@@ -1,47 +1,47 @@
-## Operator-authorized broken-continuity re-genesis for auth-broker-tee.
+## Operator-authorized broken-continuity re-genesis for auth-broker-tee
+## (first-class, repeatable).
 ##
-## Use this workflow ONLY when the active TEE's first-principles policy is
-## incompatible with the candidate image and the operator has explicitly
-## authorized a broken-continuity event (e.g., the governance state capsule
-## persistence rollout that moves governance signing keys to KMS and
-## persists predecessor-signed lineage to GCS).
+## Use ONLY for a deliberate broken-continuity event: the active TEE's
+## first-principles policy is incompatible with the candidate image, OR there is
+## no recoverable active TEE (e.g. an unrecoverably inactive broker). This is an
+## explicit lineage RESET, not a predecessor-approved successor. Continuity is
+## broken: the new lineage starts at epoch 1 and is NOT trusted by relying
+## parties (tenants, the external verifier run with --require-successor-lineage,
+## sibling TEEs) until they explicitly re-admit it.
 ##
 ## Pre-conditions (all must already be true before this runs):
-##   1. The candidate image has been built via build-and-attest.yml's
-##      ALLOW_AUTH_BROKER_TEE_BOOTSTRAP_BUILD path (no active TEE
-##      adjudication; bypass recorded in the compliance predicate).
-##   2. The new digest is in terraform's candidate_image_digests so WIF
-##      grants Secret Manager / KMS / GCS read access to the new principal.
-##   3. The KMS governance signer key and GCS capsule bucket exist
-##      (terraform/governance-state-capsule.tf applied).
+##   1. The signed genesis image exists, built by genesis-build.yml under the
+##      `genesis` GitHub Environment (required-reviewer approval). Pass its
+##      digest as image_digest and the same commit as source_revision.
+##   2. This workflow opens the candidate WIF window itself (the --genesis
+##      reconciler), so no manual Terraform candidate_image_digests edit is needed.
+##   3. The KMS governance signer key and GCS capsule bucket exist.
 ##
 ## What this workflow does:
-##   1. Provisions a fresh inactive candidate VM with the new image and
-##      tee-env-GENESIS_RECOVERY_MODE=true so the new TEE can self-attest
-##      as its own genesis reviewer.
-##   2. Waits for the candidate VM HTTPS endpoint to be reachable.
-##   3. Builds the first-principles adjudication request (diff that
-##      describes the candidate image).
-##   4. Asks the new TEE to adjudicate per its own (updated) first-
-##      principles. The carve-outs in the new prompt explicitly permit the
-##      image-attested KMS-witnessed state capsule pattern, so a properly
-##      constructed candidate diff approves cleanly.
-##   5. POSTs the signed adjudication response to the new TEE's
-##      /governance/genesis-bootstrap. GENESIS_RECOVERY_MODE=true allows
-##      the self-attested reviewer (since the request and reviewer image
-##      digest match).
-##   6. Verifies the new TEE reports active + epoch 1 + the expected
-##      image digest, and that the governance state capsule was written.
+##   1. Opens the COMPLETE genesis candidate WIF window for the image digest
+##      (reconcile-candidate-resource-iam.mjs --genesis + the project-role
+##      reconciler) so the candidate can sign its genesis cert, mint TLS, and
+##      write its first capsule.
+##   2. Provisions a fresh INACTIVE Intel TDX candidate VM running the image.
+##   3. Waits for its HTTPS endpoint and confirms it reports inactive.
+##   4. Builds the first-principles adjudication request and asks the candidate
+##      to self-adjudicate (allowed only while INACTIVE; auth is the
+##      operator-genesis GitHub OIDC token).
+##   5. POSTs the signed APPROVE to /governance/genesis-bootstrap, which accepts
+##      the self-attested reviewer (the candidate's own image digest) and goes
+##      active at epoch 1.
+##   6. Verifies active + epoch 1 + the expected image digest; uploads evidence.
+##      On failure, revokes the candidate window and deletes the VM.
 ##
-## Operator follow-up after this workflow succeeds:
-##   - Update Cloudflare oauth-tee.femled.ai A record to the new VM's IP.
-##   - Update authoritative-dns-tee/src/zone-manifest.js to match.
-##   - When DNS has propagated and the new TEE is steady-state, decommission
-##     the old VM via gcloud compute instances delete.
-##   - Remove GENESIS_RECOVERY_MODE from the new VM's metadata via
-##     gcloud compute instances remove-metadata so future restarts use the
-##     standard capsule restore path rather than the self-attestation
-##     escape hatch.
+## Operator follow-up after this workflow succeeds (explicit operator actions):
+##   - Update Cloudflare oauth-tee.femled.ai A record to the new VM's IP and
+##     authoritative-dns-tee/src/zone-manifest.js to match.
+##   - Re-admit the new (broken-continuity) lineage with tenants (fresh admission
+##     envelopes) and add the new digest to authoritative-dns-tee
+##     EXTERNAL_TEE_RENEWERS so it can mint TLS.
+##   - Run scripts/promote-genesis.sh to promote active IAM and REVOKE the
+##     candidate window once the new TEE is steady-state, then decommission the
+##     old VM.
 
 name: operator-genesis
 
@@ -136,6 +136,26 @@ jobs:
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Open genesis candidate WIF window (complete binding set)
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          # Genesis needs the FULL candidate binding set (--genesis): the
+          # successor subset (secrets, tls-sealing, TLS capsule object, artifact
+          # reader, project roles) PLUS governance-signer + renewer-signer
+          # (signerVerifier/viewer) and capsule reader/writer/latest-pointer, so a
+          # self-attested genesis can sign its cert, mint TLS, and write its first
+          # capsule. Scoped to the exact image-digest principalSet; revoked by the
+          # failure-cleanup step and by scripts/promote-genesis.sh after promotion.
+          node scripts/reconcile-candidate-resource-iam.mjs \
+            --operation grant --genesis \
+            --candidate-image-digest "${IMAGE_DIGEST}"
+          gcloud run jobs execute auth-broker-candidate-role-reconciler \
+            --project="${GCP_PROJECT_ID}" \
+            --region=us-west1 \
+            --wait \
+            --update-env-vars="RECONCILE_OPERATION=grant,CANDIDATE_IMAGE_DIGEST=${IMAGE_DIGEST}"
+
       - name: Resolve candidate VM name and check non-collision
         id: vm
         env:
@@ -160,11 +180,11 @@ jobs:
           IMAGE_REFERENCE: ${{ inputs.image_reference }}
           VM_NAME: ${{ steps.vm.outputs.vm_name }}
         run: |
-          # GENESIS_RECOVERY_MODE=true permits self-attested genesis since
-          # this is an explicit broken-continuity event under a new
-          # first-principles policy. The operator removes the metadata
-          # key after genesis succeeds so subsequent VM restarts go through
-          # the capsule restore path instead.
+          # Self-attested genesis is permitted by the image code while INACTIVE
+          # (bootstrapGenesisFromAttestedApproval accepts the candidate's own
+          # attested image digest); there is no VM-metadata escape-hatch flag. The
+          # candidate WIF window opened above lets it sign its genesis cert, mint
+          # TLS, and write its first capsule.
           metadata="tee-image-reference=${IMAGE_REFERENCE}@${IMAGE_DIGEST}"
           metadata="${metadata},tee-restart-policy=Always"
           metadata="${metadata},tee-signed-image-repos=${IMAGE_REFERENCE}"
@@ -173,11 +193,11 @@ jobs:
           metadata="${metadata},tee-env-REDIRECT_URI=https://oauth-tee.femled.ai/callback"
           metadata="${metadata},tee-env-GOOGLE_SCOPES=openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
           metadata="${metadata},tee-env-AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION=auth_broker_route_documents"
-          # GOVERNANCE_KMS_SIGNER_KEY_VERSION and CAPSULE_BUCKET are now image-PINNED
+          # GOVERNANCE_KMS_SIGNER_KEY_VERSION and CAPSULE_BUCKET are image-PINNED
           # (Dockerfile ENV) and dropped from allow_env_override, so they must NOT
           # be passed as overridable tee-env metadata (the launcher rejects env not
-          # in allow_env_override). GENESIS_RECOVERY_MODE was removed from the image
-          # (capsule restore is the steady-state recovery path), so it is gone too.
+          # in allow_env_override). There is no genesis escape-hatch env var:
+          # self-attested genesis is enforced in code (INACTIVE-only), not metadata.
           gcloud compute instances create "${VM_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \
@@ -337,16 +357,11 @@ jobs:
             echo "**Candidate IP:** \`${CANDIDATE_IP}\`"
             echo "**Image digest:** \`${IMAGE_DIGEST}\`"
             echo ""
-            echo "### Next operator steps"
-            echo "1. Update Cloudflare DNS \`oauth-tee.femled.ai\` A record to \`${CANDIDATE_IP}\`."
-            echo "2. Update \`authoritative-dns-tee/src/zone-manifest.js\` to match."
-            echo "3. Verify the new TEE is steady-state, then remove \`tee-env-GENESIS_RECOVERY_MODE\` metadata via:"
-            echo "   \`\`\`"
-            echo "   gcloud compute instances remove-metadata ${VM_NAME} \\"
-            echo "     --keys=tee-env-GENESIS_RECOVERY_MODE \\"
-            echo "     --zone=us-west1-b --project=${GCP_PROJECT_ID}"
-            echo "   \`\`\`"
-            echo "4. Decommission the old recovery VM \`auth-broker-tee-recovery-ac7192275ce2\` once cutover is confirmed."
+            echo "### Next operator steps (explicit, NOT automated)"
+            echo "1. Update Cloudflare DNS \`oauth-tee.femled.ai\` A record to \`${CANDIDATE_IP}\` and \`authoritative-dns-tee/src/zone-manifest.js\` to match."
+            echo "2. Re-admit this broken-continuity lineage with tenants (fresh admission envelopes) and add \`${IMAGE_DIGEST}\` to authoritative-dns-tee EXTERNAL_TEE_RENEWERS so it can mint TLS."
+            echo "3. Once steady-state, run \`scripts/promote-genesis.sh --image-digest ${IMAGE_DIGEST}\` to promote active IAM and REVOKE the candidate window."
+            echo "4. Decommission the old VM once cutover is confirmed."
             echo ""
             echo "### Active manifest"
             echo "\`\`\`json"
@@ -366,3 +381,23 @@ jobs:
             genesis-bootstrap-response.json
             active-manifest.json
           retention-days: 365
+
+      - name: Cleanup on failure (revoke candidate window + delete VM)
+        if: failure()
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+        run: |
+          # A failed genesis must not leave a standing privileged candidate WIF
+          # window or an inactive VM that would block re-dispatch (the non-collision
+          # check) and bill. Best-effort revoke + delete.
+          node scripts/reconcile-candidate-resource-iam.mjs \
+            --operation revoke --genesis \
+            --candidate-image-digest "${IMAGE_DIGEST}" || true
+          gcloud run jobs execute auth-broker-candidate-role-reconciler \
+            --project="${GCP_PROJECT_ID}" --region=us-west1 --wait \
+            --update-env-vars="RECONCILE_OPERATION=revoke,CANDIDATE_IMAGE_DIGEST=${IMAGE_DIGEST}" || true
+          if [[ -n "${VM_NAME}" ]]; then
+            gcloud compute instances delete "${VM_NAME}" \
+              --zone=us-west1-b --project="${GCP_PROJECT_ID}" --quiet || true
+          fi

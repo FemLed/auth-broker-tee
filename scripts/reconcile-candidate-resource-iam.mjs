@@ -40,6 +40,25 @@ export const TLS_SEALING_KMS_KEY = Object.freeze({
 export const TLS_CAPSULE_BUCKET = "prod-femled-couple-router-auth-broker-tee-governance-capsules";
 export const TLS_CAPSULE_OBJECT = "tls/oauth-tee.tls-capsule.v1.json";
 
+// Genesis-only resources. A SUCCESSOR candidate receives its governance key and
+// transferred state in-enclave and carries its TLS cert over, so it needs none
+// of these at candidate stage. A self-attested GENESIS mints everything fresh:
+// it signs its own genesis certificate (governance-signer), mints its first TLS
+// cert via DNS-01 (renewer-governance-signer), and writes its first state
+// capsule + latest-pointer to the capsule bucket. These mirror the Terraform
+// `*_candidates` resources and are only granted with --genesis.
+export const GOVERNANCE_SIGNER_KMS_KEY = Object.freeze({
+  keyRing: "auth-broker-governance",
+  key: "governance-signer",
+  location: "us-west1",
+});
+export const RENEWER_SIGNER_KMS_KEY = Object.freeze({
+  keyRing: "auth-broker-acme-renewer",
+  key: "renewer-governance-signer",
+  location: "us-west1",
+});
+export const CAPSULE_POINTER_OBJECT = "capsules/latest-pointer.json";
+
 const VALID_OPERATIONS = new Set(["grant", "revoke"]);
 
 export function parseArgs(argv = process.argv.slice(2)) {
@@ -47,6 +66,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     operation: "",
     candidateImageDigest: "",
     dryRun: false,
+    genesis: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -58,6 +78,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     if (arg === "--operation") options.operation = next();
     else if (arg === "--candidate-image-digest") options.candidateImageDigest = next();
     else if (arg === "--dry-run") options.dryRun = true;
+    else if (arg === "--genesis") options.genesis = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -71,7 +92,7 @@ export function candidateWifPrincipal(candidateImageDigest) {
   return `principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/attribute.image_digest/${candidateImageDigest}`;
 }
 
-export function buildIamOperations({ operation, candidateImageDigest }) {
+export function buildIamOperations({ operation, candidateImageDigest, genesis = false }) {
   if (!VALID_OPERATIONS.has(operation)) {
     throw new Error("operation must be grant or revoke");
   }
@@ -83,7 +104,7 @@ export function buildIamOperations({ operation, candidateImageDigest }) {
     ? "add-iam-policy-binding"
     : "remove-iam-policy-binding";
 
-  return [
+  const operations = [
     ...SECRET_ACCESSOR_SECRETS.map((secret) => ({
       kind: "secret",
       resource: secret,
@@ -161,6 +182,66 @@ export function buildIamOperations({ operation, candidateImageDigest }) {
       ],
     },
   ];
+
+  if (genesis) {
+    operations.push(...genesisOnlyOperations({ command: secretCommand, member }));
+  }
+  return operations;
+}
+
+// Bindings a self-attested GENESIS needs that a SUCCESSOR does not: sign its own
+// genesis cert (governance-signer), mint its first TLS cert via DNS-01
+// (renewer-governance-signer), and write its first state capsule + latest-pointer
+// to the capsule bucket. Mirrors the Terraform `*_candidates` resources. Granted
+// only with --genesis; revoked after promotion.
+function genesisOnlyOperations({ command, member }) {
+  const kmsRole = (keySpec, role) => ({
+    kind: "kmsKey",
+    resource: `${keySpec.keyRing}/${keySpec.key}`,
+    role,
+    command: [
+      "kms", "keys", command, keySpec.key,
+      `--keyring=${keySpec.keyRing}`,
+      `--location=${keySpec.location}`,
+      `--project=${PROJECT_ID}`,
+      `--member=${member}`,
+      `--role=${role}`,
+      "--condition=None",
+      "--quiet",
+    ],
+  });
+  const bucketRole = (role) => ({
+    kind: "bucket",
+    resource: TLS_CAPSULE_BUCKET,
+    role,
+    command: [
+      "storage", "buckets", command, `gs://${TLS_CAPSULE_BUCKET}`,
+      `--member=${member}`,
+      `--role=${role}`,
+      "--condition=None",
+      "--quiet",
+    ],
+  });
+  return [
+    kmsRole(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier"),
+    kmsRole(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.viewer"),
+    kmsRole(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier"),
+    kmsRole(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.viewer"),
+    bucketRole("roles/storage.objectViewer"),
+    bucketRole("roles/storage.objectCreator"),
+    {
+      kind: "bucket",
+      resource: `${TLS_CAPSULE_BUCKET}/${CAPSULE_POINTER_OBJECT}`,
+      role: "roles/storage.objectAdmin",
+      command: [
+        "storage", "buckets", command, `gs://${TLS_CAPSULE_BUCKET}`,
+        `--member=${member}`,
+        "--role=roles/storage.objectAdmin",
+        `--condition=expression=resource.name.endsWith("/objects/${CAPSULE_POINTER_OBJECT}"),title=Latest pointer object only (candidate)`,
+        "--quiet",
+      ],
+    },
+  ];
 }
 
 export function isSha256Digest(value) {
@@ -175,7 +256,8 @@ function runGcloud(args) {
 }
 
 function usage() {
-  return `Usage: node scripts/reconcile-candidate-resource-iam.mjs --operation <grant|revoke> --candidate-image-digest <sha256:digest> [--dry-run]`;
+  return `Usage: node scripts/reconcile-candidate-resource-iam.mjs --operation <grant|revoke> --candidate-image-digest <sha256:digest> [--dry-run] [--genesis]
+  --genesis  also grant/revoke the genesis-only bindings (governance-signer + renewer-signer signerVerifier/viewer, capsule reader/writer/latest-pointer). Required for a self-attested operator genesis; omit for successor candidates.`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -192,6 +274,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       candidateImageDigest: options.candidateImageDigest,
       candidateMember: candidateWifPrincipal(options.candidateImageDigest),
       dryRun: options.dryRun,
+      genesis: options.genesis,
       operations: operations.map(({ command, ...summary }) => summary),
     };
     if (!options.dryRun) {

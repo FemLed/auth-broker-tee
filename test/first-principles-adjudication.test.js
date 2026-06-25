@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { sha256Digest } from "../src/canonical-json.js";
-import { adjudicate } from "../src/first-principles-adjudication.js";
+import { adjudicate, normalizeAdjudicationRequest } from "../src/first-principles-adjudication.js";
+import { resetGovernanceForTests, initializeGovernance } from "../src/governance-state.js";
 
 const HEAD = "a".repeat(40);
 const STUB_DIFF = "diff --git a/src/routes.js b/src/routes.js\n+ benign";
@@ -93,4 +94,29 @@ test("broker self-repo adjudication fails closed when GitHub evidence cannot be 
     }),
     /could not collect auth-broker source evidence/,
   );
+});
+
+test("genesis: an INACTIVE candidate accepts a workflow_dispatch adjudication (self-attested genesis)", () => {
+  resetGovernanceForTests(null);
+  initializeGovernance(); // fresh INACTIVE candidate
+  const result = normalizeAdjudicationRequest({ ...baseRequest, eventName: "workflow_dispatch" });
+  assert.equal(result.ok, true, "an INACTIVE candidate must accept a genesis workflow_dispatch adjudication");
+  assert.equal(result.request.eventName, "workflow_dispatch");
+  resetGovernanceForTests(null);
+});
+
+test("genesis posture is INACTIVE-only: an ACTIVE broker rejects workflow_dispatch", () => {
+  resetGovernanceForTests({ status: "active" });
+  const result = normalizeAdjudicationRequest({ ...baseRequest, eventName: "workflow_dispatch" });
+  assert.equal(result.ok, false, "an ACTIVE broker must NOT accept workflow_dispatch (PR/push only)");
+  resetGovernanceForTests(null);
+});
+
+test("normal PR/push adjudication events are accepted regardless of governance status", () => {
+  resetGovernanceForTests({ status: "active" });
+  assert.equal(normalizeAdjudicationRequest({ ...baseRequest, eventName: "push" }).ok, true);
+  resetGovernanceForTests(null);
+  initializeGovernance();
+  assert.equal(normalizeAdjudicationRequest({ ...baseRequest, eventName: "pull_request" }).ok, true);
+  resetGovernanceForTests(null);
 });

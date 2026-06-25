@@ -269,7 +269,11 @@ test("inactive candidates and retired predecessors cannot serve privileged route
   assert.equal(mayServePath("/.well-known/femled-tee-governance.json"), true);
   assert.equal(mayServePath("/governance/genesis-bootstrap"), true);
   assert.equal(mayServePath("/login"), false);
-  assert.equal(mayServePath("/first-principles/adjudicate"), false);
+  // Genesis exception: /first-principles/adjudicate IS served while INACTIVE so
+  // operator-genesis.yml can obtain a signed APPROVE (auth still enforced in the
+  // handler). Other privileged governance-mutation routes stay denied.
+  assert.equal(mayServePath("/first-principles/adjudicate"), true);
+  assert.equal(mayServePath("/governance/preapprove"), false);
   resetGovernanceForTests(null);
   assert.throws(() => initializeGovernance({ mode: "active" }), /active governance/);
 });
