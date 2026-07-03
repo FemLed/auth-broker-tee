@@ -20,14 +20,14 @@ ENV NODE_ENV=production
 ENV GOVERNANCE_KMS_SIGNER_KEY_VERSION="projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/1"
 ENV CAPSULE_BUCKET="prod-femled-couple-router-auth-broker-tee-governance-capsules"
 
-# Sealed in-enclave TLS trust roots, image-PINNED like the governance config
+# Ephemeral in-enclave TLS trust roots, image-PINNED like the governance config
 # above. The renewer signer key authenticates this caller to the
-# authoritative-dns-tee renewer route for ACME DNS-01; the renewer itself is
-# baked ON because sealed TLS makes in-enclave minting mandatory at genesis
-# (there is no Secret Manager TLS pair to seed). Lineage-continuity boots
-# (candidates, successor activations, restarts) unseal the TLS capsule from
-# CAPSULE_BUCKET (tls/ object) and never spend a Let's Encrypt order. The
-# sealing KMS key name is image-baked in src/tls-capsule.js.
+# authoritative-dns-tee renewer route for ACME DNS-01; the renewer is baked ON
+# because in-enclave minting is mandatory (there is no Secret Manager TLS pair
+# and no sealed capsule). TLS is EPHEMERAL: every cold boot mints a fresh cert
+# in enclave memory and nothing is persisted, so a GCP project/org IAM owner has
+# no TLS ciphertext to decrypt. A non-secret mint ledger (src/tls-mint-log.js)
+# guards the Let's Encrypt weekly limit against reboot loops.
 ENV RENEWER_KMS_SIGNER_KEY_VERSION="projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-acme-renewer/cryptoKeys/renewer-governance-signer/cryptoKeyVersions/1"
 ENV ACME_RENEWER_ENABLED="true"
 

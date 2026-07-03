@@ -35,6 +35,8 @@ import {
   mayServePath,
   recordAcceptedRouteVersion,
   retryGovernanceRestoreIfDegraded,
+  governanceCapsuleHeartbeatIfDue,
+  getCapsuleSerial,
   verifyTenantAdmissionEnvelope,
   getGovernanceState,
 } from "./governance-state.js";
@@ -82,23 +84,21 @@ async function loadSecrets() {
 
 async function main() {
   await loadSecrets();
-  // Self-bootstrap TLS before the listener binds AND before governance
-  // initialization (so the post-restore lineage reconcile sees the adopted
-  // material). Lineage-continuity boots (successor activations, roll
-  // candidates, same-image restarts) unseal the attestation-gated capsule and
-  // carry the existing in-enclave cert forward; an ACME mint runs only when
-  // no usable capsule exists or the carried cert is expired/due. The key+cert
-  // live ONLY in process memory afterward -- there is no Secret Manager TLS
-  // pair anymore.
+  // Self-bootstrap TLS before the listener binds. TLS is ephemeral: there is
+  // no sealed capsule to carry over, so every cold boot mints a fresh cert
+  // in-enclave via ACME DNS-01. The key+cert live ONLY in process memory --
+  // nothing is sealed to KMS or written to GCS/Secret Manager, so a GCP
+  // project/org IAM owner has nothing to decrypt. A non-secret mint ledger
+  // guards against a reboot loop exhausting the Let's Encrypt weekly limit.
   await bootstrapTls();
   // initializeGovernanceAsync wires up KMS-backed key material (when
   // GOVERNANCE_KMS_SIGNER_KEY_VERSION is configured) and attempts to
   // restore governance state from the latest GCS-backed capsule so a
   // VM restart (host maintenance) does not surface as governance loss.
   // On any restore-time integrity mismatch we fall back to inactive and
-  // require the standard genesis or successor flow to re-activate. A
-  // successful restore fires the TLS lineage reconcile (carry-over kept;
-  // anchor verified).
+  // require the standard genesis or successor flow to re-activate. (TLS is
+  // ephemeral and independent of governance restore: it was already minted
+  // fresh by bootstrapTls above.)
   await initializeGovernanceAsync();
   setTenantAdmissionVerifier(verifyTenantAdmissionEnvelope);
   setAcceptedRouteRecorder(recordAcceptedRouteVersion);
@@ -176,7 +176,7 @@ async function main() {
           const gov = getGovernanceState();
           return jsonResponse(res, 200, {
             status: "ok",
-            governance: { status: gov.status, epoch: gov.epoch },
+            governance: { status: gov.status, epoch: gov.epoch, capsuleSerial: getCapsuleSerial() },
             tls: getTlsRuntimeStatus(),
           });
         }
@@ -212,10 +212,17 @@ async function main() {
   });
 
   startRenewalLoop();
-  // Inject the governance-restore retry so a boot-time KMS outage that left
-  // governance inactive (fail-closed) self-heals on the attestation refresh
-  // cadence without operator action or a re-genesis.
-  startAttestationRefreshLoop({ onTick: () => retryGovernanceRestoreIfDegraded() });
+  // Inject two governance maintenance ticks onto the attestation refresh
+  // cadence: (1) restore-retry so a boot-time KMS outage that left governance
+  // inactive (fail-closed) self-heals without operator action or a re-genesis;
+  // (2) the capsule heartbeat so the true head is re-sealed periodically and
+  // never ages out of the bucket retention window (anti-rollback).
+  startAttestationRefreshLoop({
+    onTick: async () => {
+      await retryGovernanceRestoreIfDegraded();
+      await governanceCapsuleHeartbeatIfDue();
+    },
+  });
   startSelfImprovementLoop();
 }
 

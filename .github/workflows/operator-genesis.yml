@@ -141,12 +141,14 @@ jobs:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
         run: |
           # Genesis needs the FULL candidate binding set (--genesis): the
-          # successor subset (secrets, tls-sealing, TLS capsule object, artifact
-          # reader, project roles) PLUS governance-signer + renewer-signer
-          # (signerVerifier/viewer) and capsule reader/writer/latest-pointer, so a
-          # self-attested genesis can sign its cert, mint TLS, and write its first
-          # capsule. Scoped to the exact image-digest principalSet; revoked by the
-          # failure-cleanup step and by scripts/promote-genesis.sh after promotion.
+          # base/successor subset (secrets, artifact reader, project roles, and
+          # the renewer-signer needed to mint ephemeral TLS at boot) PLUS the
+          # genesis-only governance-signer (signerVerifier/viewer) and capsule
+          # reader/writer/latest-pointer, so a self-attested genesis can sign its
+          # cert, mint TLS (ephemeral, in-enclave), and write its first
+          # governance capsule. Scoped to the exact image-digest principalSet;
+          # revoked by the failure-cleanup step and by scripts/promote-genesis.sh
+          # after promotion.
           node scripts/reconcile-candidate-resource-iam.mjs \
             --operation grant --genesis \
             --candidate-image-digest "${IMAGE_DIGEST}"

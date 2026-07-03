@@ -112,12 +112,13 @@ Review the source code at the commit you want to verify. Confirm:
 - [ ] `Dockerfile` -- Base image pinned by SHA-256 digest (not a mutable tag).
 - [ ] `src/server.js` -- TLS server created with `https.createServer()` from
       in-memory material only.
-- [ ] `src/tls-capsule.js` + `src/acme-renewal.js` -- the TLS private key is
-      minted in-enclave via ACME at genesis and carried across
-      lineage-continuity boots through the KMS-sealed, attestation-gated GCS
-      capsule. It is never read from or written to Secret Manager, disk, or
-      environment variables; renewals rotate in place via
-      `server.setSecureContext()`.
+- [ ] `src/acme-renewal.js` + `src/tls-material.js` -- the TLS private key is
+      minted in-enclave via ACME DNS-01 on every cold boot and lives ONLY in
+      process memory. It is EPHEMERAL: nothing is sealed to KMS or written to
+      GCS/Secret Manager/disk, so a GCP project/org IAM owner has no ciphertext
+      to decrypt. Renewals rotate in place via `server.setSecureContext()`; a
+      non-secret mint ledger (`src/tls-mint-log.js`, timestamps only) guards the
+      Let's Encrypt weekly limit against reboot loops.
 - [ ] `src/first-principles-adjudication.js` -- The adjudication endpoint
       verifies GitHub Actions OIDC, binds the signed verdict to the exact
       repo/head SHA/diff digest/compliance digest/workflow run/nonce, and

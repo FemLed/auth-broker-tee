@@ -213,49 +213,10 @@ export async function kmsGetPublicKey(keyVersionResource) {
   return data.pem;
 }
 
-// Cloud KMS raw symmetric encrypt/decrypt on an ENCRYPT_DECRYPT key. Used to
-// wrap/unwrap the 32-byte DEK of the sealed TLS capsule (tls-capsule.js): only
-// the DEK ever reaches KMS, never the TLS private key itself. Decrypt IAM on
-// the sealing key is granted ONLY to the WIF principalSet pinned to this
-// service's attested image-digest window, so unwrapping requires a fresh
-// Confidential Space attestation of a measured lineage image.
-export async function kmsEncrypt(keyName, plaintextBuffer) {
-  const accessToken = await getWifAccessToken();
-  const url = `https://cloudkms.googleapis.com/v1/${keyName}:encrypt`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ plaintext: plaintextBuffer.toString("base64") }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) {
-    throw new Error(`Cloud KMS encrypt failed (${response.status}): ${await response.text()}`);
-  }
-  const data = await response.json();
-  if (typeof data.ciphertext !== "string") throw new Error("Cloud KMS encrypt returned no ciphertext");
-  return Buffer.from(data.ciphertext, "base64");
-}
-
-export async function kmsDecrypt(keyName, ciphertextBuffer) {
-  const accessToken = await getWifAccessToken();
-  const url = `https://cloudkms.googleapis.com/v1/${keyName}:decrypt`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ ciphertext: ciphertextBuffer.toString("base64") }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) {
-    throw new Error(`Cloud KMS decrypt failed (${response.status}): ${await response.text()}`);
-  }
-  const data = await response.json();
-  if (typeof data.plaintext !== "string") throw new Error("Cloud KMS decrypt returned no plaintext");
-  return Buffer.from(data.plaintext, "base64");
-}
-
 // Minimal GCS JSON object read/write via the WIF principal. The capsule bucket
 // is untrusted transport: it only ever holds AES-256-GCM ciphertext sealed
-// in-enclave, never plaintext key material.
+// in-enclave (governance state capsule) plus the non-secret TLS mint ledger
+// (timestamps only), never plaintext key material.
 export async function readGcsObjectJson(bucket, objectName) {
   const accessToken = await getWifAccessToken();
   const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?alt=media`;

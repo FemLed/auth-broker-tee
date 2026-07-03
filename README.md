@@ -163,58 +163,54 @@ check (JWT signature -> Sigstore signature -> Fulcio cert SAN -> Rekor
 entry -> compliance predicate). Run it from a machine you control to
 continuously prove the chain is intact.
 
-## Sealed in-enclave TLS (ACME at genesis, carried over on continuity)
+## Ephemeral in-enclave TLS (minted fresh every boot, never persisted)
 
 The TLS private key for `oauth-tee.femled.ai` **lives only in enclave
-memory**; its sole at-rest form is a **sealed TLS capsule**
-([`src/tls-capsule.js`](src/tls-capsule.js)) stored in the governance
-state-capsule bucket under `tls/oauth-tee.tls-capsule.v1.json`: AES-256-GCM
-ciphertext whose 32-byte DEK is wrapped by the `tls-sealing` KMS key, with
-decrypt IAM granted only to the WIF `principalSet` pinned to the attested
-image-digest window (active image + roll candidates). Confidential Space
-exposes no vTPM to workloads, so this attestation-gated KMS unwrap is the
-measured-boot sealing equivalent. **Plaintext TLS keys are never written to
-Secret Manager** (the old `auth-broker-tls-cert`/`-tls-key` pair is retired
-along with the manual seed flow).
+memory** and has **no at-rest form at all**. It is minted fresh in-enclave on
+every cold boot and rotated in place on renewal; nothing is sealed to KMS or
+written to GCS, Secret Manager, or disk.
 
-Boot (`bootstrapTls` in [`src/acme-renewal.js`](src/acme-renewal.js)) is
-unseal-first and runs before the listener binds:
+**Why not seal it?** Confidential Space exposes no vTPM or hardware sealing key
+to workloads, so any at-rest form of the key must be unwrappable by some Cloud
+KMS key -- and a GCP project/org IAM owner can self-grant decrypt on any key in
+their project. A sealed TLS capsule would therefore let a malicious operator
+recover the live private key and silently intercept the OAuth flow, defeating
+the anonymity guarantee. Skipping persistence entirely removes that ciphertext:
+there is nothing for an owner to decrypt. This makes TLS confidentiality
+against a hostile owner a **prevented** property, not merely an audited one.
+(The previous `tls-sealing` KMS key and `tls/…tls-capsule…` object are
+retired.)
 
-- **Lineage continuity** (successor activation, candidate VM, same-image
-  restart, capsule-restored cold start): unseal the TLS capsule and carry the
-  existing in-enclave cert forward -- **no Let's Encrypt order**. After
-  `activation-apply` (and after a governance capsule restore), the renewer
-  verifies the TLS capsule's lineage anchor (the genesis certificate's
-  `payloadDigest`) matches the governance lineage.
-- **Mint** only when no usable capsule exists (first genesis boot) or the
-  carried cert is expired/inside the 30-day renewal window. The ACME DNS-01
-  order rides authoritative-dns-tee's external-TEE-renewer trust path:
-  [`src/renewer-governance-signer.js`](src/renewer-governance-signer.js)
-  builds a KMS-signed envelope bound to a fresh Confidential Space
-  attestation token (audience `https://ns1.femled.ai/renewer`), which the
-  `/governance/routine-zone-change-renewer` route accepts for the narrow
-  `_acme-challenge.oauth-tee.femled.ai.` TXT add/remove pair. The leaf
-  private key is generated in-TEE and never leaves it.
-- **Genesis events always mint a fresh cert**: after
-  `/governance/genesis-bootstrap`, material carried over from a previous
-  lineage's capsule is force-re-minted and the capsule re-sealed under the
-  new lineage anchor (the capsule's GCM AAD binds the anchor, so a stale
-  capsule can never silently impersonate a new lineage).
+Boot (`bootstrapTls` in [`src/acme-renewal.js`](src/acme-renewal.js)) runs
+before the listener binds and **always mints**: there is no capsule to carry
+over. The ACME DNS-01 order rides authoritative-dns-tee's external-TEE-renewer
+trust path -- [`src/renewer-governance-signer.js`](src/renewer-governance-signer.js)
+builds a KMS-signed envelope bound to a fresh Confidential Space attestation
+token (audience `https://ns1.femled.ai/renewer`), which the
+`/governance/routine-zone-change-renewer` route accepts for the narrow
+`_acme-challenge.oauth-tee.femled.ai.` TXT add/remove pair. The leaf private
+key is generated in-TEE and never leaves it. Renewals rotate **in place** via
+`server.setSecureContext()` (no VM reset). `/health` surfaces the runtime TLS
+state (expiry, last rotation) and the mint ledger.
 
-Renewals rotate **in place**: `server.setSecureContext()` is back (the
-interim `compute.instances.reset` reload contract is gone, together with its
-`compute.instanceAdmin.v1` IAM grant), and the capsule is re-sealed after
-every rotation. A candidate VM whose cert is due first re-reads the shared
-capsule and adopts a sibling's fresher cert before spending an order against
-Let's Encrypt's 5/week duplicate-certificate quota. `/health` surfaces the
-runtime TLS state (origin, expiry, lineage anchor, capsule seal status,
-pending re-mint).
+**Trade-offs of ephemerality (accepted):**
 
-`ACME_RENEWER_ENABLED=true` and `RENEWER_KMS_SIGNER_KEY_VERSION` are baked
-into the image (sealed TLS makes in-enclave minting mandatory at genesis;
-there is no Secret Manager TLS pair to seed). `ACME_RENEWER_DRY_RUN` remains
-the only operator toggle (allow_env_override) for staged validation of the
-order round-trip; the boot path refuses to mint under dry-run.
+- Every cold boot consumes a Let's Encrypt issuance. LE allows 5 certs per
+  exact identifier set per 7 days (refilling ~1 per 34h). Routine maintenance
+  reboots are rare, so this is comfortable; the risk is a reboot/crash loop.
+- A non-secret mint ledger ([`src/tls-mint-log.js`](src/tls-mint-log.js))
+  records mint **timestamps only** (never key material) in the capsule bucket
+  so a boot in an already-exhausted week fails fast instead of hammering LE.
+  Tampering with it only affects availability (already a non-goal), never
+  confidentiality.
+- Boot now depends on the authoritative-dns-tee quorum being reachable to
+  satisfy DNS-01, and adds ACME latency before the listener can serve.
+
+`ACME_RENEWER_ENABLED=true` and `RENEWER_KMS_SIGNER_KEY_VERSION` are baked into
+the image (in-enclave minting is mandatory; there is no Secret Manager TLS pair
+to seed). `ACME_RENEWER_DRY_RUN` remains the only operator toggle
+(allow_env_override) for staged validation of the order round-trip; the boot
+path refuses to mint under dry-run.
 
 The fingerprint is not listed in this file because any change to this
 file would change the fingerprint -- a self-referential impossibility.
@@ -260,24 +256,35 @@ controls Secret Manager and the ACME renewer signer:
    per-capsule data key derived (via HKDF) from a KMS-produced witness
    signature over the AAD bytes, so the same image digest is required
    to both produce the witness and re-derive the data key on restore.
-   `capsules/latest-pointer.json` names the most recent capsule and is
-   updated in place.
+   `capsules/latest-pointer.json` is a non-authoritative hint only (see
+   the rollback protection below).
 
 On cold start [`initializeGovernanceAsync`](src/governance-state.js)
-fetches the KMS public key, reads the pointer, fetches the capsule,
-verifies the AAD digest + KMS witness signature + AES-GCM auth tag,
-checks that the lineage tail's `signingKeyId` equals the
-KMS-bound `governanceKeyId`, re-verifies the lineage tail envelope under
-the KMS public key, then restores `status=active` with the recovered
-lineage, epoch, and tenant route policy. Any integrity gate failure
-falls back to `inactive` and surfaces in logs; recovery from that point
-is the standard genesis-bootstrap path against a trusted-reviewer TEE.
+fetches the KMS public key and **enumerates every capsule in the bucket**,
+keeping only those that decrypt under this image's KMS witness key and
+bind to the running image + KMS key version + governance public key with
+a valid predecessor-signed lineage whose **active** key equals the
+KMS-bound `governanceKeyId` (the active key -- the successor key handed
+off by the last activation -- not the predecessor that *signed* the tail).
+It then restores the one with the **highest authentic `capsuleSerial`**
+(the serial lives in the witness-signed AAD, so it cannot be forged
+upward). Any capsule that fails a gate is skipped; if none qualify the
+broker stays `inactive` and recovery is the standard genesis-bootstrap
+path against a trusted-reviewer TEE.
 
-The bucket itself is untrusted storage. Trust is rooted entirely in the
-KMS attestation policy plus the application-layer AAD + signature + auth
-tag binding. The bucket has versioning enabled so an operator can roll a
-botched restore back by writing an older capsule digest into the
-pointer object.
+**Rollback protection.** The bucket is untrusted storage, so restore does
+**not** trust the mutable `latest-pointer.json` (a bucket-write attacker
+can rewind it). Instead it takes the maximum authentic serial, and the
+bucket enforces a **locked GCS retention policy** so the true-head capsule
+cannot be deleted to force a downgrade. A periodic heartbeat re-seals a
+fresh head at least daily so it never ages out of the retention window,
+and a fresh genesis / operator re-genesis seeds its serial above any
+abandoned lineage so it strictly supersedes it. Rolling governance back
+therefore requires forging a KMS witness signature or removing a
+Google-enforced retention lock. Recovery is **forward-only**: a botched
+restore is repaired by rolling forward or an operator re-genesis, never by
+repointing to an older capsule. `/health` surfaces the restored
+`capsuleSerial` so an external probe can alert on an unexpected regression.
 
 ## Lineage Extension Example
 

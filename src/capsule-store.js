@@ -2,17 +2,20 @@
 //
 // Two object families in the bucket:
 //
-//   capsules/<sha256>.json       Immutable capsule body. Written once,
-//                                versioned by GCS bucket versioning so an
-//                                operator can roll a botched restore back
-//                                by repointing the latest-pointer.
+//   capsules/<sha256>.json       Immutable capsule body (content-addressed),
+//                                written once. On cold start the broker
+//                                ENUMERATES these and restores the highest
+//                                AUTHENTIC (KMS-witness-signed) capsuleSerial,
+//                                so the mutable latest-pointer cannot be used
+//                                to roll governance back to an older state.
+//                                The bucket's locked retention policy forbids
+//                                deleting the real head, so the max authentic
+//                                serial is always the true latest state.
 //
-//   capsules/latest-pointer.json Updated in place after every capsule
-//                                write. Names the latest capsule digest
-//                                and its imageDigest binding so cold
-//                                start can find the right capsule for
-//                                the running image without enumerating
-//                                the bucket.
+//   capsules/latest-pointer.json Updated in place after every capsule write.
+//                                A NON-authoritative hint/observability record
+//                                only -- restore does not trust it (an attacker
+//                                with bucket write access can rewind it).
 //
 // The bucket itself is untrusted storage; integrity comes from the capsule
 // AAD + KMS witness signature + AES-GCM auth tag (see state-capsule.js).
@@ -102,6 +105,47 @@ export async function readLatestPointer({ bucket = getCapsuleBucket() } = {}) {
     throw new Error(`latest pointer schema mismatch: ${pointer?.schema}`);
   }
   return pointer;
+}
+
+// Enumerate every capsule body object under the `capsules/` prefix and return
+// their capsule digests (sha256:<hex>). Excludes the mutable latest-pointer and
+// any non-capsule object. Paginated. The cold-start restore verifies each of
+// these against the running KMS key and restores the highest AUTHENTIC serial,
+// which is why restore does not depend on the (rewindable) latest-pointer.
+export async function listCapsuleObjects({ bucket = getCapsuleBucket(), maxObjects = 4096 } = {}) {
+  const digests = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ prefix: "capsules/", maxResults: "1000" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const page = await listObjectsPage({ bucket, params });
+    for (const item of page.items || []) {
+      const digest = capsuleDigestFromObjectName(item.name);
+      if (digest) digests.push(digest);
+      if (digests.length >= maxObjects) return digests;
+    }
+    pageToken = page.nextPageToken || null;
+  } while (pageToken);
+  return digests;
+}
+
+function capsuleDigestFromObjectName(name) {
+  const match = /^capsules\/([a-f0-9]{64})\.json$/.exec(String(name || "").toLowerCase());
+  return match ? `sha256:${match[1]}` : null;
+}
+
+async function listObjectsPage({ bucket, params }) {
+  const accessToken = await getWifAccessToken();
+  if (!accessToken) throw new Error("GCS list requires WIF access token");
+  const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o?${params.toString()}`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!response.ok) {
+    throw new Error(`GCS list failed for gs://${bucket}/capsules/ (${response.status}): ${await response.text()}`);
+  }
+  return response.json();
 }
 
 export async function readStateCapsule(capsuleDigest, { bucket = getCapsuleBucket() } = {}) {
