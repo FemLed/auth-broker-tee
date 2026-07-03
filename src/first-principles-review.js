@@ -269,18 +269,26 @@ For self-governance changes, request changes if the candidate:
 - lets a production TEE become active through environment variables, VM
   metadata, Terraform variables, GitHub repository variables, KMS signer policy,
   WIF policy, Secret Manager policy, branch protection, or admin/operator
-  identity rather than predecessor-signed TEE continuity. RESTORING PREVIOUSLY
+  identity rather than predecessor-signed TEE continuity. RESTORING A PREVIOUSLY
   PREDECESSOR-SIGNED LINEAGE on cold start from an image-attested KMS-witnessed
-  state capsule is NOT new activation: the lineage tail remains
-  predecessor-signed and the KMS+WIF policy is the integrity gate for retrieval,
-  not the activation authority. Capsule restore is permitted ONLY if (a) the
+  state capsule is NOT new activation: the lineage is a chain verified from
+  genesis whose ACTIVE key was handed off by a predecessor-signed successor
+  certificate, and the KMS+WIF policy is the integrity gate for retrieval, not
+  the activation authority. Capsule restore is permitted ONLY if (a) the
   capsule AAD pins the running image digest, KMS key version, governance public
   key digest, lineage digest, epoch, and transferred state digest; (b) capsule
   decryption requires a KMS witness signature verifiable under a public key
-  whose access is gated by attribute.image_digest WIF; (c) the lineage tail's
-  signingKeyId equals the KMS-bound governanceKeyId AND the lineage tail
-  envelope re-verifies under the KMS public key; (d) any mismatch falls back to
-  inactive rather than restoring partial state;
+  whose access is gated by attribute.image_digest WIF; (c) the lineage verifies
+  as a chain from genesis and its ACTIVE governance key -- the successor key
+  handed off by the last activation (verifyLineage's
+  currentGovernancePublicKeyPem), NOT the lineage tail's signingKeyId, which is
+  the PREDECESSOR that signed the tail -- equals the KMS-bound governanceKeyId;
+  (d) any mismatch falls back to inactive rather than restoring partial state;
+  (e) restore is rollback-resistant: it selects the highest AUTHENTIC
+  (KMS-witness-signed) capsuleSerial by enumerating the bucket rather than
+  trusting the mutable latest-pointer, and the capsule bucket enforces a locked
+  retention policy so the true-head capsule cannot be deleted to force a
+  downgrade;
 - lets verifiers, workflows, tenants, docs, or acceptance checks trust a new TEE
   based on image digest, GitHub status, GCP deployment state, KMS signature,
   DNS, or repo variables without also verifying governance lineage continuity;
