@@ -1,24 +1,22 @@
 # ============================================================================
-# In-TEE ACME renewer (DNS-01 via authoritative-dns-tee) + sealed TLS capsule.
+# In-TEE ACME renewer (DNS-01 via authoritative-dns-tee). TLS is EPHEMERAL.
 #
 # This file provisions:
 #   - ECDSA P-256 governance signer key in Cloud KMS, image-baked-fingerprinted
 #     into authoritative-dns-tee's EXTERNAL_TEE_RENEWERS.
 #   - `auth-broker-tee-acme-account-key` Secret Manager secret for the
 #     persistent ACME account key.
-#   - The `tls-sealing` ENCRYPT_DECRYPT KMS key that wraps the DEK of the
-#     sealed TLS capsule (src/tls-capsule.js). TLS private keys are NEVER
-#     stored in Secret Manager: the leaf key+cert live in enclave memory and
-#     the only at-rest form is the AES-256-GCM capsule in the governance
-#     state-capsule bucket (tls/ object). Decrypt IAM on the sealing key is
-#     granted ONLY to the attestation-pinned image-digest window, so unsealing
-#     requires a fresh Confidential Space attestation of a measured lineage
-#     image -- the Confidential Space equivalent of vTPM/measured-boot sealing
-#     (workloads have no direct vTPM access).
 #
-# Renewals rotate the live listener in place via setSecureContext; the old
-# compute.instanceAdmin.v1 self-reset binding is gone (no VM reset anywhere
-# in the TLS path).
+# TLS private keys have NO at-rest form. The leaf key+cert are minted fresh in
+# enclave memory on every cold boot (src/acme-renewal.js) and rotated in place
+# via setSecureContext; nothing is sealed to KMS or written to GCS/Secret
+# Manager. This deliberately removes the previous sealed-TLS capsule so that a
+# GCP project/org IAM owner -- who can self-grant KMS decrypt -- has no
+# ciphertext to unwrap. The trade-off is that each boot consumes a Let's
+# Encrypt issuance (guarded by the non-secret mint ledger in src/tls-mint-log.js).
+#
+# The former `tls-sealing` ENCRYPT_DECRYPT key is RETIRED below (all IAM grants
+# removed); see the note on that resource for the post-cutover destroy step.
 # ============================================================================
 
 resource "google_kms_key_ring" "acme_renewer" {
@@ -79,21 +77,20 @@ resource "google_secret_manager_secret" "acme_account_key" {
   }
 }
 
-# TLS-sealing key: wraps the 32-byte DEK of the sealed TLS capsule (and ONLY
-# the DEK -- the TLS private key never reaches KMS). cryptoKeyEncrypterDecrypter
-# is the gate that makes the capsule "sealed to the TEE": only a workload whose
-# Confidential Space attestation carries an image digest in the current window
-# can unwrap, so a lineage-continuity boot (roll candidate, successor
-# activation, same-image restart) can carry the in-enclave cert forward while
-# nothing outside the measured lineage can ever decrypt it.
+# RETIRED: the `tls-sealing` ENCRYPT_DECRYPT key formerly wrapped the DEK of the
+# sealed TLS capsule. TLS is now ephemeral (minted fresh in-enclave every boot,
+# never persisted), so NO principal is granted encrypt/decrypt on this key -- a
+# GCP project/org IAM owner therefore has nothing to unwrap. `prevent_destroy`
+# is cleared so a follow-up apply can destroy the key entirely.
+#
+# CUTOVER (operator, after the ephemeral image is confirmed active): delete the
+# stale `tls/oauth-tee.tls-capsule.v1.json` object from the capsule bucket, then
+# remove this resource in a follow-up apply to destroy the key. Until then the
+# key exists with no IAM bindings and no ciphertext referencing it.
 resource "google_kms_crypto_key" "tls_sealing" {
   name     = "tls-sealing"
   key_ring = google_kms_key_ring.acme_renewer.id
   purpose  = "ENCRYPT_DECRYPT"
-
-  # New primary every 90d; old versions stay decryptable so existing capsules
-  # keep unsealing, and every renewal/re-seal re-wraps under the new primary.
-  rotation_period = "7776000s"
 
   version_template {
     algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
@@ -101,21 +98,8 @@ resource "google_kms_crypto_key" "tls_sealing" {
   }
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
-}
-
-resource "google_kms_crypto_key_iam_member" "tls_sealing_encrypter_decrypter" {
-  crypto_key_id = google_kms_crypto_key.tls_sealing.id
-  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = local.wif_principal
-}
-
-resource "google_kms_crypto_key_iam_member" "tls_sealing_encrypter_decrypter_candidates" {
-  for_each      = toset(local.candidate_wif_principals)
-  crypto_key_id = google_kms_crypto_key.tls_sealing.id
-  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = each.value
 }
 
 # Surface the renewer signer key version so authoritative-dns-tee operators

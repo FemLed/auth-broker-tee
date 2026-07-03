@@ -22,6 +22,8 @@ import {
   persistGovernanceCapsule,
   tryRestoreGovernanceFromCapsule,
   retryGovernanceRestoreIfDegraded,
+  governanceCapsuleHeartbeatIfDue,
+  getCapsuleSerial,
   bootstrapGenesisFromAttestedApproval,
   completeActivation,
   applyActivationBundle,
@@ -64,6 +66,14 @@ function installInMemoryGcsBucket() {
           return new Response("Not Found", { status: 404 });
         }
         return new Response(store.get(objectName), { status: 200 });
+      }
+      // Object list endpoint: GET /storage/v1/b/<bucket>/o?prefix=capsules/
+      if (parsed.pathname.endsWith("/o")) {
+        const prefix = parsed.searchParams.get("prefix") || "";
+        const items = [...store.keys()]
+          .filter((name) => name.startsWith(prefix))
+          .map((name) => ({ name }));
+        return new Response(JSON.stringify({ items }), { status: 200 });
       }
     }
     if (originalFetch) return originalFetch(url, init);
@@ -455,3 +465,156 @@ test("retry restores ACTIVE after a transient KMS failure at boot (fail closed, 
   assert.equal(await retryGovernanceRestoreIfDegraded({ now, createKeyMaterial: flakyFactory }), null);
   assert.equal(kmsCalls, 2);
 }));
+
+// ---------------------------------------------------------------------------
+// Part A: capsule rollback floor. Restore enumerates the bucket and picks the
+// highest AUTHENTIC (KMS-witness-signed) capsuleSerial, ignoring the mutable
+// latest-pointer. Paired with the locked GCS retention policy (Terraform), an
+// attacker cannot roll governance back to an older still-present capsule.
+// ---------------------------------------------------------------------------
+
+test("rollback floor: restore picks the highest authentic capsule serial among many", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const keyMaterial = createMockKmsBackedKeyMaterial();
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial }); // serial 1
+  const p2 = await persistGovernanceCapsule(); // serial 2
+  const p3 = await persistGovernanceCapsule(); // serial 3
+  assert.equal(p2.capsuleSerial, 2);
+  assert.equal(p3.capsuleSerial, 3);
+
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial });
+  const restored = await tryRestoreGovernanceFromCapsule();
+  assert.ok(restored);
+  assert.equal(restored.status, "active");
+  assert.equal(restored.capsuleSerial, 3, "restore must land on the highest authentic serial");
+  assert.equal(getCapsuleSerial(), 3);
+}));
+
+test("rollback floor: a rewound latest-pointer is ignored; restore still lands the true head", withCapsuleEnv(async (t, bucket) => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const keyMaterial = createMockKmsBackedKeyMaterial();
+  const g = await initializeGovernanceAsync({ mode: "genesis", keyMaterial }); // serial 1
+  void g;
+  const p1Serial = getCapsuleSerial(); // 1
+  const lineageDigest = sha256Of(getGovernanceState().lineage);
+  const p1Digest = (await readPointerFromStore(bucket)).capsuleDigest; // capsule at serial 1
+  await persistGovernanceCapsule(); // serial 2
+  await persistGovernanceCapsule(); // serial 3
+
+  // Attacker rewinds the mutable pointer to name the serial-1 capsule.
+  bucket.store.set("capsules/latest-pointer.json", JSON.stringify(buildLatestPointer({
+    capsuleDigest: p1Digest,
+    imageDigest: process.env.TEE_LOCAL_IMAGE_DIGEST,
+    governanceKmsKeyVersion: keyMaterial.kmsKeyVersion,
+    epoch: 1,
+    status: "active",
+    capsuleSerial: p1Serial,
+    lineageDigest,
+  })));
+
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial });
+  const restored = await tryRestoreGovernanceFromCapsule();
+  assert.ok(restored);
+  assert.equal(restored.capsuleSerial, 3, "the rewound pointer must not roll governance back below the true head");
+  assert.equal(getCapsuleSerial(), 3);
+}));
+
+test("rollback floor: forged/undecryptable capsule objects are skipped", withCapsuleEnv(async (t, bucket) => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const keyMaterial = createMockKmsBackedKeyMaterial();
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial }); // one authentic capsule, serial 1
+
+  // Inject junk objects under capsules/ that must be skipped (they do not
+  // decrypt under our KMS witness key). A well-formed capsule name so it is
+  // listed, but a body that is not an authentic capsule.
+  bucket.store.set(`capsules/${"cc".repeat(32)}.json`, JSON.stringify({ schema: "not-a-capsule" }));
+  bucket.store.set(`capsules/${"dd".repeat(32)}.json`, "not even json");
+
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial });
+  const restored = await tryRestoreGovernanceFromCapsule();
+  assert.ok(restored, "restore must succeed on the one authentic capsule and ignore the forgeries");
+  assert.equal(restored.status, "active");
+  assert.equal(restored.capsuleSerial, 1);
+}));
+
+test("rollback floor: re-genesis seeds its serial above an abandoned lineage (no rollback into it)", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const keyMaterial = createMockKmsBackedKeyMaterial();
+
+  // Lineage L1: genesis + two more persists (serials 1..3), then abandoned.
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial, now: new Date("2026-01-01T00:00:00Z") });
+  await persistGovernanceCapsule();
+  await persistGovernanceCapsule();
+  const l1GenesisDigest = getGovernanceState().lineage[0].payloadDigest;
+  assert.equal(getCapsuleSerial(), 3);
+
+  // Operator re-genesis on the SAME image + KMS key. The abandoned L1 capsules
+  // remain in the (retention-locked) bucket at serials 1..3. The new genesis
+  // must seed ABOVE them so highest-serial-wins can never resurrect L1.
+  resetGovernanceForTests(null);
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial, now: new Date("2026-02-02T00:00:00Z") });
+  const l2GenesisDigest = getGovernanceState().lineage[0].payloadDigest;
+  assert.notEqual(l2GenesisDigest, l1GenesisDigest, "re-genesis must produce a distinct lineage");
+  assert.equal(getCapsuleSerial(), 4, "re-genesis seeds its serial above the abandoned lineage's max (3) -> 4");
+
+  // Cold boot: restore must land the NEW genesis (serial 4), not abandoned L1.
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial });
+  const restored = await tryRestoreGovernanceFromCapsule();
+  assert.ok(restored);
+  assert.equal(restored.capsuleSerial, 4);
+  assert.equal(getGovernanceState().lineage[0].payloadDigest, l2GenesisDigest, "must restore the new genesis, never the abandoned lineage");
+}));
+
+test("heartbeat: re-seals a fresh higher-serial capsule when due, and is a no-op otherwise", withCapsuleEnv(async () => {
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  resetGovernanceForTests(null);
+
+  const keyMaterial = createMockKmsBackedKeyMaterial();
+  await initializeGovernanceAsync({ mode: "genesis", keyMaterial }); // serial 1, sets lastPersistAt
+  assert.equal(getCapsuleSerial(), 1);
+
+  // Not due yet (default 24h interval): no-op.
+  assert.equal(await governanceCapsuleHeartbeatIfDue({ now: new Date() }), null);
+  assert.equal(getCapsuleSerial(), 1);
+
+  // Well past the interval: re-seals a fresh higher-serial head.
+  const farFuture = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+  const beat = await governanceCapsuleHeartbeatIfDue({ now: farFuture });
+  assert.ok(beat, "heartbeat must persist when the interval has elapsed");
+  assert.equal(getCapsuleSerial(), 2);
+
+  // Immediately after, it is a no-op again (lastPersistAt just advanced).
+  assert.equal(await governanceCapsuleHeartbeatIfDue({ now: farFuture }), null);
+  assert.equal(getCapsuleSerial(), 2);
+
+  // Inactive governance never heartbeats.
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "inactive", keyMaterial });
+  assert.equal(await governanceCapsuleHeartbeatIfDue({ now: farFuture }), null);
+}));
+
+function sha256Of(value) {
+  return `sha256:${crypto.createHash("sha256").update(canonicalStringify(value)).digest("hex")}`;
+}
+
+async function readPointerFromStore(bucket) {
+  const raw = bucket.store.get("capsules/latest-pointer.json");
+  return raw ? JSON.parse(raw) : null;
+}

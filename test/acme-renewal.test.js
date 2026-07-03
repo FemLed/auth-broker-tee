@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { test, beforeEach, afterEach } from "node:test";
 import { adoptTlsMaterial, getCurrentTlsMaterial, resetTlsMaterialForTests, setTlsServer } from "../src/tls-material.js";
-import { setTlsCapsuleTransportForTests, resetTlsCapsuleStatusForTests, getTlsCapsuleLocation } from "../src/tls-capsule.js";
+import { setMintLogTransportForTests, resetMintLogForTests, MINT_LOG_OBJECT, MINT_LOG_SCHEMA } from "../src/tls-mint-log.js";
 
 // Keep the boot bootstrap fast under test: these are read at module load, so
 // they must be set before the renewer module is imported (node --test runs
@@ -14,7 +14,6 @@ const {
   runOnce,
   bootstrapTls,
   renewIfDue,
-  reconcileTlsWithLineage,
   setDnsTeeFetcherForTests,
   setRenewerEnvelopeBuilderForTests,
   setRenewerDriversForTests,
@@ -57,38 +56,34 @@ iYSsvzn8oeeLtMuQJvUtmmWIt71vYg4=
 
 const TODAY = new Date("2026-06-11T00:00:00Z"); // both certs fresh
 const DUE_100Y = new Date("2126-05-10T00:00:00Z"); // 100y cert inside 30d window, 200y cert fresh
-const EXPIRED_100Y = new Date("2126-06-01T00:00:00Z"); // 100y cert expired
+
+const TEST_BUCKET = "test-capsule-bucket";
 
 const ORIGINAL_ENV = {
   ACME_RENEWER_ENABLED: process.env.ACME_RENEWER_ENABLED,
   ACME_RENEWER_DRY_RUN: process.env.ACME_RENEWER_DRY_RUN,
   RENEWER_KMS_SIGNER_KEY_VERSION: process.env.RENEWER_KMS_SIGNER_KEY_VERSION,
   DNS_TEE_RENEWER_URLS: process.env.DNS_TEE_RENEWER_URLS,
+  CAPSULE_BUCKET: process.env.CAPSULE_BUCKET,
+  TLS_MAX_MINTS_PER_WEEK: process.env.TLS_MAX_MINTS_PER_WEEK,
 };
 
-const WRAP_PREFIX = Buffer.from("kms-wrapped:");
-let capsuleStore;
-
-function installFakeCapsuleTransport() {
-  capsuleStore = new Map();
-  setTlsCapsuleTransportForTests({
-    kmsEncrypt: async (_keyName, plaintext) => Buffer.concat([WRAP_PREFIX, plaintext]),
-    kmsDecrypt: async (_keyName, ciphertext) => ciphertext.subarray(WRAP_PREFIX.length),
-    readObject: async (bucket, objectName) => capsuleStore.get(`${bucket}/${objectName}`) ?? null,
+// In-memory fake for the non-secret TLS mint ledger (timestamps only).
+let mintLogStore;
+function installFakeMintLog() {
+  mintLogStore = new Map();
+  setMintLogTransportForTests({
+    readObject: async (bucket, objectName) => mintLogStore.get(`${bucket}/${objectName}`) ?? null,
     writeObject: async (bucket, objectName, value) => {
-      capsuleStore.set(`${bucket}/${objectName}`, JSON.parse(JSON.stringify(value)));
+      mintLogStore.set(`${bucket}/${objectName}`, JSON.parse(JSON.stringify(value)));
     },
   });
 }
-
-async function seedCapsule(material) {
-  const { sealTlsMaterial } = await import("../src/tls-capsule.js");
-  await sealTlsMaterial(material);
+function seedMintLog(timestamps) {
+  mintLogStore.set(`${TEST_BUCKET}/${MINT_LOG_OBJECT}`, { schema: MINT_LOG_SCHEMA, mints: timestamps });
 }
-
-function storedCapsule() {
-  const { bucket, object } = getTlsCapsuleLocation();
-  return capsuleStore.get(`${bucket}/${object}`) ?? null;
+function mintLogEntries() {
+  return mintLogStore.get(`${TEST_BUCKET}/${MINT_LOG_OBJECT}`)?.mints ?? [];
 }
 
 function enableRenewer() {
@@ -101,13 +96,15 @@ beforeEach(() => {
   process.env.ACME_RENEWER_ENABLED = "false";
   process.env.ACME_RENEWER_DRY_RUN = "false";
   process.env.RENEWER_KMS_SIGNER_KEY_VERSION = "test-key";
+  process.env.CAPSULE_BUCKET = TEST_BUCKET;
+  delete process.env.TLS_MAX_MINTS_PER_WEEK;
   setDnsTeeFetcherForTests(null);
   setRenewerEnvelopeBuilderForTests(null);
   setRenewerDriversForTests(null);
   resetTlsMaterialForTests();
   resetTlsSupervisorForTests();
-  resetTlsCapsuleStatusForTests();
-  installFakeCapsuleTransport();
+  resetMintLogForTests();
+  installFakeMintLog();
 });
 
 afterEach(() => {
@@ -120,8 +117,7 @@ afterEach(() => {
   setRenewerDriversForTests(null);
   resetTlsMaterialForTests();
   resetTlsSupervisorForTests();
-  resetTlsCapsuleStatusForTests();
-  setTlsCapsuleTransportForTests(null);
+  resetMintLogForTests();
 });
 
 test("renewIfDue returns skipped when ACME_RENEWER_ENABLED is false", async () => {
@@ -139,9 +135,9 @@ test("renewIfDue returns skipped when RENEWER_KMS_SIGNER_KEY_VERSION is missing"
   assert.match(result.reason, /RENEWER_KMS_SIGNER_KEY_VERSION/);
 });
 
-test("renewIfDue reads the renewal window from the IN-MEMORY cert (no Secret Manager)", async () => {
+test("renewIfDue reads the renewal window from the IN-MEMORY cert (no persistence)", async () => {
   enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y }, { origin: "minted_in_enclave" });
+  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y });
   const result = await renewIfDue({ now: TODAY });
   assert.equal(result.status, "not_due");
   assert.ok(result.remainingMs > 30 * 24 * 60 * 60 * 1000);
@@ -153,22 +149,7 @@ test("supervisor runOnce stays inert when the renewer is disabled", async () => 
   assert.equal(result.status, "skipped");
 });
 
-test("lineage continuity: bootstrapTls carries over a valid sealed capsule without any ACME order", async () => {
-  enableRenewer();
-  await seedCapsule({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt: "2026-06-01T00:00:00.000Z", lineageId: "sha256:" + "a".repeat(64) });
-  let mintCalls = 0;
-  setRenewerDriversForTests({ runForcedRenewal: async () => { mintCalls += 1; throw new Error("must not mint"); } });
-
-  const result = await bootstrapTls({ now: TODAY });
-  assert.equal(result.status, "carried_over");
-  assert.equal(mintCalls, 0);
-  const material = getCurrentTlsMaterial();
-  assert.equal(material.origin, "carried_over");
-  assert.equal(material.keyPem, KEY_100Y);
-  assert.equal(material.lineageId, "sha256:" + "a".repeat(64));
-});
-
-test("bootstrapTls mints in-enclave when no capsule exists (first genesis boot) and seals the result", async () => {
+test("bootstrapTls always mints a fresh in-enclave cert and records the mint (no capsule, nothing persisted)", async () => {
   enableRenewer();
   setRenewerDriversForTests({
     runForcedRenewal: async () => ({
@@ -181,42 +162,47 @@ test("bootstrapTls mints in-enclave when no capsule exists (first genesis boot) 
   const result = await bootstrapTls({ now: TODAY });
   assert.equal(result.status, "minted");
   const material = getCurrentTlsMaterial();
-  assert.equal(material.origin, "minted_in_enclave");
   assert.equal(material.keyPem, KEY_200Y);
-  assert.equal(material.lineageId, null);
-  const capsule = storedCapsule();
-  assert.ok(capsule, "fresh mint must be sealed for the next continuity boot");
-  assert.ok(!JSON.stringify(capsule).includes(KEY_200Y));
+  // The mint is recorded in the non-secret ledger (timestamp only, no key).
+  const entries = mintLogEntries();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0], TODAY.toISOString());
+  assert.ok(!JSON.stringify(mintLogStore.get(`${TEST_BUCKET}/${MINT_LOG_OBJECT}`)).includes(KEY_200Y));
 });
 
-test("crash-loop guard: a due capsule minted within the guard interval is carried over instead of re-minted", async () => {
+test("bootstrapTls refuses to attempt an order once the weekly mint budget is exhausted", async () => {
   enableRenewer();
-  const mintedAt = new Date(DUE_100Y.getTime() - 60 * 60 * 1000).toISOString();
-  await seedCapsule({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt, lineageId: null });
+  // Five successful mints within the trailing 7 days = LE ceiling.
+  const base = TODAY.getTime();
+  seedMintLog([1, 2, 3, 4, 5].map((h) => new Date(base - h * 60 * 60 * 1000).toISOString()));
   let mintCalls = 0;
   setRenewerDriversForTests({ runForcedRenewal: async () => { mintCalls += 1; throw new Error("must not mint"); } });
 
-  const result = await bootstrapTls({ now: DUE_100Y });
-  assert.equal(result.status, "carried_over");
-  assert.equal(mintCalls, 0);
+  await assert.rejects(bootstrapTls({ now: TODAY }), /weekly mint budget reached/);
+  assert.equal(mintCalls, 0, "must not send an order LE would reject");
 });
 
-test("bootstrapTls falls back to the still-valid (merely due) capsule cert when minting fails", async () => {
+test("bootstrapTls mints when older mints have aged out of the 7-day window", async () => {
   enableRenewer();
-  await seedCapsule({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt: "2126-01-01T00:00:00.000Z", lineageId: null });
-  setRenewerDriversForTests({ runForcedRenewal: async () => { throw new Error("LE rate limited"); } });
+  const base = TODAY.getTime();
+  // Five mints, but all older than 7 days -> pruned, budget available again.
+  seedMintLog([8, 9, 10, 11, 12].map((d) => new Date(base - d * 24 * 60 * 60 * 1000).toISOString()));
+  setRenewerDriversForTests({
+    runForcedRenewal: async () => ({
+      status: "renewed",
+      material: { keyPem: KEY_200Y, certPem: CERT_200Y, mintedAt: TODAY.toISOString() },
+      expiresAt: "2226-04-23T18:36:06.000Z",
+    }),
+  });
 
-  const result = await bootstrapTls({ now: DUE_100Y });
-  assert.equal(result.status, "fallback_carried_over");
-  assert.equal(getCurrentTlsMaterial().origin, "carried_over");
+  const result = await bootstrapTls({ now: TODAY });
+  assert.equal(result.status, "minted");
+  assert.equal(mintLogEntries().length, 1, "aged-out entries are pruned before appending the fresh mint");
 });
 
-test("bootstrapTls throws when minting fails and the capsule cert is expired", async () => {
-  enableRenewer();
-  await seedCapsule({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt: "2126-01-01T00:00:00.000Z", lineageId: null });
-  setRenewerDriversForTests({ runForcedRenewal: async () => { throw new Error("LE rate limited"); } });
-
-  await assert.rejects(bootstrapTls({ now: EXPIRED_100Y }), /LE rate limited/);
+test("bootstrapTls throws when minting is disabled (no capsule fallback exists)", async () => {
+  process.env.ACME_RENEWER_ENABLED = "false";
+  await assert.rejects(bootstrapTls({ now: TODAY }), /minting is unavailable/);
   assert.equal(getCurrentTlsMaterial(), null);
 });
 
@@ -226,22 +212,16 @@ test("bootstrapTls refuses to mint at boot in dry-run mode (LE rate-limit guard)
   await assert.rejects(bootstrapTls({ now: TODAY }), /ACME_RENEWER_DRY_RUN/);
 });
 
-test("bootstrapTls in dry-run still carries over a valid capsule", async () => {
+test("bootstrapTls rethrows the mint error when all attempts fail (no persisted fallback)", async () => {
   enableRenewer();
-  process.env.ACME_RENEWER_DRY_RUN = "true";
-  await seedCapsule({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt: "2026-06-01T00:00:00.000Z", lineageId: null });
-  const result = await bootstrapTls({ now: TODAY });
-  assert.equal(result.status, "carried_over");
+  setRenewerDriversForTests({ runForcedRenewal: async () => { throw new Error("LE rate limited"); } });
+  await assert.rejects(bootstrapTls({ now: TODAY }), /LE rate limited/);
+  assert.equal(getCurrentTlsMaterial(), null);
 });
 
-test("bootstrapTls throws when minting is disabled and no capsule exists", async () => {
-  process.env.ACME_RENEWER_ENABLED = "false";
-  await assert.rejects(bootstrapTls({ now: TODAY }), /minting is unavailable/);
-});
-
-test("runOnce rotates the live secure context in place and re-seals the capsule (no VM reset)", async () => {
+test("runOnce rotates the live secure context in place on renewal (no VM reset, nothing sealed)", async () => {
   enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, lineageId: "sha256:" + "a".repeat(64) }, { origin: "carried_over" });
+  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y });
   const rotations = [];
   setTlsServer({ setSecureContext: (context) => rotations.push(context) });
   setRenewerDriversForTests({
@@ -257,116 +237,18 @@ test("runOnce rotates the live secure context in place and re-seals the capsule 
   assert.equal(rotations.length, 1);
   assert.equal(rotations[0].key, KEY_200Y);
   assert.equal(rotations[0].cert, CERT_200Y);
-  const material = getCurrentTlsMaterial();
-  assert.equal(material.origin, "minted_in_enclave");
-  assert.equal(material.lineageId, "sha256:" + "a".repeat(64), "renewal keeps the lineage anchor");
-  assert.ok(storedCapsule(), "renewal must re-seal the capsule");
-});
-
-test("runOnce adopts a fresher cert from the shared capsule instead of double-minting (candidate convergence)", async () => {
-  enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y }, { origin: "minted_in_enclave" });
-  await seedCapsule({ keyPem: KEY_200Y, certPem: CERT_200Y, mintedAt: DUE_100Y.toISOString(), lineageId: null });
-  let mintCalls = 0;
-  setRenewerDriversForTests({ renewIfDue: async () => { mintCalls += 1; throw new Error("must not mint"); } });
-
-  const result = await runOnce({ now: DUE_100Y });
-  assert.equal(result.status, "adopted_from_capsule");
-  assert.equal(mintCalls, 0);
   assert.equal(getCurrentTlsMaterial().keyPem, KEY_200Y);
+  // A steady-state renewal is also a real LE issuance -> recorded in the ledger.
+  assert.equal(mintLogEntries().length, 1);
 });
 
-test("genesis with carried-over material schedules a forced re-mint bound to the new lineage anchor", async () => {
+test("getTlsRuntimeStatus exposes in-memory material and the mint ledger, never a capsule", async () => {
   enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, lineageId: "sha256:" + "0".repeat(64) }, { origin: "carried_over" });
-  const newAnchor = "sha256:" + "1".repeat(64);
-  let forcedCalls = 0;
-  setRenewerDriversForTests({
-    runForcedRenewal: async () => {
-      forcedCalls += 1;
-      return {
-        status: "renewed",
-        material: { keyPem: KEY_200Y, certPem: CERT_200Y, mintedAt: TODAY.toISOString() },
-        expiresAt: "2226-04-23T18:36:06.000Z",
-      };
-    },
-  });
-
-  const result = await reconcileTlsWithLineage({ lineageId: newAnchor, event: "genesis" });
-  assert.equal(result.status, "remint_scheduled");
-  // The re-mint is kicked fire-and-forget; wait for it to land.
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(forcedCalls, 1);
-  const material = getCurrentTlsMaterial();
-  assert.equal(material.origin, "minted_in_enclave");
-  assert.equal(material.keyPem, KEY_200Y, "genesis must never keep a carried-over cert");
-  assert.equal(material.lineageId, newAnchor);
-  assert.equal(storedCapsule().lineageId, newAnchor, "capsule must be re-sealed under the new anchor");
-  assert.equal(getTlsRuntimeStatus().pendingRemint, null);
-});
-
-test("genesis with material minted by this enclave only re-binds and re-seals (already a fresh cert)", async () => {
-  enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_200Y, certPem: CERT_200Y, lineageId: null }, { origin: "minted_in_enclave" });
-  const anchor = "sha256:" + "2".repeat(64);
-  let forcedCalls = 0;
-  setRenewerDriversForTests({ runForcedRenewal: async () => { forcedCalls += 1; throw new Error("must not mint"); } });
-
-  const result = await reconcileTlsWithLineage({ lineageId: anchor, event: "genesis" });
-  assert.equal(result.status, "rebound");
-  assert.equal(forcedCalls, 0);
-  assert.equal(getCurrentTlsMaterial().lineageId, anchor);
-  assert.equal(storedCapsule().lineageId, anchor);
-});
-
-test("successor activation and capsule restore keep the carried-over cert when the anchors match", async () => {
-  enableRenewer();
-  const anchor = "sha256:" + "3".repeat(64);
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, lineageId: anchor }, { origin: "carried_over" });
-  let forcedCalls = 0;
-  setRenewerDriversForTests({ runForcedRenewal: async () => { forcedCalls += 1; throw new Error("must not mint"); } });
-
-  for (const event of ["successor_activation", "lineage_restore"]) {
-    const result = await reconcileTlsWithLineage({ lineageId: anchor, event });
-    assert.equal(result.status, "anchored");
-  }
-  assert.equal(forcedCalls, 0);
-  assert.equal(getCurrentTlsMaterial().keyPem, KEY_100Y, "continuity must keep the carried-over in-enclave cert");
-});
-
-test("successor activation force-re-mints when the capsule anchor does not match the transferred lineage", async () => {
-  enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, lineageId: "sha256:" + "4".repeat(64) }, { origin: "carried_over" });
-  const transferredAnchor = "sha256:" + "5".repeat(64);
-  setRenewerDriversForTests({
-    runForcedRenewal: async () => ({
-      status: "renewed",
-      material: { keyPem: KEY_200Y, certPem: CERT_200Y, mintedAt: TODAY.toISOString() },
-      expiresAt: "2226-04-23T18:36:06.000Z",
-    }),
-  });
-
-  const result = await reconcileTlsWithLineage({ lineageId: transferredAnchor, event: "successor_activation" });
-  assert.equal(result.status, "remint_scheduled");
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(getCurrentTlsMaterial().lineageId, transferredAnchor);
-  assert.equal(getCurrentTlsMaterial().keyPem, KEY_200Y);
-});
-
-test("lineage restore binds an unanchored carried-over capsule to the restored lineage", async () => {
-  enableRenewer();
-  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, lineageId: null }, { origin: "carried_over" });
-  const anchor = "sha256:" + "6".repeat(64);
-  const result = await reconcileTlsWithLineage({ lineageId: anchor, event: "lineage_restore" });
-  assert.equal(result.status, "rebound");
-  assert.equal(getCurrentTlsMaterial().lineageId, anchor);
-  assert.equal(getCurrentTlsMaterial().keyPem, KEY_100Y);
-});
-
-test("reconcileTlsWithLineage is a safe no-op when the renewer is disabled (test/gov-route environments)", async () => {
-  process.env.ACME_RENEWER_ENABLED = "false";
-  const result = await reconcileTlsWithLineage({ lineageId: "sha256:" + "7".repeat(64), event: "genesis" });
-  assert.equal(result.status, "skipped");
+  adoptTlsMaterial({ keyPem: KEY_100Y, certPem: CERT_100Y, mintedAt: TODAY.toISOString() });
+  const status = getTlsRuntimeStatus();
+  assert.equal(status.material.adopted, true);
+  assert.ok(status.mintLog, "runtime status surfaces the mint ledger");
+  assert.equal(status.capsule, undefined, "there is no TLS capsule in the ephemeral model");
 });
 
 test("renewer envelope canonical form is stable", async () => {

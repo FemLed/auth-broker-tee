@@ -27,18 +27,12 @@ export const SECRET_VERSION_ADDER_SECRETS = Object.freeze([
   "auth-broker-tee-acme-account-key",
 ]);
 
-// Sealed TLS continuity: a candidate boot carries over the in-enclave cert by
-// unsealing the shared TLS capsule -- KMS unwrap of the capsule DEK plus a
-// conditioned objectAdmin on exactly the capsule object (it is overwritten in
-// place on every re-seal). TLS cert/key Secret Manager grants are gone;
-// plaintext TLS keys are never stored in Secret Manager.
-export const TLS_SEALING_KMS_KEY = Object.freeze({
-  keyRing: "auth-broker-acme-renewer",
-  key: "tls-sealing",
-  location: "us-west1",
-});
-export const TLS_CAPSULE_BUCKET = "prod-femled-couple-router-auth-broker-tee-governance-capsules";
-export const TLS_CAPSULE_OBJECT = "tls/oauth-tee.tls-capsule.v1.json";
+// TLS is ephemeral: a candidate mints its own in-enclave cert at boot, so it
+// needs NO TLS-sealing KMS unwrap and NO TLS-capsule object grant (there is no
+// capsule). Plaintext TLS keys are never stored in Secret Manager or GCS. The
+// governance state capsule bucket is still shared for genesis-only grants
+// (governance capsules + latest-pointer).
+export const CAPSULE_BUCKET = "prod-femled-couple-router-auth-broker-tee-governance-capsules";
 
 // Genesis-only resources. A SUCCESSOR candidate receives its governance key and
 // transferred state in-enclave and carries its TLS cert over, so it needs none
@@ -134,38 +128,6 @@ export function buildIamOperations({ operation, candidateImageDigest, genesis = 
       ],
     })),
     {
-      kind: "kmsKey",
-      resource: `${TLS_SEALING_KMS_KEY.keyRing}/${TLS_SEALING_KMS_KEY.key}`,
-      role: "roles/cloudkms.cryptoKeyEncrypterDecrypter",
-      command: [
-        "kms",
-        "keys",
-        secretCommand,
-        TLS_SEALING_KMS_KEY.key,
-        `--keyring=${TLS_SEALING_KMS_KEY.keyRing}`,
-        `--location=${TLS_SEALING_KMS_KEY.location}`,
-        `--project=${PROJECT_ID}`,
-        `--member=${member}`,
-        "--role=roles/cloudkms.cryptoKeyEncrypterDecrypter",
-        "--quiet",
-      ],
-    },
-    {
-      kind: "bucket",
-      resource: `${TLS_CAPSULE_BUCKET}/${TLS_CAPSULE_OBJECT}`,
-      role: "roles/storage.objectAdmin",
-      command: [
-        "storage",
-        "buckets",
-        secretCommand,
-        `gs://${TLS_CAPSULE_BUCKET}`,
-        `--member=${member}`,
-        "--role=roles/storage.objectAdmin",
-        `--condition=expression=resource.name.endsWith("/objects/${TLS_CAPSULE_OBJECT}"),title=TLS capsule object only (candidate)`,
-        "--quiet",
-      ],
-    },
-    {
       kind: "artifactRepository",
       resource: `${PROJECT_ID}/${ARTIFACT_LOCATION}/${ARTIFACT_REPOSITORY}`,
       role: "roles/artifactregistry.reader",
@@ -181,6 +143,15 @@ export function buildIamOperations({ operation, candidateImageDigest, genesis = 
         "--quiet",
       ],
     },
+    // Ephemeral TLS: EVERY candidate (successor or genesis) mints its own
+    // in-enclave cert at boot, so it needs the renewer-governance-signer to sign
+    // the DNS-01 renewer envelope to authoritative-dns-tee. (Under the old
+    // sealed-TLS model a successor carried the cert over and needed no signer at
+    // boot; that carry-over is gone.) Governance-signer + capsule bucket writes
+    // remain genesis-only -- a successor receives its governance identity/state
+    // through the predecessor-signed activation bundle, not by minting genesis.
+    kmsKeyGrant(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier", secretCommand, member),
+    kmsKeyGrant(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.viewer", secretCommand, member),
   ];
 
   if (genesis) {
@@ -189,13 +160,8 @@ export function buildIamOperations({ operation, candidateImageDigest, genesis = 
   return operations;
 }
 
-// Bindings a self-attested GENESIS needs that a SUCCESSOR does not: sign its own
-// genesis cert (governance-signer), mint its first TLS cert via DNS-01
-// (renewer-governance-signer), and write its first state capsule + latest-pointer
-// to the capsule bucket. Mirrors the Terraform `*_candidates` resources. Granted
-// only with --genesis; revoked after promotion.
-function genesisOnlyOperations({ command, member }) {
-  const kmsRole = (keySpec, role) => ({
+function kmsKeyGrant(keySpec, role, command, member) {
+  return {
     kind: "kmsKey",
     resource: `${keySpec.keyRing}/${keySpec.key}`,
     role,
@@ -209,13 +175,22 @@ function genesisOnlyOperations({ command, member }) {
       "--condition=None",
       "--quiet",
     ],
-  });
+  };
+}
+
+// Bindings a self-attested GENESIS needs that a SUCCESSOR does not: sign its own
+// genesis cert (governance-signer) and write its first state capsule +
+// latest-pointer to the capsule bucket. (The renewer-governance-signer needed to
+// mint TLS at boot is granted to ALL candidates in the base set now that TLS is
+// ephemeral, so it is not repeated here.) Mirrors the Terraform `*_candidates`
+// resources. Granted only with --genesis; revoked after promotion.
+function genesisOnlyOperations({ command, member }) {
   const bucketRole = (role) => ({
     kind: "bucket",
-    resource: TLS_CAPSULE_BUCKET,
+    resource: CAPSULE_BUCKET,
     role,
     command: [
-      "storage", "buckets", command, `gs://${TLS_CAPSULE_BUCKET}`,
+      "storage", "buckets", command, `gs://${CAPSULE_BUCKET}`,
       `--member=${member}`,
       `--role=${role}`,
       "--condition=None",
@@ -223,18 +198,16 @@ function genesisOnlyOperations({ command, member }) {
     ],
   });
   return [
-    kmsRole(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier"),
-    kmsRole(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.viewer"),
-    kmsRole(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier"),
-    kmsRole(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.viewer"),
+    kmsKeyGrant(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier", command, member),
+    kmsKeyGrant(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.viewer", command, member),
     bucketRole("roles/storage.objectViewer"),
     bucketRole("roles/storage.objectCreator"),
     {
       kind: "bucket",
-      resource: `${TLS_CAPSULE_BUCKET}/${CAPSULE_POINTER_OBJECT}`,
+      resource: `${CAPSULE_BUCKET}/${CAPSULE_POINTER_OBJECT}`,
       role: "roles/storage.objectAdmin",
       command: [
-        "storage", "buckets", command, `gs://${TLS_CAPSULE_BUCKET}`,
+        "storage", "buckets", command, `gs://${CAPSULE_BUCKET}`,
         `--member=${member}`,
         "--role=roles/storage.objectAdmin",
         `--condition=expression=resource.name.endsWith("/objects/${CAPSULE_POINTER_OBJECT}"),title=Latest pointer object only (candidate)`,

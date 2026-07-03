@@ -98,28 +98,11 @@ resource "google_project_iam_custom_role" "candidate_project_role_reconciler_inv
   ]
 }
 
-# Sealed-TLS candidate windows: the activator's reconcile-candidate-resource-iam
-# step must grant/revoke the candidate WIF principal on the tls-sealing KMS key
-# and the TLS-capsule object IAM in the governance bucket. Mirror the
-# per-resource Secret Manager pattern (authBrokerSuccessorSecretIam):
-# IAM-policy-admin custom roles bound ONLY on those two resources, never
-# project-wide.
-resource "google_project_iam_custom_role" "successor_kms_iam" {
-  role_id     = "authBrokerSuccessorKmsIam"
-  title       = "Auth Broker Successor KMS IAM"
-  description = "Can edit IAM policy only on bound auth-broker KMS keys for candidate window grants"
-  permissions = [
-    "cloudkms.cryptoKeys.getIamPolicy",
-    "cloudkms.cryptoKeys.setIamPolicy",
-  ]
-}
-
-resource "google_kms_crypto_key_iam_member" "activator_tls_sealing_iam_admin" {
-  crypto_key_id = google_kms_crypto_key.tls_sealing.id
-  role          = google_project_iam_custom_role.successor_kms_iam.id
-  member        = "serviceAccount:${var.successor_activation_service_account_email}"
-}
-
+# Successor candidate bucket windows: the activator's reconcile-candidate-resource-iam
+# step may grant/revoke the candidate WIF principal on the governance state
+# capsule bucket. The former tls-sealing KMS IAM-admin grant is REMOVED: TLS is
+# ephemeral now (each candidate mints its own in-enclave cert at boot), so there
+# is no TLS-sealing key or TLS-capsule object for the activator to delegate.
 resource "google_project_iam_custom_role" "successor_bucket_iam" {
   role_id     = "authBrokerSuccessorBucketIam"
   title       = "Auth Broker Successor Bucket IAM"
