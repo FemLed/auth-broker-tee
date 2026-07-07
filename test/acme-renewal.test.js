@@ -170,15 +170,15 @@ test("bootstrapTls always mints a fresh in-enclave cert and records the mint (no
   assert.ok(!JSON.stringify(mintLogStore.get(`${TEST_BUCKET}/${MINT_LOG_OBJECT}`)).includes(KEY_200Y));
 });
 
-test("bootstrapTls refuses to attempt an order once the weekly mint budget is exhausted", async () => {
+test("bootstrapTls refuses to attempt an order once the issuance token bucket is empty", async () => {
   enableRenewer();
-  // Five successful mints within the trailing 7 days = LE ceiling.
+  // Five successful mints within a few hours empty LE's token bucket.
   const base = TODAY.getTime();
   seedMintLog([1, 2, 3, 4, 5].map((h) => new Date(base - h * 60 * 60 * 1000).toISOString()));
   let mintCalls = 0;
   setRenewerDriversForTests({ runForcedRenewal: async () => { mintCalls += 1; throw new Error("must not mint"); } });
 
-  await assert.rejects(bootstrapTls({ now: TODAY }), /weekly mint budget reached/);
+  await assert.rejects(bootstrapTls({ now: TODAY }), /issuance budget exhausted/);
   assert.equal(mintCalls, 0, "must not send an order LE would reject");
 });
 

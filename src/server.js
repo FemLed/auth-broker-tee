@@ -40,7 +40,7 @@ import {
   verifyTenantAdmissionEnvelope,
   getGovernanceState,
 } from "./governance-state.js";
-import { jsonResponse, textResponse } from "./http-helpers.js";
+import { jsonResponse, parseRequestUrl, textResponse } from "./http-helpers.js";
 import { startRenewalLoop, bootstrapTls, getTlsRuntimeStatus } from "./acme-renewal.js";
 import { getCurrentTlsMaterial, setTlsServer } from "./tls-material.js";
 import {
@@ -117,9 +117,12 @@ async function main() {
   const material = getCurrentTlsMaterial();
 
   const server = https.createServer({ key: material.keyPem, cert: material.certPem }, async (req, res) => {
-    const url = new URL(req.url, `https://${req.headers.host}`);
-
     try {
+      const url = parseRequestUrl(req);
+      if (!url) {
+        return jsonResponse(res, 400, { error: "Malformed request URL or Host header" });
+      }
+
       if (!mayServePath(url.pathname)) {
         return jsonResponse(res, 423, {
           error: "TEE governance is not active for this route",
