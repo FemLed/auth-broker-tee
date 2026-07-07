@@ -35,6 +35,7 @@ export const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "src/governance-routes.js",
   "src/governance-state.js",
   "src/governance-successor-decision.js",
+  "src/http-helpers.js",
   "src/kms-governance-key.js",
   "src/route-registry.js",
   "src/server.js",
