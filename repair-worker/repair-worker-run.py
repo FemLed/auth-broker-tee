@@ -115,7 +115,7 @@ def parse_submit(command: str) -> dict:
 
 
 def run_agent(prompt: str, base_branch: str) -> dict:
-    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-3.1-pro-preview")
+    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-3.7-flash")
     model_kwargs = {
         "vertex_project": os.getenv("VERTEXAI_PROJECT", os.getenv("GCP_PROJECT_ID")),
         "vertex_location": os.getenv("VERTEXAI_LOCATION", "global"),

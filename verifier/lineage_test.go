@@ -18,7 +18,7 @@ func TestValidateGovernanceLineageRejectsMalformedGenesis(t *testing.T) {
 		"governancePublicKeyPem":      pubPEM,
 		"governanceKeyId":             testKeyID(t, pubPEM),
 		"imageDigest":                 "sha256:" + strings.Repeat("a", 64),
-		"model":                       "gemini-3.1-pro-preview",
+		"model":                       "gemini-3.7-flash",
 		"firstPrinciplesPromptDigest": "sha256:" + strings.Repeat("b", 64),
 		"responseSchemaDigest":        "sha256:" + strings.Repeat("c", 64),
 		"modelPolicyDigest":           "sha256:" + strings.Repeat("d", 64),

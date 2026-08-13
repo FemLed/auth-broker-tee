@@ -149,7 +149,7 @@ test("health transient recovery clears degraded and critical availability risk",
   recordVertexRetryExhausted({ reason: "transient outage" });
   assert.equal(buildHealthSnapshot({ governanceStatus: "active" }).availabilityRisk, "critical");
 
-  recordVertexCall({ status: "success", model: "gemini-3.1-pro-preview" });
+  recordVertexCall({ status: "success", model: "gemini-3.7-flash" });
   const recovered = buildHealthSnapshot({ governanceStatus: "active" });
   assert.equal(recovered.status, "healthy");
   assert.equal(recovered.availabilityRisk, "low");
