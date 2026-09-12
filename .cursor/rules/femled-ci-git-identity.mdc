@@ -32,6 +32,34 @@ If the active git/GitHub identity is not clearly the correct app identity for
 the operation, stop before any write operation and ask the user to switch
 credentials or provide the approved CI mechanism.
 
+Never fork this repository into a personal account to obtain push access. A
+fork of a public repository is itself public and carries the personal handle;
+a pull request opened from it is permanently attributed to that account even
+after the fork is deleted. If a change cannot be pushed as `FemLed-CI`, stop.
+
+## Guards expected in a local checkout
+
+Set these in `.git/config` of every checkout so a stray `git push` or local
+commit can never carry a personal identity:
+
+```bash
+git config remote.origin.pushurl 'disabled://auth-broker-tee-writes-go-through-femled-ci-app-token'
+git config user.name 'femled-ci[bot]'
+git config user.email '268454212+femled-ci[bot]@users.noreply.github.com'
+```
+
+- `remote.origin.pushurl` starting with `disabled://` makes `git push` fail
+  (`remote helper 'disabled' aborted session`) while `fetch` and `pull` keep
+  working. Do not remove it or add a second remote to route around it.
+- `user.name`/`user.email` are the bot's, so a local commit is not attributed
+  to a person. Local commits are never pushed anyway: the `require-signed-commits`
+  ruleset rejects commits that GitHub did not sign, which is every commit made
+  with a local `git commit`. Commits reach the repository through the GitHub
+  API (`createCommitOnBranch` or the contents API) using the `FemLed-CI`
+  installation token, which GitHub signs as verified.
+- The `femled-ci-only-writes` ruleset limits ref creation, update, and deletion
+  to the `FemLed-CI` app. No other app or user is a bypass actor.
+
 ## Minting a FemLed-CI GitHub App Token
 
 Use a short-lived GitHub App installation token from GCP Secret Manager. Do not
