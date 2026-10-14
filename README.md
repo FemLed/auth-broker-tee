@@ -239,10 +239,27 @@ candidate's own in-enclave key, and encrypts the transferred state (lineage,
 epoch, accepted tenant route policy) to the candidate's attested X25519
 activation key.
 
-The price is availability. A broker whose memory is lost comes back
-`inactive`, and losing every copy of the key means an operator-authorized
-re-genesis plus an explicit re-admission by every relying party
-([GENESIS.md](GENESIS.md)).
+Two replicas of the same image keep the broker alive through a restart
+([`src/governance-replica-custody.js`](src/governance-replica-custody.js)).
+The primary serves; the custodian holds the same key and a current copy of
+the state, mints no certificate and serves no broker route. A replica that
+restarts comes back `inactive` and asks its peer for custody over the private
+network. The peer seals the key to the restarted replica's activation key only
+after a Confidential Space attestation proves that the replica runs the same
+image, in this project, as the broker's service account, and that it holds
+that activation key: the attestation's nonce is computed inside the enclave
+over its own key ids, in answer to a single-use challenge. The primary releases
+no governance change (a signed certificate, a status change) until the
+custodian has acknowledged it, and reverts any change it did not, so the
+surviving replica always holds everything that was released. Launch metadata
+only tells a replica where its peer is. When the primary is lost, an operator
+runs `replica-failover.yml`: it stops the lost primary, and the custodian
+accepts promotion only after three minutes without a heartbeat from it. The
+operator then enrolls a replacement (`replica-enroll.yml`).
+
+The price is availability. Losing both replicas loses every copy of the key,
+which means an operator-authorized re-genesis plus an explicit re-admission by
+every relying party ([GENESIS.md](GENESIS.md)).
 
 Earlier images signed governance with a Cloud KMS key and persisted state in
 GCS capsules. Both were removed: anyone administering the project could use

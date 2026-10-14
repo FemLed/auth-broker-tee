@@ -7,10 +7,16 @@ import {
 
 const ENVELOPE_SCHEMA = "femled.tee.governance.envelope.v1";
 const STATE_ENCRYPTION_ALG = "X25519-HKDF-SHA256-AES-256-GCM";
+const CUSTODY_TRANSFER_SCHEMA = "femled.tee.governance.custody_transfer.v1";
 
 export function createInMemoryGovernanceKeyMaterial() {
-  const signing = crypto.generateKeyPairSync("ed25519");
-  const activation = crypto.generateKeyPairSync("x25519");
+  return buildInMemoryKeyMaterial({
+    signing: crypto.generateKeyPairSync("ed25519"),
+    activation: crypto.generateKeyPairSync("x25519"),
+  });
+}
+
+function buildInMemoryKeyMaterial({ signing, activation }) {
   const governancePublicKeyPem = exportPublicPem(signing.publicKey);
   const activationPublicKeyPem = exportPublicPem(activation.publicKey);
 
@@ -40,6 +46,40 @@ export function createInMemoryGovernanceKeyMaterial() {
         plaintext,
         aad,
       });
+    },
+    // Replica custody: the signing key leaves this closure only inside an
+    // envelope encrypted to a replica's attested activation key.
+    encryptCustodyTransferFor(recipientActivationPublicKeyPem, state, aad) {
+      return encryptStateEnvelope({
+        senderPrivateKey: activation.privateKey,
+        senderActivationPublicKeyPem: activationPublicKeyPem,
+        recipientActivationPublicKeyPem,
+        plaintext: {
+          schema: CUSTODY_TRANSFER_SCHEMA,
+          signingKey: signing.privateKey.export({ type: "pkcs8", format: "pem" }),
+          state,
+        },
+        aad,
+      });
+    },
+    // Returns key material that signs with the transferred key and keeps this
+    // replica's own activation key, plus the transferred state.
+    acceptCustodyTransfer(envelope, aad) {
+      const transfer = decryptStateEnvelope({ envelope, recipientPrivateKey: activation.privateKey, aad });
+      if (transfer?.schema !== CUSTODY_TRANSFER_SCHEMA) {
+        throw new Error("custody transfer schema mismatch");
+      }
+      const privateKey = crypto.createPrivateKey(transfer.signingKey);
+      if (privateKey.asymmetricKeyType !== "ed25519") {
+        throw new Error("custody transfer signing key must be Ed25519");
+      }
+      return {
+        keyMaterial: buildInMemoryKeyMaterial({
+          signing: { privateKey, publicKey: crypto.createPublicKey(privateKey) },
+          activation,
+        }),
+        state: transfer.state,
+      };
     },
   });
 }

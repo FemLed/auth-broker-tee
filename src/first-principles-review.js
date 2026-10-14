@@ -1,7 +1,7 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
 import { recordVertexParseFailure } from "./governance-monitor.js";
 
-export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v6";
+export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v7";
 export const FIRST_PRINCIPLES_MODEL = "gemini-4-argon";
 export const FIRST_PRINCIPLES_VERTEX_LOCATION = "global";
 export const FIRST_PRINCIPLES_GENERATION_TEMPERATURE = 1.0;
@@ -295,6 +295,30 @@ For self-governance changes, request changes if the candidate:
   Artifact Registry writes, logs, callback payloads, GitHub PRs, or substrate
   claims as activation authority instead of evidence inspected and arbitrated by
   the active TEE.
+
+Two-replica custody is how the broker survives a restart, and it is not a
+recovery path. A primary and a custodian replica of the same image hold one
+lineage key in enclave memory. The key and transferred state may move only
+between those live enclaves: sealed to the receiving replica's activation key,
+which that replica proved it holds with a Confidential Space attestation whose
+nonce binds its own key ids, answering a fresh single-use challenge, from the
+same image digest, project and broker service account; signed with the lineage
+key; and never written to disk, logs, Secret Manager, KMS or any other place an
+operator can read. A replica is re-keyed only by its configured peer while the
+other replica still holds the key; if both die, the only path is operator
+re-genesis of a new lineage. Every governance change the primary releases (a
+signed certificate, a status change) has first been acknowledged by the
+custodian, so a re-keyed replica never rolls back what was released. Promoting
+a custodian changes which live replica serves; it cannot create, import or
+restore a key, it is refused until the primary has been silent for a quiet
+period and does not answer as serving, and it fences the old primary, whose
+changes the promoted replica no longer acknowledges. Request changes if the
+candidate sends the governance key or transferred state to anything other than
+such an attested replica of the same image, lets launch metadata or an operator
+choose the recipient's keys, lets a custodian serve broker routes before
+explicit promotion, releases a governance change the custodian has not
+acknowledged, or lets a replica accept state that rolls back or forks its
+lineage.
 
 Approve only if the change is additive, neutral, or strengthening relative to
 the FemLed mission and the broker's sealed trust model.

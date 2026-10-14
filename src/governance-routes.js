@@ -24,6 +24,14 @@ import {
 } from "./governance-repair-jobs.js";
 import { recordManifestAttestation } from "./governance-monitor.js";
 import { initializeRouteRegistry } from "./route-registry.js";
+import {
+  buildReplicaManifest,
+  issueCustodyChallenge,
+  promoteToPrimary,
+  receiveHeartbeat,
+  receiveSyncBundle,
+  serveCustodyRequest,
+} from "./governance-replica-custody.js";
 
 const MAX_GOVERNANCE_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_GOVERNANCE_CHALLENGE_BODY_BYTES = 16 * 1024;
@@ -36,6 +44,10 @@ const GENESIS_WORKFLOW_REFS = [
   "FemLed/auth-broker-tee/.github/workflows/operator-genesis.yml@refs/heads/master",
 ];
 const GENESIS_ALLOWED_EVENTS = new Set(["workflow_dispatch"]);
+const REPLICA_FAILOVER_WORKFLOW_REFS = [
+  "FemLed/auth-broker-tee/.github/workflows/replica-failover.yml@refs/heads/master",
+];
+const MAX_REPLICA_BODY_BYTES = 2 * 1024 * 1024;
 const PREAPPROVAL_CHALLENGE_PURPOSE = "governance.preapprove";
 const TENANT_REGISTRATION_SCHEMA = "femled.auth_broker.tenant_registration.v1";
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
@@ -53,6 +65,7 @@ const governanceChallenges = new Map();
 
 let verifyGovernanceOidc = verifyGitHubActionsOidc;
 let governanceNow = () => new Date();
+let replicaPromotionHandler = null;
 
 export async function handleGovernanceManifest(req, res) {
   if (req.method !== "GET") return textResponse(res, 405, "Method not allowed");
@@ -162,6 +175,124 @@ export async function handleGovernanceChallenge(req, res) {
   } catch (error) {
     return jsonResponse(res, 400, { error: error.message });
   }
+}
+
+export function setReplicaPromotionHandler(handler) {
+  replicaPromotionHandler = handler;
+}
+
+export async function handleReplicaManifest(req, res) {
+  if (req.method !== "GET") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "replica-manifest")) return;
+  return jsonResponse(res, 200, buildReplicaManifest());
+}
+
+export async function handleReplicaCustodyChallenge(req, res) {
+  if (req.method !== "GET") return textResponse(res, 405, "Method not allowed");
+  if (!refusePublicReplicaCaller(req, res)) return;
+  if (!consumeCoarseRateLimit(req, res, "replica-custody")) return;
+  try {
+    return jsonResponse(res, 200, issueCustodyChallenge());
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+}
+
+export async function handleReplicaCustodyRequest(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!refusePublicReplicaCaller(req, res)) return;
+  if (!consumeCoarseRateLimit(req, res, "replica-custody")) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_REPLICA_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    const result = await serveCustodyRequest({
+      challenge: body.challenge,
+      evidence: body.evidence,
+      requesterAddress: clientAddress(req),
+    });
+    return jsonResponse(res, 200, result);
+  } catch (error) {
+    return jsonResponse(res, 403, { error: error.message });
+  }
+}
+
+export async function handleReplicaSync(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!refusePublicReplicaCaller(req, res)) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_REPLICA_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    return jsonResponse(res, 200, await receiveSyncBundle({ bundle: body.bundle }));
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+}
+
+export async function handleReplicaHeartbeat(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!refusePublicReplicaCaller(req, res)) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_GOVERNANCE_CHALLENGE_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    return jsonResponse(res, 200, receiveHeartbeat({ heartbeat: body.heartbeat }));
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+}
+
+export async function handleReplicaPromote(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "replica-promote")) return;
+  try {
+    await verifyGovernanceOidc(req.headers.authorization, {
+      audience: GOVERNANCE_OIDC_AUDIENCE,
+      workflowRefs: REPLICA_FAILOVER_WORKFLOW_REFS,
+      allowedEvents: GENESIS_ALLOWED_EVENTS,
+    });
+  } catch (error) {
+    return jsonResponse(res, 401, { error: error.message });
+  }
+  let manifest;
+  try {
+    manifest = await promoteToPrimary();
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+  if (replicaPromotionHandler) {
+    Promise.resolve()
+      .then(() => replicaPromotionHandler())
+      .catch((error) => console.error("[ReplicaCustody] public service start after promotion failed:", error.message));
+  }
+  return jsonResponse(res, 202, { status: "promoted", manifest });
+}
+
+// Custody and sync only travel between the replicas, over the private network;
+// the public replica port exists for explicit promotion.
+function refusePublicReplicaCaller(req, res) {
+  if (isPrivatePeerAddress(clientAddress(req))) return true;
+  jsonResponse(res, 403, { error: "replica custody is served on the private network only" });
+  return false;
+}
+
+function isPrivatePeerAddress(address) {
+  const host = String(address || "").replace(/^::ffff:/, "");
+  if (host === "::1") return true;
+  const octets = host.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false;
+  const [a, b] = octets;
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 export async function handleGenesisBootstrap(req, res) {

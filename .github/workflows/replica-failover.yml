@@ -1,0 +1,195 @@
+## Explicit failover for auth-broker-tee: promote the custodian replica to
+## primary after the primary is lost, then move oauth-tee.femled.ai's reserved
+## address to it.
+##
+## The workflow first stops the lost primary's VM, so its copy of the key is gone
+## and two primaries can never coexist. The custodian then accepts promotion only
+## with this workflow's GitHub OIDC token, only after it has heard nothing from
+## the primary for three minutes, and only while no probe finds the primary
+## serving. Promotion changes which live replica serves; it creates, imports or
+## restores no key. Afterwards, delete the lost primary's VM and enroll a
+## replacement in its slot (replica-enroll.yml).
+
+name: replica-failover
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "The broker's image digest (sha256:...)"
+        required: true
+        type: string
+      custodian_slot:
+        description: "The custodian's slot"
+        required: true
+        type: choice
+        options:
+          - a
+          - b
+      operator_statement:
+        description: "Must explicitly contain 'operator-authorized replica failover'"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: prod-femled-couple-router
+
+jobs:
+  failover:
+    name: promote custodian and move address
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate inputs and operator statement
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          OPERATOR_STATEMENT: ${{ inputs.operator_statement }}
+        run: |
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::image_digest must be a sha256 digest"
+            exit 1
+          fi
+          if ! echo "${OPERATOR_STATEMENT}" | grep -qiE 'operator[- ]authorized.*replica failover'; then
+            echo "::error::operator_statement must explicitly contain 'operator-authorized replica failover'"
+            exit 1
+          fi
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
+          service_account: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
+          access_token_lifetime: 1800s
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Locate the custodian
+        id: custodian
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SLOT: ${{ inputs.custodian_slot }}
+        run: |
+          digest_hex="${IMAGE_DIGEST#sha256:}"
+          vm_name="auth-broker-tee-${SLOT}-${digest_hex:0:12}"
+          zone=$(gcloud compute instances list --project="${GCP_PROJECT_ID}" --filter="name=${vm_name}" --format='value(zone.basename())')
+          if [[ -z "${zone}" ]]; then
+            echo "::error::custodian ${vm_name} does not exist"
+            exit 1
+          fi
+          ip=$(gcloud compute instances describe "${vm_name}" --project="${GCP_PROJECT_ID}" --zone="${zone}" \
+            --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+          curl -fsS --max-time 15 "http://${ip}:8080/replica/manifest" > custodian-manifest.json
+          jq -e --arg digest "${IMAGE_DIGEST}" '.imageDigest == $digest and .status == "active" and .role == "custodian"' \
+            custodian-manifest.json >/dev/null \
+            || (echo "::error::${vm_name} is not an active custodian on ${IMAGE_DIGEST}"; jq '{status, role, imageDigest}' custodian-manifest.json; exit 1)
+          if [[ "${SLOT}" == "a" ]]; then primary_slot=b; else primary_slot=a; fi
+          {
+            echo "vm_name=${vm_name}"
+            echo "zone=${zone}"
+            echo "ip=${ip}"
+            echo "primary_name=auth-broker-tee-${primary_slot}-${digest_hex:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stop the lost primary
+        env:
+          PRIMARY_NAME: ${{ steps.custodian.outputs.primary_name }}
+        run: |
+          zone=$(gcloud compute instances list --project="${GCP_PROJECT_ID}" --filter="name=${PRIMARY_NAME}" --format='value(zone.basename())')
+          if [[ -z "${zone}" ]]; then
+            echo "${PRIMARY_NAME} no longer exists"
+            exit 0
+          fi
+          status=$(gcloud compute instances describe "${PRIMARY_NAME}" --project="${GCP_PROJECT_ID}" --zone="${zone}" --format='value(status)')
+          echo "${PRIMARY_NAME} is ${status}"
+          if [[ "${status}" != "TERMINATED" ]]; then
+            gcloud compute instances stop "${PRIMARY_NAME}" --project="${GCP_PROJECT_ID}" --zone="${zone}" --quiet
+          fi
+
+      - name: Promote the custodian
+        env:
+          CUSTODIAN_IP: ${{ steps.custodian.outputs.ip }}
+          AUDIENCE: https://oauth-tee.femled.ai/governance
+        run: |
+          # The custodian waits out three minutes of silence from the primary.
+          deadline=$(( $(date +%s) + 480 ))
+          while :; do
+            token=$(curl -fsS \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+            if [[ -z "${token}" || "${token}" == "null" ]]; then
+              echo "::error::Failed to mint GitHub OIDC token for promotion"
+              exit 1
+            fi
+            echo "::add-mask::${token}"
+            status=$(curl -sS --max-time 90 \
+              -X POST \
+              -H "Authorization: Bearer ${token}" \
+              "http://${CUSTODIAN_IP}:8080/governance/replica-promote" \
+              --output promote-response.json \
+              --write-out '%{http_code}' || echo "000")
+            if [[ "${status}" == "202" ]]; then
+              jq '{status, role: .manifest.replica.role, epoch: .manifest.epoch}' promote-response.json
+              exit 0
+            fi
+            if [[ "${status}" == "409" ]] && jq -e '.error | test("promotion is allowed after")' promote-response.json >/dev/null 2>&1 \
+                && [[ $(date +%s) -lt ${deadline} ]]; then
+              jq -r .error promote-response.json
+              sleep 30
+              continue
+            fi
+            echo "::error::promotion refused (${status})"
+            jq '{error}' promote-response.json || true
+            exit 1
+          done
+
+      - name: Wait for the new primary to serve
+        env:
+          CUSTODIAN_IP: ${{ steps.custodian.outputs.ip }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          # The promoted replica mints its TLS certificate in-enclave before it
+          # opens 443.
+          deadline=$(( $(date +%s) + 600 ))
+          while [[ $(date +%s) -lt ${deadline} ]]; do
+            curl -sS --max-time 10 --resolve "oauth-tee.femled.ai:443:${CUSTODIAN_IP}" \
+              https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json > primary-manifest.json 2>/dev/null || true
+            if jq -e --arg digest "${IMAGE_DIGEST}" \
+                '.payload.status == "active" and .payload.replica.role == "primary" and .payload.imageDigest == $digest' \
+                primary-manifest.json >/dev/null 2>&1; then
+              echo "New primary serves on ${CUSTODIAN_IP}"
+              exit 0
+            fi
+            echo "New primary not serving yet; sleeping 15s"
+            sleep 15
+          done
+          echo "::error::the promoted replica did not start serving in time"
+          exit 1
+
+      - name: Move the reserved address
+        env:
+          VM_NAME: ${{ steps.custodian.outputs.vm_name }}
+          ZONE: ${{ steps.custodian.outputs.zone }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          bash scripts/move-reserved-ip.sh --to "${VM_NAME}" --to-zone "${ZONE}" --expect-digest "${IMAGE_DIGEST}"
+          {
+            echo "## Replica failover complete"
+            echo ""
+            echo "**New primary:** \`${VM_NAME}\` (${ZONE}) holds oauth-tee.femled.ai's reserved address."
+            echo ""
+            echo "### Next operator steps"
+            echo "1. Delete the lost primary's VM."
+            echo "2. Enroll a replacement in its slot with replica-enroll.yml, so the lineage again has two replicas."
+          } >> "$GITHUB_STEP_SUMMARY"

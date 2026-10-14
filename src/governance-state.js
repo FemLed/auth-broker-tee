@@ -104,6 +104,9 @@ export function initializeGovernance({ mode = "inactive", keyMaterial: providedK
     },
     pendingActivationChallenges: new Map(),
     genesisSelfAdjudications: new Map(),
+    replicaRole: null,
+    replicaSerial: 0,
+    replicaPeer: null,
     transferredState: {
       schema: "femled.tee.governance.transferred_state.v1",
       routePolicy: emptyRoutePolicyState(),
@@ -149,6 +152,12 @@ export function assertActiveGovernance() {
 
 export function mayServePath(pathname) {
   const current = getGovernanceState();
+  if (current.replicaRole === "custodian") {
+    // A custodian holds the lineage key but serves nothing until promoted.
+    if (pathname === "/health" || pathname === "/attestation" || pathname === "/.well-known/femled-tee-governance.json") return true;
+    recordRouteGateDenied({ pathname });
+    return false;
+  }
   if (current.status === ACTIVE || current.status === ACTIVATING_SUCCESSOR) return true;
   if (pathname === "/health" || pathname === "/attestation" || pathname === "/.well-known/femled-tee-governance.json") return true;
   if (pathname === "/governance/genesis-bootstrap") return true;
@@ -195,9 +204,10 @@ export async function issuePreapprovalCertificate({
     authorizedRunId,
     now,
   });
-  current.latestPreapproval = envelope;
+  await withGovernanceCommit(() => {
+    current.latestPreapproval = envelope;
+  });
   recordPreapproval({ status: "issued", candidateDigest: candidate.candidateImageDigest });
-  notifyGovernanceStateChanged();
   return envelope;
 }
 
@@ -315,11 +325,15 @@ export async function bootstrapGenesisFromAttestedApproval({
     now,
   });
 
-  current.status = ACTIVE;
-  current.epoch = 1;
-  current.lineage = [genesisCertificate];
+  await withGovernanceCommit(() => {
+    if (current.status !== INACTIVE || current.lineage.length > 0) {
+      throw new Error("genesis bootstrap requires a fresh inactive TEE");
+    }
+    current.status = ACTIVE;
+    current.epoch = 1;
+    current.lineage = [genesisCertificate];
+  });
   current.genesisSelfAdjudications?.clear();
-  notifyGovernanceStateChanged();
 
   return buildGovernanceManifestPayload();
 }
@@ -389,8 +403,14 @@ export async function issueTenantAdmissionCertificate({
     now,
     ...(ttlMs ? { ttlMs } : {}),
   });
-  recordTenantAdmissionInState(envelope.payload, envelope.payloadDigest);
-  notifyGovernanceStateChanged();
+  await withGovernanceCommit(() => {
+    assertActiveGovernance();
+    if (sha256Digest(canonicalStringify(current.lineage)) !== lineageDigest) {
+      throw new Error("governance lineage changed while the tenant admission was being issued");
+    }
+    assertTenantAdmissionDoesNotReplaceExistingKey(current, { tenant, tenantRouteSigningKeys });
+    recordTenantAdmissionInState(envelope.payload, envelope.payloadDigest);
+  });
   return envelope;
 }
 
@@ -441,6 +461,9 @@ export function recordAcceptedRouteVersion({ tenant, routeVersion, routeDigest }
   if (Number.isInteger(routeVersion) && routeVersion > (admitted.latestAcceptedRouteVersion || 0)) {
     admitted.latestAcceptedRouteVersion = routeVersion;
     admitted.latestAcceptedRouteDigest = routeDigest || null;
+    // Informational: route rollback is refused on the signed admission's
+    // minRouteVersion, so this reaches the custodian in the background.
+    notifyGovernanceStateChanged({ replicated: false });
   }
 }
 
@@ -558,53 +581,56 @@ export async function completeActivation({
     throw error;
   }
 
-  const successorCertificate = await signSuccessorCertificate({
-    keyMaterial: current.keyMaterial,
-    predecessorEpoch: current.epoch,
-    successorEpoch: current.epoch + 1,
-    candidateImageDigest: candidate.candidateImageDigest,
-    candidateAttestationDigest: sha256Digest(candidateAttestationToken),
-    candidateAttestationNonce: activationNonce,
-    preapprovalPayloadDigest: preapprovalEnvelope.payloadDigest,
-    successorDecisionPacketDigest: successorDecision.decisionPacketDigest,
-    successorArbitrationDigest: successorDecision.arbitrationDigest,
-    successorGovernancePublicKeyPem: candidateGovernancePublicKeyPem,
-    successorGovernanceKeyId: candidateGovernanceKeyId,
-    successorActivationPublicKeyPem: candidateActivationPublicKeyPem,
-    now,
+  const { successorCertificate, encryptedState } = await withGovernanceCommit(async () => {
+    assertActiveGovernance();
+    const successorCertificate = await signSuccessorCertificate({
+      keyMaterial: current.keyMaterial,
+      predecessorEpoch: current.epoch,
+      successorEpoch: current.epoch + 1,
+      candidateImageDigest: candidate.candidateImageDigest,
+      candidateAttestationDigest: sha256Digest(candidateAttestationToken),
+      candidateAttestationNonce: activationNonce,
+      preapprovalPayloadDigest: preapprovalEnvelope.payloadDigest,
+      successorDecisionPacketDigest: successorDecision.decisionPacketDigest,
+      successorArbitrationDigest: successorDecision.arbitrationDigest,
+      successorGovernancePublicKeyPem: candidateGovernancePublicKeyPem,
+      successorGovernanceKeyId: candidateGovernanceKeyId,
+      successorActivationPublicKeyPem: candidateActivationPublicKeyPem,
+      now,
+    });
+
+    const transferAad = {
+      successorPayloadDigest: successorCertificate.payloadDigest,
+      predecessorGovernanceKeyId: current.keyMaterial.governanceKeyId,
+      successorGovernanceKeyId: candidateGovernanceKeyId,
+      candidateImageDigest: candidate.candidateImageDigest,
+      activationNonce,
+    };
+    const encryptedState = current.keyMaterial.encryptStateFor(candidateActivationPublicKeyPem, {
+      schema: "femled.tee.governance.transferable_state.v1",
+      lineage: [...current.lineage, successorCertificate],
+      epoch: current.epoch + 1,
+      transferredState: current.transferredState,
+    }, transferAad);
+
+    current.status = ACTIVATING_SUCCESSOR;
+    current.pendingSuccessorActivation = {
+      schema: "femled.tee.governance.pending_successor_activation.v1",
+      activationNonce,
+      candidateImageDigest: candidate.candidateImageDigest,
+      candidateGovernanceKeyId,
+      candidateGovernancePublicKeyPem,
+      candidateActivationPublicKeyPem,
+      successorCertificate,
+      successorPayloadDigest: successorCertificate.payloadDigest,
+      successorDecisionPacketDigest: successorDecision.decisionPacketDigest,
+      successorArbitrationDigest: successorDecision.arbitrationDigest,
+      issuedAt: now.toISOString(),
+      expiresAt: successorCertificate.payload.expiresAt,
+    };
+    current.latestSuccessorCertificate = successorCertificate;
+    return { successorCertificate, encryptedState };
   });
-
-  const transferAad = {
-    successorPayloadDigest: successorCertificate.payloadDigest,
-    predecessorGovernanceKeyId: current.keyMaterial.governanceKeyId,
-    successorGovernanceKeyId: candidateGovernanceKeyId,
-    candidateImageDigest: candidate.candidateImageDigest,
-    activationNonce,
-  };
-  const encryptedState = current.keyMaterial.encryptStateFor(candidateActivationPublicKeyPem, {
-    schema: "femled.tee.governance.transferable_state.v1",
-    lineage: [...current.lineage, successorCertificate],
-    epoch: current.epoch + 1,
-    transferredState: current.transferredState,
-  }, transferAad);
-
-  current.status = ACTIVATING_SUCCESSOR;
-  current.pendingSuccessorActivation = {
-    schema: "femled.tee.governance.pending_successor_activation.v1",
-    activationNonce,
-    candidateImageDigest: candidate.candidateImageDigest,
-    candidateGovernanceKeyId,
-    candidateGovernancePublicKeyPem,
-    candidateActivationPublicKeyPem,
-    successorCertificate,
-    successorPayloadDigest: successorCertificate.payloadDigest,
-    successorDecisionPacketDigest: successorDecision.decisionPacketDigest,
-    successorArbitrationDigest: successorDecision.arbitrationDigest,
-    issuedAt: now.toISOString(),
-    expiresAt: successorCertificate.payload.expiresAt,
-  };
-  current.latestSuccessorCertificate = successorCertificate;
-  notifyGovernanceStateChanged();
 
   return {
     successorCertificate,
@@ -668,11 +694,16 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
   if (terminalCertificate?.payloadDigest !== successorCertificate.payloadDigest) {
     throw new Error("transferred lineage does not end with supplied successor certificate");
   }
-  current.status = ACTIVE;
-  current.epoch = transferred.epoch;
-  current.lineage = transferred.lineage;
-  current.transferredState = normalizeTransferredState(transferred.transferredState);
-  current.latestSuccessorCertificate = successorCertificate;
+  await withGovernanceCommit(() => {
+    if (current.status !== INACTIVE || current.lineage.length > 0) {
+      throw new Error("activation bundle can only be applied to inactive candidate");
+    }
+    current.status = ACTIVE;
+    current.epoch = transferred.epoch;
+    current.lineage = transferred.lineage;
+    current.transferredState = normalizeTransferredState(transferred.transferredState);
+    current.latestSuccessorCertificate = successorCertificate;
+  });
   const lineageDigest = sha256Digest(canonicalStringify(current.lineage));
   const activationProof = await signActivationProofCertificate({
     keyMaterial: current.keyMaterial,
@@ -683,7 +714,6 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
     lineageDigest,
     now,
   });
-  notifyGovernanceStateChanged();
 
   return {
     ...buildGovernanceManifestPayload(),
@@ -719,21 +749,27 @@ export async function finalizeActivation({ activationProof, now = new Date() } =
     }
   }
   verifyLineage(expectedLineage, { now, enforceTerminalExpiry: true });
-  const retirementCertificate = await signRetirementCertificate({
-    keyMaterial: current.keyMaterial,
-    retiredEpoch: current.epoch,
-    successorEpoch: current.epoch + 1,
-    successorGovernanceKeyId: pending.candidateGovernanceKeyId,
-    successorPayloadDigest: pending.successorPayloadDigest,
-    now,
+  const retirementCertificate = await withGovernanceCommit(async () => {
+    if (current.status !== ACTIVATING_SUCCESSOR
+      || current.pendingSuccessorActivation?.successorPayloadDigest !== pending.successorPayloadDigest) {
+      throw new Error("pending successor activation changed before finalize");
+    }
+    const retirementCertificate = await signRetirementCertificate({
+      keyMaterial: current.keyMaterial,
+      retiredEpoch: current.epoch,
+      successorEpoch: current.epoch + 1,
+      successorGovernanceKeyId: pending.candidateGovernanceKeyId,
+      successorPayloadDigest: pending.successorPayloadDigest,
+      now,
+    });
+    current.status = RETIRED;
+    current.latestRetirementCertificate = retirementCertificate;
+    current.pendingSuccessorActivation = null;
+    return retirementCertificate;
   });
-  current.status = RETIRED;
-  current.latestRetirementCertificate = retirementCertificate;
   current.pendingActivationChallenges.clear();
-  current.pendingSuccessorActivation = null;
   recordActivation({ status: "success", candidateDigest: pending.candidateImageDigest });
   recordRetirement({ successorDigest: pending.successorPayloadDigest });
-  notifyGovernanceStateChanged();
   return {
     status: "retired",
     successorCertificate: pending.successorCertificate,
@@ -769,6 +805,19 @@ export function buildGovernanceManifestPayload() {
     latestSuccessorCertificate: current.latestSuccessorCertificate,
     latestRetirementCertificate: current.latestRetirementCertificate,
     pendingSuccessorActivation: current.pendingSuccessorActivation,
+    replica: {
+      role: current.replicaRole || null,
+      serial: current.replicaSerial || 0,
+      peer: current.replicaPeer
+        ? { instanceName: current.replicaPeer.instanceName || null, role: current.replicaPeer.role || null }
+        : null,
+      health: {
+        lastAcknowledgedAt: current.replicaHealth?.lastAcknowledgedAt || null,
+        peerSerial: current.replicaHealth?.peerSerial ?? null,
+        lastPrimaryContactAt: current.replicaHealth?.lastPrimaryContactAt || null,
+        lastError: current.replicaHealth?.lastError || null,
+      },
+    },
     routeTrustAnchorsDigest: routeRegistry.trustAnchorsDigest,
     routeBundleDigest: routeRegistry.routeBundleDigest,
     routePolicyStateDigest: getRoutePolicyStateDigest(),
@@ -1019,22 +1068,224 @@ function normalizeSuccessorArbitrationResult(result) {
   };
 }
 
-// Governance state lives only in this process. Every mutation that issues a
-// lineage certificate or changes the route policy notifies listeners, which is
-// how a replica's custodian is kept current without any at-rest copy.
+// Governance state lives only in this process (and its custodian replica's).
 const governanceStateListeners = new Set();
+let governanceStateReplicator = null;
 
 export function onGovernanceStateChange(listener) {
   governanceStateListeners.add(listener);
   return () => governanceStateListeners.delete(listener);
 }
 
-function notifyGovernanceStateChanged() {
+// `replicated` is false for bookkeeping that changed without a commit and
+// still has to reach the custodian.
+function notifyGovernanceStateChanged({ replicated = true } = {}) {
   for (const listener of governanceStateListeners) {
     try {
-      listener(getGovernanceState());
+      listener(getGovernanceState(), { replicated });
     } catch (error) {
       console.error("[governance] state-change listener failed:", error.message);
     }
   }
+}
+
+export function setGovernanceStateReplicator(replicator) {
+  governanceStateReplicator = replicator;
+}
+
+function withGovernanceLock(fn) {
+  const current = getGovernanceState();
+  const run = (current.governanceQueue || Promise.resolve()).then(() => fn(current));
+  current.governanceQueue = run.catch(() => {});
+  return run;
+}
+
+// A change becomes visible outside this process (a signed certificate, a new
+// status) only after the custodian has acknowledged it, and is reverted if it
+// was not; a replica re-keyed from its custodian therefore never loses
+// anything that was released. Serials never repeat, even after a revert, so a
+// custodian that applied a change whose acknowledgement was lost still accepts
+// the next one.
+function withGovernanceCommit(mutate) {
+  return withGovernanceLock(async (current) => {
+    const previous = structuredClone(exportReplicaSnapshot(current));
+    const serial = previous.replicaSerial + 1;
+    let result;
+    try {
+      result = await mutate(current);
+      current.replicaSerial = serial;
+      if (governanceStateReplicator) await governanceStateReplicator(current);
+    } catch (error) {
+      applyReplicaSnapshot(current, previous);
+      current.replicaSerial = serial;
+      throw error;
+    }
+    notifyGovernanceStateChanged();
+    return result;
+  });
+}
+
+// Replicates bookkeeping that changed outside a commit.
+export function replicateGovernanceState() {
+  return withGovernanceCommit(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Replica custody state. Two replicas of the same image hold one lineage key:
+// the primary serves, the custodian keeps a current copy so a restarted replica
+// can be re-keyed. Transfers are sealed to an attested replica's activation key
+// (governance-replica-custody.js); nothing here is ever persisted.
+// ---------------------------------------------------------------------------
+
+const REPLICA_SNAPSHOT_SCHEMA = "femled.tee.governance.replica_snapshot.v1";
+const REPLICA_ROLES = new Set(["primary", "custodian"]);
+
+export function getReplicaRole() {
+  return getGovernanceState().replicaRole || null;
+}
+
+export function setReplicaRole(role) {
+  if (role !== null && !REPLICA_ROLES.has(role)) throw new Error(`unknown replica role ${role}`);
+  getGovernanceState().replicaRole = role;
+}
+
+export function getReplicaPeer() {
+  return getGovernanceState().replicaPeer || null;
+}
+
+export function recordReplicaPeer(peer) {
+  getGovernanceState().replicaPeer = peer ? { ...peer, recordedAt: new Date().toISOString() } : null;
+}
+
+export function isGovernanceKeyHolder() {
+  const status = getGovernanceState().status;
+  return status === ACTIVE || status === ACTIVATING_SUCCESSOR;
+}
+
+function exportReplicaSnapshot(current) {
+  return {
+    schema: REPLICA_SNAPSHOT_SCHEMA,
+    status: current.status,
+    epoch: current.epoch,
+    lineage: current.lineage,
+    transferredState: current.transferredState,
+    latestPreapproval: current.latestPreapproval,
+    latestSuccessorCertificate: current.latestSuccessorCertificate,
+    latestRetirementCertificate: current.latestRetirementCertificate,
+    pendingSuccessorActivation: current.pendingSuccessorActivation,
+    replicaSerial: current.replicaSerial || 0,
+  };
+}
+
+function verifyReplicaSnapshot(snapshot, { now }) {
+  if (snapshot?.schema !== REPLICA_SNAPSHOT_SCHEMA) throw new Error("replica snapshot schema mismatch");
+  if (![ACTIVE, ACTIVATING_SUCCESSOR, RETIRED].includes(snapshot.status)) {
+    throw new Error(`replica snapshot has unexpected status ${snapshot.status}`);
+  }
+  const verified = verifyLineage(snapshot.lineage, { now, enforceTerminalExpiry: false });
+  if (verified.currentEpoch !== snapshot.epoch) throw new Error("replica snapshot epoch does not match its lineage");
+  return verified;
+}
+
+function applyReplicaSnapshot(current, snapshot) {
+  current.status = snapshot.status;
+  current.epoch = snapshot.epoch;
+  current.lineage = snapshot.lineage;
+  current.transferredState = normalizeTransferredState(snapshot.transferredState || {});
+  current.latestPreapproval = snapshot.latestPreapproval || null;
+  current.latestSuccessorCertificate = snapshot.latestSuccessorCertificate || null;
+  current.latestRetirementCertificate = snapshot.latestRetirementCertificate || null;
+  current.pendingSuccessorActivation = snapshot.pendingSuccessorActivation || null;
+  current.replicaSerial = snapshot.replicaSerial || 0;
+}
+
+// Sender side of custody: seals the lineage key and current state to a replica
+// whose activation key the caller has verified through key-bound attestation.
+export function buildReplicaCustodyTransfer({ recipientActivationPublicKeyPem, aad }) {
+  return withGovernanceLock((current) => {
+    if (!isGovernanceKeyHolder()) throw new Error(`replica custody requires a live lineage key holder, got ${current.status}`);
+    assertEnclaveGovernanceKeyInProduction(current);
+    return current.keyMaterial.encryptCustodyTransferFor(recipientActivationPublicKeyPem, exportReplicaSnapshot(current), aad);
+  });
+}
+
+// Recipient side of custody: only a fresh inactive replica accepts it, and the
+// transferred key must be the key the lineage currently names.
+export function applyReplicaCustodyTransfer({ encryptedState, aad, role, expectedGovernanceKeyId, now = new Date() }) {
+  return withGovernanceLock((current) => {
+    if (current.status !== INACTIVE || current.lineage.length > 0) {
+      throw new Error("replica custody can only be applied by a fresh inactive replica");
+    }
+    if (!REPLICA_ROLES.has(role)) throw new Error(`unknown replica role ${role}`);
+    const { keyMaterial, state: snapshot } = current.keyMaterial.acceptCustodyTransfer(encryptedState, aad);
+    if (keyMaterial.governanceKeyId !== expectedGovernanceKeyId) {
+      throw new Error("replica custody key is not the sender's attested key");
+    }
+    const verified = verifyReplicaSnapshot(snapshot, { now });
+    if (`sha256:${publicKeyFingerprint(verified.currentGovernancePublicKeyPem)}` !== keyMaterial.governanceKeyId) {
+      throw new Error("replica custody key is not the key the lineage names");
+    }
+    if (sha256Digest(canonicalStringify(snapshot.lineage)) !== aad.lineageDigest) {
+      throw new Error("replica custody lineage does not match its binding");
+    }
+    current.keyMaterial = keyMaterial;
+    applyReplicaSnapshot(current, snapshot);
+    current.replicaRole = role;
+    current.pendingActivationChallenges.clear();
+    return buildGovernanceManifestPayload();
+  });
+}
+
+// Primary side of state sync, called by the replicator inside a commit: the
+// custodian already holds the key, so only the state travels, encrypted to the
+// custodian's attested activation key.
+export function buildReplicaSync({ recipientActivationPublicKeyPem, aad }) {
+  const current = getGovernanceState();
+  return current.keyMaterial.encryptStateFor(recipientActivationPublicKeyPem, exportReplicaSnapshot(current), aad);
+}
+
+// Custodian side of state sync: only newer state that extends the custodian's
+// own lineage is applied, including a retirement or a change after one.
+export function applyReplicaSync({ encryptedState, aad, now = new Date() }) {
+  return withGovernanceLock((current) => {
+    if (current.replicaRole !== "custodian") throw new Error("only a custodian applies replica state sync");
+    if (![ACTIVE, ACTIVATING_SUCCESSOR, RETIRED].includes(current.status)) {
+      throw new Error(`replica sync requires a custodian holding the lineage, got ${current.status}`);
+    }
+    const snapshot = current.keyMaterial.decryptState(encryptedState, aad);
+    verifyReplicaSnapshot(snapshot, { now });
+    if ((snapshot.replicaSerial || 0) <= (current.replicaSerial || 0)) {
+      throw new Error("replica sync is not newer than the custodian's state");
+    }
+    const ownLineageDigest = sha256Digest(canonicalStringify(current.lineage));
+    const prefixDigest = sha256Digest(canonicalStringify(snapshot.lineage.slice(0, current.lineage.length)));
+    if (snapshot.lineage.length < current.lineage.length || prefixDigest !== ownLineageDigest) {
+      throw new Error("replica sync does not extend the custodian's lineage");
+    }
+    applyReplicaSnapshot(current, snapshot);
+    return { status: current.status, epoch: current.epoch, replicaSerial: current.replicaSerial };
+  });
+}
+
+// Promotion drops the old primary as peer: an old primary that is still alive
+// can then commit nothing, because its syncs reach a replica that refuses them.
+export function promoteReplicaToPrimary() {
+  return withGovernanceLock((current) => {
+    if (current.replicaRole !== "custodian") throw new Error("only a custodian can be promoted");
+    if (current.status !== ACTIVE) throw new Error(`promotion requires active governance, got ${current.status}`);
+    current.replicaRole = "primary";
+    current.replicaPeer = null;
+    return buildGovernanceManifestPayload();
+  });
+}
+
+// Local custody health (never replicated): what this replica last heard from
+// its peer, shown in the manifest so degraded custody is visible early.
+export function recordReplicaHealth(patch) {
+  const current = getGovernanceState();
+  current.replicaHealth = { ...(current.replicaHealth || {}), ...patch };
+}
+
+export function getReplicaHealth() {
+  return getGovernanceState().replicaHealth || {};
 }

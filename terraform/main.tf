@@ -369,6 +369,25 @@ resource "google_compute_firewall" "auth_broker_https" {
   depends_on = [google_project_service.compute]
 }
 
+# The replica port carries custody between the two broker replicas (accepted
+# only from private addresses, src/governance-routes.js) and the failover
+# workflow's promotion request (accepted only with its GitHub OIDC token), so
+# it is reachable from outside the VPC for promotion alone.
+resource "google_compute_firewall" "auth_broker_replica" {
+  name    = "auth-broker-tee-allow-replica"
+  network = "default"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["auth-broker-tee-replica"]
+
+  depends_on = [google_project_service.compute]
+}
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------

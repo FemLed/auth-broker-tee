@@ -26,5 +26,14 @@
   ],
   "_health_server_routes": [
     "/health"
+  ],
+  "_replica_server_routes": [
+    "/health",
+    "/replica/manifest",
+    "/replica/custody-challenge",
+    "/replica/custody-request",
+    "/replica/sync",
+    "/replica/heartbeat",
+    "/governance/replica-promote"
   ]
 }

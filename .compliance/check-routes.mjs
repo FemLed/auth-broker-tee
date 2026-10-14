@@ -14,8 +14,8 @@
  *      sneak path elsewhere in src/).
  *
  * Exit 0 iff:
- *   - Every allowlisted main-server route appears in some discovered
- *     switch.
+ *   - Every allowlisted main-server and replica-port route appears in some
+ *     discovered switch.
  *   - Every allowlisted health-server route appears in some discovered
  *     switch OR equality test.
  *   - Every discovered switch case is allowlisted (no extra main routes).
@@ -117,10 +117,12 @@ if (parseErrors.length > 0) {
 
 const expectedMain = new Set(allowlist._main_server_routes || []);
 const expectedHealth = new Set(allowlist._health_server_routes || []);
-const allExpected = new Set([...expectedMain, ...expectedHealth]);
+const expectedReplica = new Set(allowlist._replica_server_routes || []);
+const expectedSwitch = new Set([...expectedMain, ...expectedReplica]);
+const allExpected = new Set([...expectedMain, ...expectedHealth, ...expectedReplica]);
 
-const missingMain = [...expectedMain].filter((r) => !discoveredSwitchRoutes.has(r));
-const extraMain = [...discoveredSwitchRoutes.keys()].filter((r) => !expectedMain.has(r));
+const missingMain = [...expectedSwitch].filter((r) => !discoveredSwitchRoutes.has(r));
+const extraMain = [...discoveredSwitchRoutes.keys()].filter((r) => !expectedSwitch.has(r));
 
 const allDiscoveredHealth = new Set([...discoveredEqualityRoutes.keys(), ...discoveredSwitchRoutes.keys()]);
 const missingHealth = [...expectedHealth].filter((r) => !allDiscoveredHealth.has(r));
@@ -150,6 +152,7 @@ if (failed) {
     expected: {
       main: [...expectedMain].sort(),
       health: [...expectedHealth].sort(),
+      replica: [...expectedReplica].sort(),
     },
     remediation: "Update both the source AND .compliance/route-allowlist.json -- they must agree. Equality-style route checks anywhere under src/ (e.g. `if (url.pathname === '/foo')`) are also gated by this allowlist, not just switch cases in server.js.",
   });
