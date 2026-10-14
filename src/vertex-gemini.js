@@ -206,7 +206,7 @@ function rankModelName(model) {
   const version = /gemini-([0-9]+)(?:[.-]([0-9]+))?/.exec(text);
   const major = Number.parseInt(version?.[1] || "0", 10);
   const minor = Number.parseInt(version?.[2] || "0", 10);
-  const proWeight = /pro|argon/.test(text) ? 100 : 0;
+  const proWeight = /pro/.test(text) ? 100 : 0;
   const previewPenalty = /preview|experimental|exp/.test(text) ? -5 : 0;
   return major * 1000 + minor * 10 + proWeight + previewPenalty;
 }

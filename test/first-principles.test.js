@@ -177,11 +177,9 @@ test("First Principles structured output contract is pinned", () => {
   assert.equal(FIRST_PRINCIPLES_MODEL_POLICY.current.thinkingLevel, "HIGH");
   assert.equal(FIRST_PRINCIPLES_MODEL_POLICY.successorModelPolicy.discoverySource, "vertex_google_publisher_catalog_evidence_only");
   assert.equal(isPermittedSuccessorModelCandidate("gemini-3.1-pro"), true);
-  assert.equal(isPermittedSuccessorModelCandidate("gemini-4-argon"), true);
-  assert.equal(isPermittedSuccessorModelCandidate("gemini-4.1-argon"), true);
   assert.equal(isPermittedSuccessorModelCandidate("gemini-3.1-flash"), false);
-  assert.equal(isPermittedSuccessorModelCandidate("gemini-4-argon-live"), false);
-  assert.equal(isPermittedSuccessorModelCandidate("gemini-3.5-transcribe-preview"), false);
+  assert.equal(isPermittedSuccessorModelCandidate("gemini-3.5-pro-live"), false);
+  assert.equal(isPermittedSuccessorModelCandidate("gemini-3.5-pro-transcribe-preview"), false);
   assert.equal(isPermittedSuccessorModelCandidate("made-up-non-gemini-model"), false);
 });
 
