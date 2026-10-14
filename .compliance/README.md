@@ -29,7 +29,7 @@ in order; any failure short-circuits the workflow.
 | `check-route-integrity`  | custom source scan         | Regressing tenant routing to mutable Firestore fields instead of TEE-admitted, tenant-signed route documents     |
 | `branch-protection`      | GitHub REST API            | Disabling the required compliance/TEE status checks, signed commits, force-push protection, deletion protection, or admin-bypass enforcement. PR reviews are not the trust root; the TEE First Principles status check is. |
 | `sbom`                   | Syft                       | Drift between locked and produced dependency tree; provides SBOM digest for the predicate                        |
-| `vuln-scan`              | OSV-Scanner against SBOM   | Shipping a HIGH/CRITICAL CVE in any transitive dependency                                                        |
+| `vuln-scan`              | OSV-Scanner against SBOM   | Shipping a HIGH/CRITICAL CVE in any transitive dependency, except an unexpired, unreachable, unfixable advisory listed in `vuln-exceptions.json` |
 
 ## How the rules are pinned
 
@@ -71,6 +71,16 @@ When *intentionally* tightening or expanding rules:
    prints JSON to stdout and exits 0 on pass / non-zero on fail. Wire it
    into `run.sh` next to the existing AST checks.
 3. **Allowlists**: edit the corresponding JSON file and bump it via PR.
+
+## Vulnerability exceptions
+
+`vuln-exceptions.json` may list a HIGH/CRITICAL advisory only when no fixed
+release exists and the affected code path is unreachable in this image. Each
+entry names one advisory id, its package, an `expiresAt` at most 90 days out,
+and the reachability reason. A lapsed entry stops applying and the gate fails
+again: renew it with fresh evidence, or remove the dependency. Excepted
+advisories are recorded in the `vuln` result (`excepted`) and so in the
+attested compliance predicate.
 
 ## How to add a new TEE-side dependency
 

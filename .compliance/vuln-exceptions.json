@@ -1,0 +1,11 @@
+{
+  "schema": "femled.auth_broker.compliance.vuln_exceptions.v1",
+  "exceptions": [
+    {
+      "id": "GHSA-86w9-cpqp-85rv",
+      "package": "node-forge",
+      "expiresAt": "2027-01-12T00:00:00Z",
+      "reason": "Affects every node-forge release (1.4.0 is the latest) and no fixed release exists. node-forge reaches this image only through acme-client's legacy forge module (acme-client/src/crypto/forge.js); the broker calls acme.crypto only (src/acme-renewal.js createCsr, src/acme-account.js createPrivateKey), which uses Node's native crypto, so the affected RSA PKCS#1 v1.5 verification path is never executed."
+    }
+  ]
+}

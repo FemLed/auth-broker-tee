@@ -223,23 +223,40 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ -f "${RESULTS_DIR}/sbom.spdx.jso
   #     without doing full CVSS base-score arithmetic in jq.
   # The heuristic intentionally prefers false positives (failed builds)
   # over false negatives (silent passes).
-  HIGH_COUNT=$(
-    jq '
-      [
-        .results[]?.packages[]?.vulnerabilities[]?
-        | select(
-            (
-              (.database_specific.severity? // "" | ascii_upcase | test("HIGH|CRITICAL"))
+  #
+  # vuln-exceptions.json lists HIGH advisories that have no fixed release and
+  # are unreachable in this image. Each entry matches one advisory id in one
+  # package and stops applying at its expiresAt, so a lapsed exception fails
+  # the build again. It is a .json file so the rules digest covers it.
+  NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  HIGH_ENTRIES=$(
+    jq -c --slurpfile ex "${SCRIPT_DIR}/vuln-exceptions.json" --arg now "${NOW_ISO}" '
+      ($ex[0].exceptions // [] | map(select(.expiresAt > $now))) as $active
+      | [
+          .results[]?.packages[]? as $p
+          | $p.vulnerabilities[]?
+          | select(
+              (
+                (.database_specific.severity? // "" | ascii_upcase | test("HIGH|CRITICAL"))
+              )
+              or
+              (
+                [.severity[]? | (.score // "") | ascii_upcase
+                  | test("HIGH|CRITICAL|/C:H|/I:H|/A:H")
+                ] | any
+              )
             )
-            or
-            (
-              [.severity[]? | (.score // "") | ascii_upcase
-                | test("HIGH|CRITICAL|/C:H|/I:H|/A:H")
-              ] | any
-            )
-          )
-      ] | length' "${RESULTS_DIR}/vuln-raw.json"
+          | . as $v
+          | {
+              id: $v.id,
+              package: $p.package.name,
+              version: $p.package.version,
+              excepted: ($active | any(.id == $v.id and .package == $p.package.name))
+            }
+        ]' "${RESULTS_DIR}/vuln-raw.json"
   )
+  HIGH_COUNT=$(jq '[.[] | select(.excepted | not)] | length' <<<"${HIGH_ENTRIES}")
+  EXCEPTED=$(jq -c '[.[] | select(.excepted) | del(.excepted)]' <<<"${HIGH_ENTRIES}")
   if [[ -z "${HIGH_COUNT}" ]] || ! [[ "${HIGH_COUNT}" =~ ^[0-9]+$ ]]; then
     echo "[compliance] vuln-scan: FAILED (could not parse severity from vuln-raw.json)" >&2
     jq -n --arg status "failed" --arg reason "severity parse failed" '{status: $status, reason: $reason}' > "${RESULTS_DIR}/vuln.json"
@@ -256,7 +273,8 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ -f "${RESULTS_DIR}/sbom.spdx.jso
       --arg status "failed" \
       --argjson high_count "${HIGH_COUNT}" \
       --argjson total_count "${TOTAL_COUNT}" \
-      '{status: $status, high_count: $high_count, total_count: $total_count, raw_path: ".compliance-results/vuln-raw.json"}' \
+      --argjson excepted "${EXCEPTED:-[]}" \
+      '{status: $status, high_count: $high_count, total_count: $total_count, excepted: $excepted, raw_path: ".compliance-results/vuln-raw.json"}' \
       > "${RESULTS_DIR}/vuln.json"
     echo "[compliance] vuln-scan: FAILED (${HIGH_COUNT} HIGH/CRITICAL, ${TOTAL_COUNT} total)" >&2
     OVERALL_STATUS="failed"
@@ -266,9 +284,10 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ -f "${RESULTS_DIR}/sbom.spdx.jso
       --arg status "passed" \
       --argjson high_count "${HIGH_COUNT}" \
       --argjson total_count "${TOTAL_COUNT}" \
-      '{status: $status, high_count: $high_count, total_count: $total_count}' \
+      --argjson excepted "${EXCEPTED:-[]}" \
+      '{status: $status, high_count: $high_count, total_count: $total_count, excepted: $excepted}' \
       > "${RESULTS_DIR}/vuln.json"
-    echo "[compliance] vuln-scan: PASSED (${TOTAL_COUNT} non-high advisories)" >&2
+    echo "[compliance] vuln-scan: PASSED (${TOTAL_COUNT} non-high advisories, $(jq length <<<"${EXCEPTED:-[]}") excepted)" >&2
   fi
   fi  # close: empty vuln-raw.json branch
 else

@@ -67,7 +67,7 @@ test("tenant route document derives trust anchor from TEE admission certificate"
   const state = buildRegistryState({
     trustAnchors: emptyTrustAnchors(),
     routeDocuments: [document],
-    verifyAdmission: (envelope) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem),
+    verifyAdmission: (envelope, options) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem, options),
     now: NOW,
   });
 
@@ -104,7 +104,7 @@ test("tenant route document rejects routes outside admitted host policy", () => 
     () => buildRegistryState({
       trustAnchors: emptyTrustAnchors(),
       routeDocuments: [routeDocument({ admission, routeEnvelope })],
-      verifyAdmission: (envelope) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem),
+      verifyAdmission: (envelope, options) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem, options),
       now: NOW,
     }),
     /apiHost is not admitted/
@@ -139,7 +139,7 @@ test("Firestore tenant route documents and private deploy bundle load as separat
   await initializeRouteRegistry({
     trustAnchors: trustAnchors(keys.publicPem),
     routeDocuments: [routeDocument({ admission, routeEnvelope: tenantEnvelope })],
-    verifyAdmission: (envelope) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem),
+    verifyAdmission: (envelope, options) => verifyGovernanceEnvelope(envelope, governance.governancePublicKeyPem, options),
     deployBundle: { schema: ROUTE_BUNDLE_SCHEMA, routes: [deployEnvelope] },
     refreshMs: 0,
     now: NOW,
