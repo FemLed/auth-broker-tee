@@ -32,6 +32,10 @@ const GOVERNANCE_WORKFLOW_REFS = [
   "FemLed/auth-broker-tee/.github/workflows/build-and-attest.yml@refs/heads/master",
 ];
 const GOVERNANCE_ALLOWED_EVENTS = new Set(["push"]);
+const GENESIS_WORKFLOW_REFS = [
+  "FemLed/auth-broker-tee/.github/workflows/operator-genesis.yml@refs/heads/master",
+];
+const GENESIS_ALLOWED_EVENTS = new Set(["workflow_dispatch"]);
 const PREAPPROVAL_CHALLENGE_PURPOSE = "governance.preapprove";
 const TENANT_REGISTRATION_SCHEMA = "femled.auth_broker.tenant_registration.v1";
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
@@ -162,6 +166,16 @@ export async function handleGovernanceChallenge(req, res) {
 
 export async function handleGenesisBootstrap(req, res) {
   if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "genesis-bootstrap")) return;
+  try {
+    await verifyGovernanceOidc(req.headers.authorization, {
+      audience: GOVERNANCE_OIDC_AUDIENCE,
+      workflowRefs: GENESIS_WORKFLOW_REFS,
+      allowedEvents: GENESIS_ALLOWED_EVENTS,
+    });
+  } catch (error) {
+    return jsonResponse(res, 401, { error: error.message });
+  }
   let body;
   try {
     body = await readJsonBody(req, MAX_GOVERNANCE_BODY_BYTES);

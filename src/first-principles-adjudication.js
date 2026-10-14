@@ -22,7 +22,7 @@ import {
 import { generateFirstPrinciplesContent } from "./vertex-gemini.js";
 import { collectGitHubSourceEvidence } from "./github-source-evidence.js";
 import { getRouteRegistryStatus } from "./route-registry.js";
-import { buildGovernanceManifestPayload, isGovernanceInactive } from "./governance-state.js";
+import { buildGovernanceManifestPayload, isGovernanceInactive, recordGenesisSelfAdjudication } from "./governance-state.js";
 import { recordManifestAttestation } from "./governance-monitor.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -50,11 +50,12 @@ export async function handleFirstPrinciplesAdjudicate(req, res) {
   }
 
   let oidcClaims;
+  const genesisSelfAdjudication = isGovernanceInactive();
   try {
     // Genesis self-adjudication presents an operator-genesis.yml workflow_dispatch
     // OIDC token. Accept that workflow ref + event ONLY while INACTIVE; an active
     // broker keeps the strict default workflow-ref/event allow-list in github-oidc.js.
-    const genesisOidcExpectations = isGovernanceInactive()
+    const genesisOidcExpectations = genesisSelfAdjudication
       ? {
           allowedEvents: new Set(["workflow_dispatch"]),
           workflowRefs: ["FemLed/auth-broker-tee/.github/workflows/operator-genesis.yml@refs/heads/master"],
@@ -73,6 +74,9 @@ export async function handleFirstPrinciplesAdjudicate(req, res) {
 
   try {
     const response = await adjudicate(normalized.request, oidcClaims);
+    if (genesisSelfAdjudication && response.payload?.decision === "APPROVE") {
+      recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt });
+    }
     return jsonResponse(res, 200, response);
   } catch (error) {
     console.error("[FirstPrinciples] Adjudication failed:", error.message);

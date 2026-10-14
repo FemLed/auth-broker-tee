@@ -46,9 +46,7 @@ const ACTIVE = "active";
 const INACTIVE = "inactive";
 const ACTIVATING_SUCCESSOR = "activating_successor";
 const RETIRED = "retired";
-const TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS = new Set([
-  "sha256:a3b34e462346ef3bf9c7fd313284530c1ad3813c3756ad7a86bb762e26bc46e8",
-]);
+const GENESIS_SELF_ADJUDICATION_LIMIT = 8;
 
 let state = null;
 
@@ -105,6 +103,7 @@ export function initializeGovernance({ mode = "inactive", keyMaterial: providedK
       lastScanError: null,
     },
     pendingActivationChallenges: new Map(),
+    genesisSelfAdjudications: new Map(),
     transferredState: {
       schema: "femled.tee.governance.transferred_state.v1",
       routePolicy: emptyRoutePolicyState(),
@@ -238,33 +237,21 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (response.payloadDigest !== payloadDigest) {
     throw new Error("genesis bootstrap adjudication payloadDigest mismatch");
   }
+  // Operator-authorized self-attested re-genesis is the only genesis path: the
+  // candidate adjudicates the diff that produced its own image while INACTIVE.
+  // It accepts only an approval this process produced and recorded. An
+  // attestation over a caller-supplied payload proves nothing on its own,
+  // because /attestation attests any nonce a caller asks for. Continuity IS
+  // broken: the new lineage is not trusted by tenants until they re-admit it.
+  const recordedExpiry = current.genesisSelfAdjudications?.get(payloadDigest);
+  if (recordedExpiry === undefined) {
+    throw new Error("genesis bootstrap accepts only an adjudication this TEE produced for its own genesis");
+  }
   const reviewerAttestation = await verifyAttestation(response.attestationToken, {
     expectedNonce: payloadDigest,
   });
   const reviewerImageDigest = reviewerAttestation.submods?.container?.image_digest || null;
-  // Genesis bootstrap accepts a reviewer in one of two ways:
-  //
-  //   1. A pre-trusted seed reviewer whose attested image digest is hardcoded
-  //      in TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS (a previously-blessed image
-  //      reviews the candidate -- continuity-preserving seed review).
-  //   2. Operator-authorized self-attested re-genesis: the candidate attests
-  //      its OWN running image digest. This is the explicit broken-continuity
-  //      lineage-reset path (governance rulebook "Operator-authorized
-  //      re-genesis"), used when no live trusted reviewer is available -- e.g.
-  //      the active TEE is unrecoverably inactive and cannot adjudicate.
-  //
-  // The self-attested path is deliberately narrow: genesis bootstrap is only
-  // reachable on a fresh INACTIVE TEE with an empty lineage (enforced above),
-  // and the running image's source revision must equal the TEE-approved commit
-  // (enforced below), so the self-review is still bound to a specific
-  // GitHub-reviewed image -- not arbitrary code. Continuity IS broken: the new
-  // lineage starts at this genesis and is NOT trusted by tenants until they
-  // re-admit it. Tenant lineage-pinning plus freshly issued admission envelopes
-  // are the trust boundary for a self-attested re-genesis, not an external
-  // reviewer. An arbitrary third-party reviewer image (neither self nor a
-  // trusted seed) is still rejected.
-  const isSelfAttestedGenesis = reviewerImageDigest !== null && reviewerImageDigest === current.imageDigest;
-  if (!isSelfAttestedGenesis && !TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS.has(reviewerImageDigest)) {
+  if (reviewerImageDigest !== current.imageDigest) {
     throw new Error(`genesis bootstrap reviewer image ${reviewerImageDigest || "unknown"} is not trusted for genesis`);
   }
 
@@ -331,9 +318,24 @@ export async function bootstrapGenesisFromAttestedApproval({
   current.status = ACTIVE;
   current.epoch = 1;
   current.lineage = [genesisCertificate];
+  current.genesisSelfAdjudications?.clear();
   notifyGovernanceStateChanged();
 
   return buildGovernanceManifestPayload();
+}
+
+// Records an APPROVE adjudication this INACTIVE TEE produced for its own
+// genesis (operator-genesis.yml self-adjudication), the only approval
+// bootstrapGenesisFromAttestedApproval will accept.
+export function recordGenesisSelfAdjudication({ payloadDigest, expiresAt = null }) {
+  const current = getGovernanceState();
+  if (current.status !== INACTIVE || current.lineage.length > 0) return false;
+  current.genesisSelfAdjudications ||= new Map();
+  current.genesisSelfAdjudications.set(payloadDigest, expiresAt);
+  while (current.genesisSelfAdjudications.size > GENESIS_SELF_ADJUDICATION_LIMIT) {
+    current.genesisSelfAdjudications.delete(current.genesisSelfAdjudications.keys().next().value);
+  }
+  return true;
 }
 
 export async function issueSelfHealingProposal({ proposal, healthSnapshot = null, internalEventDigests = [], industryTelemetryDigest = null, now = new Date() }) {
@@ -394,8 +396,23 @@ export async function issueTenantAdmissionCertificate({
 
 export function verifyTenantAdmissionEnvelope(envelope, { now = new Date() } = {}) {
   const current = getGovernanceState();
-  const publicKeyPem = resolveGovernancePublicKeyForKeyId(envelope?.signingKeyId, current);
-  const payload = verifyGovernanceEnvelope(envelope, publicKeyPem, { now });
+  // An admission is valid only under the lineage that issued it: its lineage
+  // digest must be this lineage's prefix at its epoch, and it must be signed by
+  // that epoch's key. A key reused across lineages therefore cannot carry an
+  // admission from one lineage into another.
+  const epoch = envelope?.payload?.governanceEpoch;
+  if (!Number.isInteger(epoch) || epoch < 1 || epoch > current.lineage.length) {
+    throw new Error("tenant admission epoch is not in the accepted governance lineage");
+  }
+  const prefixDigest = sha256Digest(canonicalStringify(current.lineage.slice(0, epoch)));
+  if (envelope.payload.governanceLineageDigest !== prefixDigest) {
+    throw new Error("tenant admission was not issued under the accepted governance lineage");
+  }
+  const epochKey = governanceKeyAtEpoch(current.lineage, epoch);
+  if (!epochKey.publicKeyPem || envelope.signingKeyId !== epochKey.keyId) {
+    throw new Error("tenant admission is not signed by the governance key of its epoch");
+  }
+  const payload = verifyGovernanceEnvelope(envelope, epochKey.publicKeyPem, { now });
   assertTenantAdmissionPayload(payload, { now });
   if (payload.governanceKeyId !== envelope.signingKeyId) {
     throw new Error("tenant admission governanceKeyId must match envelope signingKeyId");
@@ -810,23 +827,18 @@ function routeKeyFingerprint(key) {
   };
 }
 
-function resolveGovernancePublicKeyForKeyId(keyId, current) {
-  if (!keyId || typeof keyId !== "string") {
-    throw new Error("tenant admission envelope must include signingKeyId");
+// The governance key that was current at `epoch`: the genesis key for epoch 1,
+// otherwise the key named by the successor certificate that opened the epoch.
+function governanceKeyAtEpoch(lineage, epoch) {
+  const payload = lineage[epoch - 1]?.payload || {};
+  if (epoch === 1) {
+    return payload.epoch === 1
+      ? { keyId: payload.governanceKeyId, publicKeyPem: payload.governancePublicKeyPem }
+      : {};
   }
-  for (const envelope of current.lineage || []) {
-    const payload = envelope.payload || {};
-    if (payload.governanceKeyId === keyId && payload.governancePublicKeyPem) {
-      return payload.governancePublicKeyPem;
-    }
-    if (payload.successorGovernanceKeyId === keyId && payload.successorGovernancePublicKeyPem) {
-      return payload.successorGovernancePublicKeyPem;
-    }
-  }
-  if (current.keyMaterial?.governanceKeyId === keyId) {
-    return current.keyMaterial.governancePublicKeyPem;
-  }
-  throw new Error(`tenant admission signing key ${keyId} is not in accepted governance lineage`);
+  return payload.successorEpoch === epoch
+    ? { keyId: payload.successorGovernanceKeyId, publicKeyPem: payload.successorGovernancePublicKeyPem }
+    : {};
 }
 
 function normalizeTransferredState(value = {}) {
