@@ -8,6 +8,7 @@ import {
   signGenesisCertificate,
   signPreapprovalCertificate,
   signSuccessorCertificate,
+  signTenantAdmissionCertificate,
   verifyLineage,
 } from "../src/governance-certificates.js";
 import { getWifAccessToken } from "../src/gcp-auth.js";
@@ -28,6 +29,7 @@ import {
   issueSelfHealingProposal,
   issueTenantAdmissionCertificate,
   mayServePath,
+  recordGenesisSelfAdjudication,
   verifyTenantAdmissionEnvelope,
   resetGovernanceForTests,
   getGovernanceState,
@@ -59,6 +61,7 @@ import { evaluateSelfImprovementOnce } from "../src/governance-self-improvement.
 import { evaluateModelPolicyUpgradeOpportunity } from "../src/governance-model-policy-supervisor.js";
 import {
   handleActivationOffer,
+  handleGenesisBootstrap,
   handleGovernanceChallenge,
   handleGovernancePreapproval,
   handleTenantAdmission,
@@ -68,6 +71,7 @@ import {
 } from "../src/governance-routes.js";
 
 const IMAGE_DIGEST = digestOf("candidate-image");
+const TENANT_ROUTE_PUBLIC_KEY_PEM = createInMemoryGovernanceKeyMaterial().governancePublicKeyPem;
 
 test("governance certificates verify and reject payload tampering", () => {
   const keys = createInMemoryGovernanceKeyMaterial();
@@ -142,6 +146,55 @@ test("active TEE issues and verifies tenant admission certificates", async () =>
   assert.equal(verified.schema, "femled.auth_broker.tenant_admission.v1");
   assert.equal(verified.governanceKeyId, state.keyMaterial.governanceKeyId);
   assert.equal(getGovernanceState().transferredState.routePolicy.admittedTenants[verified.tenant].minRouteVersion, 2);
+});
+
+test("tenant admissions are bound to the lineage that issued them", async () => {
+  resetGovernanceMonitorForTests();
+  resetGovernanceForTests();
+  const sharedKey = createInMemoryGovernanceKeyMaterial();
+  initializeGovernance({ mode: "genesis", keyMaterial: sharedKey, now: new Date("2026-05-05T00:00:00Z") });
+  const admission = await issueTenantAdmissionCertificate(tenantAdmissionFields());
+  const now = new Date("2026-05-05T00:01:00Z");
+  assert.equal(verifyTenantAdmissionEnvelope(admission, { now }).tenant, tenantAdmissionFields().tenant);
+
+  // A fresh genesis that reuses the same key is a different lineage; the
+  // admission it did not issue must not carry over.
+  resetGovernanceForTests();
+  initializeGovernance({ mode: "genesis", keyMaterial: sharedKey, now: new Date("2026-05-06T00:00:00Z") });
+  assert.throws(() => verifyTenantAdmissionEnvelope(admission, { now }), /not issued under the accepted governance lineage/);
+
+  const otherKey = createInMemoryGovernanceKeyMaterial();
+  const lineageDigest = sha256Digest(canonicalStringify(getGovernanceState().lineage));
+  const forged = await signTenantAdmissionCertificate({ keyMaterial: otherKey, epoch: 1, lineageDigest, ...tenantAdmissionFields() });
+  assert.throws(() => verifyTenantAdmissionEnvelope(forged, { now }), /not signed by the governance key of its epoch/);
+
+  const futureEpoch = await signTenantAdmissionCertificate({ keyMaterial: sharedKey, epoch: 2, lineageDigest, ...tenantAdmissionFields() });
+  assert.throws(() => verifyTenantAdmissionEnvelope(futureEpoch, { now }), /epoch is not in the accepted governance lineage/);
+});
+
+test("genesis bootstrap requires the operator-genesis workflow's governance OIDC", async () => {
+  resetGovernanceRouteSecurityForTests();
+  resetGovernanceForTests(null);
+  initializeGovernance();
+  const seen = [];
+  setGovernanceOidcVerifierForTests(async (authHeader, expected) => {
+    seen.push(expected);
+    if (authHeader !== "Bearer genesis-workflow") throw new Error("invalid test OIDC token");
+    return { event_name: "workflow_dispatch", job_workflow_ref: expected.workflowRefs[0] };
+  });
+
+  const unauthenticated = createMockResponse();
+  await handleGenesisBootstrap(governanceRequest({ body: {}, authorization: null, remoteAddress: "198.51.100.30" }), unauthenticated);
+  assert.equal(unauthenticated.statusCode, 401);
+  assert.equal(getGovernanceState().status, "inactive");
+
+  const authenticated = createMockResponse();
+  await handleGenesisBootstrap(governanceRequest({ body: {}, authorization: "Bearer genesis-workflow", remoteAddress: "198.51.100.31" }), authenticated);
+  assert.equal(authenticated.statusCode, 400);
+  assert.deepEqual(seen.at(-1).workflowRefs, ["FemLed/auth-broker-tee/.github/workflows/operator-genesis.yml@refs/heads/master"]);
+  assert.deepEqual([...seen.at(-1).allowedEvents], ["workflow_dispatch"]);
+  assert.equal(seen.at(-1).audience, "https://oauth-tee.femled.ai/governance");
+  resetGovernanceRouteSecurityForTests();
 });
 
 test("health transient recovery clears degraded and critical availability risk", () => {
@@ -278,7 +331,7 @@ test("inactive candidates and retired predecessors cannot serve privileged route
   assert.throws(() => initializeGovernance({ mode: "active" }), /active governance/);
 });
 
-test("genesis bootstrap requires fresh attested approval from trusted prior TEE", async () => {
+test("genesis bootstrap accepts only an approval this TEE produced and recorded for its own genesis", async () => {
   resetGovernanceForTests(null);
   resetGovernanceMonitorForTests();
   await withMockedImageProvenance({ sourceRevision: "b".repeat(40) }, async () => {
@@ -288,10 +341,19 @@ test("genesis bootstrap requires fresh attested approval from trusted prior TEE"
       decision: "APPROVE",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
+    // A correctly attested payload is not enough: /attestation attests any
+    // nonce, so an externally built approval must be refused.
+    await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
+      request,
+      response,
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
+    }), /only an adjudication this TEE produced/);
+
+    assert.equal(recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt }), true);
     const manifest = await bootstrapGenesisFromAttestedApproval({
       request,
       response,
-      verifyAttestation: trustedBootstrapAttestation,
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
     });
     assert.equal(manifest.status, "active");
     assert.equal(manifest.epoch, 1);
@@ -299,6 +361,8 @@ test("genesis bootstrap requires fresh attested approval from trusted prior TEE"
     assert.equal(manifest.lineage[0].payload.genesisBootstrap.targetImageReference, process.env.TEE_LOCAL_IMAGE_REFERENCE);
     assert.equal(manifest.lineage[0].payload.genesisBootstrap.targetImageSourceRevision, "b".repeat(40));
     assert.equal(mayServePath("/login"), true);
+    // Once active, no further self-adjudication can be recorded.
+    assert.equal(recordGenesisSelfAdjudication({ payloadDigest: digestOf("later") }), false);
   });
 });
 
@@ -312,6 +376,7 @@ test("genesis bootstrap rejects untrusted reviewer image or unbound target", asy
       decision: "APPROVE",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
+    recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt });
 
     await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
       request,
@@ -327,7 +392,7 @@ test("genesis bootstrap rejects untrusted reviewer image or unbound target", asy
     await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
       request: { ...genesisBootstrapRequest(current.imageDigest), headSha: "c".repeat(40) },
       response,
-      verifyAttestation: trustedBootstrapAttestation,
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
     }), /head SHA mismatch|image revision/);
   });
 });
@@ -349,15 +414,11 @@ test("genesis bootstrap allows operator-authorized self-attested re-genesis", as
       decision: "APPROVE",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
+    recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt });
     const manifest = await bootstrapGenesisFromAttestedApproval({
       request,
       response,
-      verifyAttestation: async (_jwt, expected) => ({
-        dbgstat: "disabled-since-boot",
-        swname: "CONFIDENTIAL_SPACE",
-        eat_nonce: expected.expectedNonce,
-        submods: { container: { image_digest: current.imageDigest } },
-      }),
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
     });
     assert.equal(manifest.status, "active");
     assert.equal(manifest.epoch, 1);
@@ -381,6 +442,7 @@ test("genesis bootstrap verifies fetched image manifest and config digests", asy
     decision: "APPROVE",
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
+  recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt });
   const originalFetch = globalThis.fetch;
   const configText = JSON.stringify({
     config: {
@@ -402,7 +464,7 @@ test("genesis bootstrap verifies fetched image manifest and config digests", asy
     await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
       request,
       response,
-      verifyAttestation: trustedBootstrapAttestation,
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
     }), /config digest mismatch/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -426,6 +488,7 @@ test("genesis bootstrap never sends WIF tokens to arbitrary pkg.dev-like hosts",
     decision: "APPROVE",
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
+  recordGenesisSelfAdjudication({ payloadDigest: response.payloadDigest, expiresAt: response.payload.expiresAt });
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async (_url, options = {}) => {
@@ -435,7 +498,7 @@ test("genesis bootstrap never sends WIF tokens to arbitrary pkg.dev-like hosts",
     await assert.rejects(() => bootstrapGenesisFromAttestedApproval({
       request,
       response,
-      verifyAttestation: trustedBootstrapAttestation,
+      verifyAttestation: selfBootstrapAttestation(current.imageDigest),
     }), /fetch running image manifest/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1888,17 +1951,27 @@ function genesisBootstrapResponse(request, { decision, expiresAt }) {
   };
 }
 
-async function trustedBootstrapAttestation(_jwt, expected) {
+function tenantAdmissionFields() {
   return {
+    tenant: "019a8314-3e69-7bb1-b8ee-19bc54723979",
+    tenantRouteSigningKeys: [
+      { keyId: "tenant-route-key", alg: "Ed25519", publicKeyPem: TENANT_ROUTE_PUBLIC_KEY_PEM },
+    ],
+    minRouteVersion: 2,
+    allowedApiHosts: ["api-019a8314-3e69-7bb1-b8ee-19bc54723979.femled.ai"],
+    allowedAppHosts: ["app-019a8314-3e69-7bb1-b8ee-19bc54723979.femled.ai"],
+    allowedBrokerAudiences: ["https://oauth-tee.femled.ai"],
+    now: new Date("2026-05-05T00:00:00Z"),
+  };
+}
+
+function selfBootstrapAttestation(imageDigest) {
+  return async (_jwt, expected) => ({
     dbgstat: "disabled-since-boot",
     swname: "CONFIDENTIAL_SPACE",
     eat_nonce: expected.expectedNonce,
-    submods: {
-      container: {
-        image_digest: "sha256:a3b34e462346ef3bf9c7fd313284530c1ad3813c3756ad7a86bb762e26bc46e8",
-      },
-    },
-  };
+    submods: { container: { image_digest: imageDigest } },
+  });
 }
 
 async function withMockedImageProvenance({ sourceRevision }, fn) {

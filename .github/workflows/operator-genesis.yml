@@ -26,9 +26,9 @@
 ##   4. Builds the first-principles adjudication request and asks the candidate
 ##      to self-adjudicate (allowed only while INACTIVE; auth is the
 ##      operator-genesis GitHub OIDC token).
-##   5. POSTs the signed APPROVE to /governance/genesis-bootstrap, which accepts
-##      the self-attested reviewer (the candidate's own image digest) and goes
-##      active at epoch 1.
+##   5. POSTs the signed APPROVE to /governance/genesis-bootstrap with this
+##      workflow's governance OIDC token. The candidate accepts only an approval
+##      it produced itself in step 4, and goes active at epoch 1.
 ##   6. Verifies active + epoch 1 + the expected image digest; uploads evidence.
 ##      On failure, revokes the candidate window and deletes the VM.
 ##
@@ -300,7 +300,17 @@ jobs:
       - name: POST genesis-bootstrap to candidate TEE
         env:
           CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          AUDIENCE: https://oauth-tee.femled.ai/governance
         run: |
+          # genesis-bootstrap requires this workflow's governance OIDC token.
+          token=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC token for genesis-bootstrap"
+            exit 1
+          fi
+          echo "::add-mask::${token}"
           jq -n \
             --slurpfile request first-principles-request.json \
             --slurpfile response first-principles-response.json \
@@ -309,6 +319,7 @@ jobs:
           status=$(curl -sk --max-time 60 \
             -X POST \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${token}" \
             --data-binary @genesis-bootstrap-body.json \
             "https://${CANDIDATE_IP}/governance/genesis-bootstrap" \
             --output genesis-bootstrap-response.json \
