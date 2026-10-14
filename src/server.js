@@ -20,7 +20,11 @@ import {
   handleActivationApply,
   handleActivationComplete,
   handleActivationFinalize,
+  handleActivationAbort,
+  handleActivationDecline,
   handleActivationOffer,
+  handleActivationProof,
+  handleActivationReadiness,
   handleGovernanceChallenge,
   handleGovernanceManifest,
   handleGovernancePreapproval,
@@ -253,6 +257,14 @@ async function startPublicService() {
           return await handleActivationFinalize(req, res);
         case "/governance/activation-apply":
           return await handleActivationApply(req, res);
+        case "/governance/activation-readiness":
+          return await handleActivationReadiness(req, res);
+        case "/governance/activation-decline":
+          return await handleActivationDecline(req, res);
+        case "/governance/activation-proof":
+          return await handleActivationProof(req, res);
+        case "/governance/activation-abort":
+          return await handleActivationAbort(req, res);
         case "/governance/tenant-admission":
           return await handleTenantAdmission(req, res);
         case "/governance/repair-artifact":

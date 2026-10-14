@@ -9,11 +9,15 @@ import {
 } from "./first-principles-review.js";
 import { inspectCandidateImageEvidence } from "./governance-image-inspection.js";
 import {
+  abortActivation,
   attestGovernanceManifest,
   bootstrapGenesisFromAttestedApproval,
   completeActivation,
   createActivationChallenge,
+  declineActivation,
   finalizeActivation,
+  getActivationProof,
+  issueActivationReadiness,
   issuePreapprovalCertificate,
   issueTenantAdmissionCertificate,
   applyActivationBundle,
@@ -47,6 +51,12 @@ const GENESIS_ALLOWED_EVENTS = new Set(["workflow_dispatch"]);
 const REPLICA_FAILOVER_WORKFLOW_REFS = [
   "FemLed/auth-broker-tee/.github/workflows/replica-failover.yml@refs/heads/master",
 ];
+// Finishes or unwinds a handoff the activation job could not complete:
+// finalize, decline, abort and proof re-serve only.
+const SUCCESSOR_RECOVERY_WORKFLOW_REFS = [
+  "FemLed/auth-broker-tee/.github/workflows/successor-recovery.yml@refs/heads/master",
+];
+const SUCCESSOR_RECOVERY_ALLOWED_EVENTS = new Set(["workflow_dispatch"]);
 const MAX_REPLICA_BODY_BYTES = 2 * 1024 * 1024;
 const PREAPPROVAL_CHALLENGE_PURPOSE = "governance.preapprove";
 const TENANT_REGISTRATION_SCHEMA = "femled.auth_broker.tenant_registration.v1";
@@ -365,7 +375,15 @@ export async function handleActivationComplete(req, res) {
     return jsonResponse(res, 400, { error: error.message });
   }
   try {
-    const bundle = await completeActivation(body);
+    const bundle = await completeActivation({
+      preapprovalEnvelope: body.preapprovalEnvelope,
+      candidate: body.candidate,
+      candidateReadiness: body.candidateReadiness,
+      candidateGovernancePublicKeyPem: body.candidateGovernancePublicKeyPem,
+      candidateGovernanceKeyId: body.candidateGovernanceKeyId,
+      candidateActivationPublicKeyPem: body.candidateActivationPublicKeyPem,
+      activationNonce: body.activationNonce,
+    });
     return jsonResponse(res, 200, {
       ...bundle,
       finalAcceptance: "pending_candidate_apply_and_predecessor_finalize",
@@ -378,7 +396,7 @@ export async function handleActivationComplete(req, res) {
 export async function handleActivationFinalize(req, res) {
   if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
   if (!consumeCoarseRateLimit(req, res, "activation-finalize")) return;
-  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation" });
+  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation", allowRecovery: true });
   if (!authContext) return;
   let body;
   try {
@@ -388,7 +406,7 @@ export async function handleActivationFinalize(req, res) {
   }
   try {
     return jsonResponse(res, 200, {
-      ...(await finalizeActivation(body)),
+      ...(await finalizeActivation({ activationProof: body.activationProof })),
       finalAcceptance: "granted_after_candidate_activation_proof",
     });
   } catch (error) {
@@ -408,11 +426,91 @@ export async function handleActivationApply(req, res) {
     return jsonResponse(res, 400, { error: error.message });
   }
   try {
-    const manifest = await applyActivationBundle(body);
+    const manifest = await applyActivationBundle({
+      successorCertificate: body.successorCertificate,
+      encryptedState: body.encryptedState,
+      predecessorActivationPublicKeyPem: body.predecessorActivationPublicKeyPem,
+      activationNonce: body.activationNonce,
+    });
     await initializeRouteRegistry();
     return jsonResponse(res, 200, manifest);
   } catch (error) {
     return jsonResponse(res, 400, { error: error.message });
+  }
+}
+
+// Candidate: proves which keys it holds for this activation nonce.
+export async function handleActivationReadiness(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "activation-readiness")) return;
+  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation" });
+  if (!authContext) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_GOVERNANCE_CHALLENGE_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    return jsonResponse(res, 200, await issueActivationReadiness({ activationNonce: body.activationNonce }));
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+}
+
+// Candidate: refuses the nonce for good and signs a decline.
+export async function handleActivationDecline(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "activation-decline")) return;
+  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation", allowRecovery: true });
+  if (!authContext) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_GOVERNANCE_CHALLENGE_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    return jsonResponse(res, 200, { decline: await declineActivation({ activationNonce: body.activationNonce }) });
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
+  }
+}
+
+// Successor: serves its activation proof again for a late finalize.
+export async function handleActivationProof(req, res) {
+  if (req.method !== "GET") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "activation-proof")) return;
+  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation", allowRecovery: true });
+  if (!authContext) return;
+  try {
+    return jsonResponse(res, 200, getActivationProof());
+  } catch (error) {
+    return jsonResponse(res, 404, { error: error.message });
+  }
+}
+
+// Predecessor: back to active on the candidate's decline, or after the pending
+// certificate expired plus the grace period.
+export async function handleActivationAbort(req, res) {
+  if (req.method !== "POST") return textResponse(res, 405, "Method not allowed");
+  if (!consumeCoarseRateLimit(req, res, "activation-abort")) return;
+  const authContext = await authorizeGovernanceRequest(req, res, { rateLimitProfile: "mutation", allowRecovery: true });
+  if (!authContext) return;
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_GOVERNANCE_CHALLENGE_BODY_BYTES);
+  } catch (error) {
+    return jsonResponse(res, 400, { error: error.message });
+  }
+  try {
+    return jsonResponse(res, 200, await abortActivation({
+      decline: body.decline || null,
+      expired: body.expired === true,
+      activationNonce: body.activationNonce || null,
+    }));
+  } catch (error) {
+    return jsonResponse(res, 409, { error: error.message });
   }
 }
 
@@ -598,7 +696,7 @@ function verifyTenantRegistrationSignature(payload, signature, key) {
   throw new Error("tenant registration signature alg must be Ed25519 or ECDSA_P256_SHA256");
 }
 
-async function authorizeGovernanceRequest(req, res, { rateLimitProfile = "mutation" } = {}) {
+async function authorizeGovernanceRequest(req, res, { rateLimitProfile = "mutation", allowRecovery = false } = {}) {
   let claims;
   try {
     claims = await verifyGovernanceOidc(req.headers.authorization, {
@@ -607,7 +705,16 @@ async function authorizeGovernanceRequest(req, res, { rateLimitProfile = "mutati
       allowedEvents: GOVERNANCE_ALLOWED_EVENTS,
     });
   } catch (error) {
-    return jsonResponse(res, 401, { error: error.message });
+    if (!allowRecovery) return jsonResponse(res, 401, { error: error.message });
+    try {
+      claims = await verifyGovernanceOidc(req.headers.authorization, {
+        audience: GOVERNANCE_OIDC_AUDIENCE,
+        workflowRefs: SUCCESSOR_RECOVERY_WORKFLOW_REFS,
+        allowedEvents: SUCCESSOR_RECOVERY_ALLOWED_EVENTS,
+      });
+    } catch {
+      return jsonResponse(res, 401, { error: error.message });
+    }
   }
 
   const subject = claims.sub || `${claims.repository || "unknown"}:${claims.run_id || "unknown"}`;

@@ -156,6 +156,19 @@ export function buildActivationNonce(fields) {
   }));
 }
 
+// The candidate computes this over its own key ids; the predecessor recomputes
+// it over the keys it was offered, so an attestation of it binds those keys to
+// the attested enclave.
+export function buildActivationReadinessNonce({ activationNonce, governanceKeyId, activationKeyId, imageDigest }) {
+  return sha256Digest(canonicalStringify({
+    schema: "femled.tee.governance.activation_readiness_nonce.v1",
+    activationNonce,
+    governanceKeyId,
+    activationKeyId,
+    imageDigest,
+  }));
+}
+
 export function encryptStateEnvelope({
   senderPrivateKey,
   senderActivationPublicKeyPem,

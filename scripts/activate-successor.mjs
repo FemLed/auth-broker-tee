@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import https from "node:https";
 import path from "node:path";
 
 const DEFAULT_TEE_URL = "https://oauth-tee.femled.ai";
@@ -48,7 +49,41 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const workDir = options.workDir || fs.mkdtempSync("/tmp/tee-successor-");
   fs.mkdirSync(workDir, { recursive: true });
+  const report = { schema: "femled.tee.activation_successor.report.v1", stage: options.stage, workDir };
 
+  if (options.stage === "abort") {
+    Object.assign(report, await abortStage(options, workDir));
+  } else if (options.stage === "finalize") {
+    Object.assign(report, await finalizeStage(options, workDir));
+  } else {
+    const handoff = await handoffStage(options, workDir);
+    const predecessorEpoch = Number(handoff.predecessorGovernance.payload.epoch || 0);
+    Object.assign(report, {
+      imageDigest: options.imageDigest,
+      candidateIp: options.candidateIp,
+      successorPayloadDigest: handoff.successorPayloadDigest,
+      activationProofDigest: handoff.activationProofDigest,
+      predecessorLineageDigest: handoff.predecessorGovernance.payload.lineageDigest,
+      successorExpectedEpoch: predecessorEpoch + 1,
+      postActivationIamReconciliation: {
+        when: "after production traffic points at the active successor governance manifest",
+        command: [
+          "node scripts/reconcile-active-tee-iam.mjs",
+          `--expected-image-digest ${options.imageDigest}`,
+          `--pinned-predecessor-lineage-digest ${handoff.predecessorGovernance.payload.lineageDigest}`,
+          `--min-governance-epoch ${predecessorEpoch + 1}`,
+          `--candidate-image-digest ${options.imageDigest}`,
+          "--write-default-tfvars-json",
+        ].join(" \\\n  "),
+        nextStep: "review the generated Terraform variables, then run terraform plan/apply from terraform/",
+      },
+    });
+    if (options.stage === "all") Object.assign(report, await finalizeStage(options, workDir));
+  }
+  console.log(JSON.stringify(report, null, 2));
+}
+
+async function handoffStage(options, workDir) {
   const candidateImageReference = `${options.imageRepository}@${options.imageDigest}`;
   const { manifest, manifestDigest, config } = await fetchOciEvidence({
     imageRepository: options.imageRepository,
@@ -109,10 +144,15 @@ export async function main(argv = process.argv.slice(2)) {
   });
   writeJson(path.join(workDir, "activation-offer-response.json"), activationOffer);
 
-  const candidateAttestationToken = await fetchText(`${options.teeUrl}/attestation?nonce=${encodeURIComponent(activationOffer.activationNonce)}`, {
+  // The candidate proves, under its own key and a key-bound attestation, that
+  // it holds the keys this offer names.
+  const candidateReadiness = await fetchJson(`${options.teeUrl}/governance/activation-readiness`, {
+    method: "POST",
     resolveIp: options.candidateIp,
+    headers: await governanceAuthHeaders(options),
+    body: { activationNonce: activationOffer.activationNonce },
   });
-  fs.writeFileSync(path.join(workDir, "candidate-attestation.jwt"), candidateAttestationToken);
+  writeJson(path.join(workDir, "activation-readiness-response.json"), candidateReadiness);
 
   const activationComplete = await fetchJson(`${options.teeUrl}/governance/activation-complete`, {
     method: "POST",
@@ -120,7 +160,7 @@ export async function main(argv = process.argv.slice(2)) {
     body: {
       preapprovalEnvelope: preapproval.preapproval,
       candidate: preapproval.candidate,
-      candidateAttestationToken,
+      candidateReadiness,
       candidateGovernancePublicKeyPem: candidateGovernance.payload.governancePublicKeyPem,
       candidateGovernanceKeyId: candidateGovernance.payload.governanceKeyId,
       candidateActivationPublicKeyPem: candidateGovernance.payload.activationPublicKeyPem,
@@ -140,45 +180,83 @@ export async function main(argv = process.argv.slice(2)) {
     },
   });
   writeJson(path.join(workDir, "activation-apply-response.json"), activationApply);
-
-  const activationFinalize = await fetchJson(`${options.teeUrl}/governance/activation-finalize`, {
-    method: "POST",
-    headers: await governanceAuthHeaders(options),
-    body: {
-      activationProof: activationApply.activationProof,
-    },
-  });
-  writeJson(path.join(workDir, "activation-finalize-response.json"), activationFinalize);
-
-  console.log(JSON.stringify({
-    schema: "femled.tee.activation_successor.report.v1",
-    workDir,
-    imageDigest: options.imageDigest,
-    candidateIp: options.candidateIp,
+  return {
+    predecessorGovernance,
     successorPayloadDigest: activationComplete.successorCertificate.payloadDigest,
-    activationProofDigest: activationApply.activationProof.payloadDigest,
-    finalizeStatus: activationFinalize.status,
-    predecessorLineageDigest: predecessorGovernance.payload.lineageDigest,
-    successorExpectedEpoch: Number(predecessorGovernance.payload.epoch || 0) + 1,
-    postActivationIamReconciliation: {
-      when: "after production traffic points at the active successor governance manifest",
-      command: [
-        "node scripts/reconcile-active-tee-iam.mjs",
-        `--expected-image-digest ${options.imageDigest}`,
-        `--pinned-predecessor-lineage-digest ${predecessorGovernance.payload.lineageDigest}`,
-        `--min-governance-epoch ${Number(predecessorGovernance.payload.epoch || 0) + 1}`,
-        `--candidate-image-digest ${options.imageDigest}`,
-        "--write-default-tfvars-json",
-      ].join(" \\\n  "),
-      nextStep: "review the generated Terraform variables, then run terraform plan/apply from terraform/",
-    },
-  }, null, 2));
+    activationProofDigest: activationApply.activationProof?.payloadDigest || null,
+  };
+}
+
+// Finalize from the saved handoff evidence. The successor's proof comes from
+// the apply response or, if that was lost, from the successor itself; the
+// predecessor accepts it after the successor certificate expired as long as
+// the successor applied while it was valid.
+async function finalizeStage(options, workDir) {
+  readEvidence(workDir, "activation-complete-response.json");
+  let activationProof = readEvidence(workDir, "activation-apply-response.json", { optional: true })?.activationProof;
+  if (!activationProof) {
+    if (!options.candidateIp) throw new Error("the apply response is missing; --candidate-ip is needed to fetch the successor's proof");
+    const served = await fetchJson(`${options.teeUrl}/governance/activation-proof`, {
+      resolveIp: options.candidateIp,
+      headers: await governanceAuthHeaders(options),
+    });
+    writeJson(path.join(workDir, "activation-proof-response.json"), served);
+    activationProof = served.activationProof;
+  }
+  const finalized = await fetchJson(`${options.teeUrl}/governance/activation-finalize`, {
+    method: "POST",
+    resolveIp: options.predecessorIp,
+    headers: await governanceAuthHeaders(options),
+    body: { activationProof },
+  });
+  writeJson(path.join(workDir, "activation-finalize-response.json"), finalized);
+  return { finalizeStatus: finalized.status, activationProofDigest: activationProof.payloadDigest };
+}
+
+// Unwind a handoff whose candidate never applied: the candidate's decline, or
+// (--expired, once the candidate is gone) the expiry of the pending certificate.
+async function abortStage(options, workDir) {
+  const { activationNonce } = readEvidence(workDir, "activation-offer-response.json");
+  let body;
+  if (options.expired) {
+    body = { expired: true, activationNonce };
+  } else {
+    const declined = await fetchJson(`${options.teeUrl}/governance/activation-decline`, {
+      method: "POST",
+      resolveIp: options.candidateIp,
+      headers: await governanceAuthHeaders(options),
+      body: { activationNonce },
+    });
+    writeJson(path.join(workDir, "activation-decline-response.json"), declined);
+    body = { decline: declined.decline };
+  }
+  const aborted = await fetchJson(`${options.teeUrl}/governance/activation-abort`, {
+    method: "POST",
+    resolveIp: options.predecessorIp,
+    headers: await governanceAuthHeaders(options),
+    body,
+  });
+  writeJson(path.join(workDir, "activation-abort-response.json"), aborted);
+  return { abortStatus: aborted.status, abortReason: aborted.abortedActivation?.reason || null };
+}
+
+function readEvidence(workDir, name, { optional = false } = {}) {
+  const file = path.join(workDir, name);
+  if (!fs.existsSync(file)) {
+    if (optional) return null;
+    throw new Error(`${name} is missing from ${workDir}`);
+  }
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 export function parseArgs(argv) {
   const options = {
+    stage: "all",
     teeUrl: DEFAULT_TEE_URL,
     imageRepository: DEFAULT_IMAGE_REPOSITORY,
+    candidateIp: "",
+    predecessorIp: "",
+    expired: false,
     workDir: "",
     workflowRunId: "",
     complianceSummary: "",
@@ -188,8 +266,11 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") options.help = true;
+    else if (arg === "--stage") options.stage = argv[++i];
     else if (arg === "--tee-url") options.teeUrl = stripTrailingSlash(argv[++i]);
     else if (arg === "--candidate-ip") options.candidateIp = argv[++i];
+    else if (arg === "--predecessor-ip") options.predecessorIp = argv[++i];
+    else if (arg === "--expired") options.expired = true;
     else if (arg === "--image-digest") options.imageDigest = argv[++i];
     else if (arg === "--image-repository") options.imageRepository = argv[++i];
     else if (arg === "--workflow-run-id") options.workflowRunId = argv[++i];
@@ -198,11 +279,23 @@ export function parseArgs(argv) {
     else if (arg === "--work-dir") options.workDir = argv[++i];
     else throw new Error(`unknown argument: ${arg}`);
   }
-  if (!options.help) {
+  if (options.help) return options;
+  if (!["all", "handoff", "finalize", "abort"].includes(options.stage)) {
+    throw new Error("--stage must be all, handoff, finalize or abort");
+  }
+  for (const [flag, value] of [["--candidate-ip", options.candidateIp], ["--predecessor-ip", options.predecessorIp]]) {
+    if (value && !/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) throw new Error(`${flag} must be an IPv4 address`);
+  }
+  if (options.stage === "all" || options.stage === "handoff") {
     if (!options.candidateIp) throw new Error("--candidate-ip is required");
     if (!isSha256Digest(options.imageDigest)) throw new Error("--image-digest must be a sha256 digest");
     if (!options.complianceSummary && !options.workflowRunId) {
       throw new Error("--compliance-summary or --workflow-run-id is required");
+    }
+  } else {
+    if (!options.workDir) throw new Error(`--work-dir with the handoff evidence is required for --stage ${options.stage}`);
+    if (options.stage === "abort" && !options.expired && !options.candidateIp) {
+      throw new Error("--candidate-ip is required to ask the candidate to decline (or pass --expired)");
     }
   }
   return options;
@@ -320,24 +413,52 @@ async function fetchJson(url, { method = "GET", body = null, resolveIp = "", hea
 // aborted mid-flight (the epoch-5 roll's first attempt died exactly here).
 const GOVERNANCE_CALL_TIMEOUT_MS = 600_000;
 
+// Errors name the method, path and status and quote the response; request
+// headers (the governance token) and bodies never appear in them.
 async function fetchText(url, { method = "GET", body = null, resolveIp = "", headers = {} } = {}) {
-  if (resolveIp) {
-    const args = ["-fsS", "--max-time", String(GOVERNANCE_CALL_TIMEOUT_MS / 1000), "--resolve", `oauth-tee.femled.ai:443:${resolveIp}`];
-    for (const [name, value] of Object.entries(headers)) args.push("-H", `${name}: ${value}`);
-    if (method !== "GET") args.push("-X", method);
-    if (body) args.push("--data-binary", JSON.stringify(body));
-    args.push(url);
-    return run("curl", args);
+  const target = new URL(url);
+  const payload = body ? JSON.stringify(body) : null;
+  const { status, text } = resolveIp
+    ? await requestPinned(target, { method, headers, payload, address: resolveIp })
+    : await requestDirect(target, { method, headers, payload });
+  if (status < 200 || status >= 300) {
+    throw new Error(`${method} ${target.pathname} returned ${status}: ${text.slice(0, 2000)}`);
   }
-  const response = await fetch(url, {
+  return text;
+}
+
+async function requestDirect(target, { method, headers, payload }) {
+  const response = await fetch(target, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : null,
+    body: payload,
     signal: AbortSignal.timeout(GOVERNANCE_CALL_TIMEOUT_MS),
   });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${url} returned ${response.status}: ${text}`);
-  return text;
+  return { status: response.status, text: await response.text() };
+}
+
+// Talks to one TEE by address while TLS still verifies the certificate for
+// the URL's host name.
+function requestPinned(target, { method, headers, payload, address }) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(target, {
+      method,
+      headers: payload ? { ...headers, "Content-Length": Buffer.byteLength(payload) } : headers,
+      timeout: GOVERNANCE_CALL_TIMEOUT_MS,
+      lookup: (_hostname, lookupOptions, callback) => (lookupOptions?.all
+        ? callback(null, [{ address, family: 4 }])
+        : callback(null, address, 4)),
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode, text: Buffer.concat(chunks).toString("utf8") }));
+      response.on("error", (error) => reject(new Error(`${method} ${target.pathname} response failed: ${error.message}`)));
+    });
+    request.on("timeout", () => request.destroy(new Error("timed out")));
+    request.on("error", (error) => reject(new Error(`${method} ${target.pathname} to ${address} failed: ${error.message}`)));
+    if (payload) request.write(payload);
+    request.end();
+  });
 }
 
 function run(command, args) {
@@ -375,15 +496,25 @@ function stripTrailingSlash(value) {
 }
 
 function usage() {
-  return `Usage: node scripts/activate-successor.mjs --candidate-ip <ip> --image-digest <sha256:digest> [options]
+  return `Usage: node scripts/activate-successor.mjs [--stage all|handoff|finalize|abort] [options]
+
+Stages:
+  all (default)  handoff, then finalize
+  handoff        preapprove, offer, candidate readiness, complete, candidate apply
+  finalize       finalize from the saved evidence (fetches the successor's proof if the apply response is missing)
+  abort          the candidate declines, then the predecessor aborts; with --expired, abort an expired activation
 
 Options:
-  --tee-url <url>              Active predecessor TEE URL. Default: ${DEFAULT_TEE_URL}
+  --tee-url <url>              TEE URL (host name for TLS). Default: ${DEFAULT_TEE_URL}
+  --candidate-ip <ip>          Address of the candidate (successor) TEE.
+  --predecessor-ip <ip>        Address of the predecessor, when the URL no longer resolves to it.
+  --expired                    abort stage: abort without a decline once the pending certificate has expired.
+  --image-digest <digest>      Candidate image digest (handoff).
   --image-repository <path>    Artifact Registry repository path. Default: ${DEFAULT_IMAGE_REPOSITORY}
   --workflow-run-id <id>       GitHub Actions run id containing compliance-summary artifact.
   --compliance-summary <path>  Local compliance summary JSON.
   --governance-oidc-token <t>  Governance-audience GitHub Actions OIDC token.
-  --work-dir <path>            Directory to write request/response artifacts.
+  --work-dir <path>            Directory for request/response evidence (required for finalize and abort).
 `;
 }
 

@@ -294,7 +294,18 @@ For self-governance changes, request changes if the candidate:
 - treats repair-worker output, external model output, Cloud Build results,
   Artifact Registry writes, logs, callback payloads, GitHub PRs, or substrate
   claims as activation authority instead of evidence inspected and arbitrated by
-  the active TEE.
+  the active TEE;
+- lets a predecessor certify successor keys without the candidate's readiness
+  proof (a statement signed with the candidate's in-enclave key and a
+  Confidential Space attestation, under an audience /attestation never
+  requests, of a nonce the candidate computed over its own key ids), lets a
+  predecessor abort after it has seen the successor's activation proof, or lets
+  a candidate apply an expired successor certificate.
+
+Finishing or unwinding a handoff between two live TEEs (late finalize, the
+candidate's signed decline followed by an abort, or an abort once the pending
+successor certificate has expired) is not an admin recovery path: none of them
+creates, imports or restores a key, and none lets the lineage fork.
 
 Two-replica custody is how the broker survives a restart, and it is not a
 recovery path. A primary and a custodian replica of the same image hold one
