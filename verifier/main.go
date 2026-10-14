@@ -125,6 +125,9 @@ var expectedComplianceChecks = []string{
 // `submods.container.env_override` is a sign of operator tampering.
 var defaultAllowedEnvOverrideKeys = []string{
 	"ACME_RENEWER_DRY_RUN",
+	"REPLICA_ROLE",
+	"REPLICA_PEER_URL",
+	"REPLICA_PEER_INSTANCE",
 }
 
 func main() {

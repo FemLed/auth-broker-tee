@@ -21,7 +21,8 @@
 ##      (reconcile-candidate-resource-iam.mjs + the project-role reconciler) so
 ##      the candidate can read its secrets and mint TLS. It signs its genesis
 ##      certificate with a key generated in its own enclave.
-##   2. Provisions a fresh INACTIVE Intel TDX candidate VM running the image.
+##   2. Provisions a fresh INACTIVE Intel TDX VM running the image as replica
+##      slot a (the primary), told where its custodian will be.
 ##   3. Waits for its HTTPS endpoint and confirms it reports inactive.
 ##   4. Builds the first-principles adjudication request and asks the candidate
 ##      to self-adjudicate (allowed only while INACTIVE; auth is the
@@ -29,12 +30,17 @@
 ##   5. POSTs the signed APPROVE to /governance/genesis-bootstrap with this
 ##      workflow's governance OIDC token. The candidate accepts only an approval
 ##      it produced itself in step 4, and goes active at epoch 1.
-##   6. Verifies active + epoch 1 + the expected image digest; uploads evidence.
-##      On failure, revokes the candidate window and deletes the VM.
+##   6. Verifies active + epoch 1 + the expected image digest.
+##   7. Provisions replica slot b (the custodian). It mints no TLS and opens no
+##      public listener; it pulls custody of the lineage key from slot a with
+##      key-bound attestation, and the workflow waits until slot a's manifest
+##      names it as custodian. Uploads evidence. On failure, revokes the
+##      candidate window and deletes both VMs.
 ##
 ## Operator follow-up after this workflow succeeds (explicit operator actions):
-##   - Update Cloudflare oauth-tee.femled.ai A record to the new VM's IP and
-##     authoritative-dns-tee/src/zone-manifest.js to match.
+##   - Move the reserved address to slot a:
+##     bash scripts/move-reserved-ip.sh --to <slot a VM> --to-zone us-west1-b --expect-digest <digest>
+##     (oauth-tee.femled.ai's A record already names the reserved address).
 ##   - Re-admit the new (broken-continuity) lineage with tenants (fresh admission
 ##     envelopes) and add the new digest to authoritative-dns-tee
 ##     EXTERNAL_TEE_RENEWERS so it can mint TLS.
@@ -68,6 +74,11 @@ on:
         description: "How long to wait for the candidate VM HTTPS endpoint to become reachable"
         required: false
         default: "240"
+        type: string
+      custodian_zone:
+        description: "Zone for replica slot b, the custodian (slot a runs in us-west1-b)"
+        required: false
+        default: "us-west1-b"
         type: string
 
 permissions:
@@ -152,22 +163,36 @@ jobs:
             --wait \
             --update-env-vars="RECONCILE_OPERATION=grant,CANDIDATE_IMAGE_DIGEST=${IMAGE_DIGEST}"
 
-      - name: Resolve candidate VM name and check non-collision
+      - name: Resolve replica VM names and check non-collision
         id: vm
         env:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
+          CUSTODIAN_ZONE: ${{ inputs.custodian_zone }}
         run: |
-          digest_hex="${IMAGE_DIGEST#sha256:}"
-          short="${digest_hex:0:12}"
-          vm_name="auth-broker-tee-genesis-${short}"
-          if gcloud compute instances describe "${vm_name}" \
-              --project="${GCP_PROJECT_ID}" \
-              --zone=us-west1-b >/dev/null 2>&1; then
-            echo "::error::candidate VM ${vm_name} already exists; delete it before re-running"
+          if [[ ! "${CUSTODIAN_ZONE}" =~ ^us-west1-[a-c]$ ]]; then
+            echo "::error::custodian_zone must be a us-west1 zone (the reserved address is regional)"
             exit 1
           fi
-          echo "vm_name=${vm_name}" >> "$GITHUB_OUTPUT"
-          echo "Candidate VM name: ${vm_name}"
+          digest_hex="${IMAGE_DIGEST#sha256:}"
+          short="${digest_hex:0:12}"
+          vm_name="auth-broker-tee-a-${short}"
+          custodian_name="auth-broker-tee-b-${short}"
+          for pair in "${vm_name}:us-west1-b" "${custodian_name}:${CUSTODIAN_ZONE}"; do
+            if gcloud compute instances describe "${pair%%:*}" \
+                --project="${GCP_PROJECT_ID}" \
+                --zone="${pair##*:}" >/dev/null 2>&1; then
+              echo "::error::VM ${pair%%:*} already exists; delete it before re-running"
+              exit 1
+            fi
+          done
+          {
+            echo "vm_name=${vm_name}"
+            echo "custodian_name=${custodian_name}"
+            echo "primary_peer_url=http://${vm_name}.us-west1-b.c.${GCP_PROJECT_ID}.internal:8080"
+            echo "custodian_peer_url=http://${custodian_name}.${CUSTODIAN_ZONE}.c.${GCP_PROJECT_ID}.internal:8080"
+          } >> "$GITHUB_OUTPUT"
+          echo "Replica slot a (primary): ${vm_name}"
+          echo "Replica slot b (custodian): ${custodian_name} in ${CUSTODIAN_ZONE}"
 
       - name: Provision inactive candidate VM
         id: provision
@@ -175,6 +200,8 @@ jobs:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
           IMAGE_REFERENCE: ${{ inputs.image_reference }}
           VM_NAME: ${{ steps.vm.outputs.vm_name }}
+          CUSTODIAN_NAME: ${{ steps.vm.outputs.custodian_name }}
+          CUSTODIAN_PEER_URL: ${{ steps.vm.outputs.custodian_peer_url }}
         run: |
           # Self-attested genesis is permitted by the image code while INACTIVE
           # (bootstrapGenesisFromAttestedApproval accepts the candidate's own
@@ -183,10 +210,14 @@ jobs:
           # it signs its genesis certificate with a key generated in its enclave.
           # The OAuth redirect, scopes, project and route collection are baked into
           # the image and are not overridable: the launcher refuses any tee-env
-          # value outside allow_env_override.
+          # value outside allow_env_override. The REPLICA_* values only locate the
+          # custodian; custody is granted on its attestation.
           metadata="tee-image-reference=${IMAGE_REFERENCE}@${IMAGE_DIGEST}"
           metadata="${metadata},tee-restart-policy=Always"
           metadata="${metadata},tee-signed-image-repos=${IMAGE_REFERENCE}"
+          metadata="${metadata},tee-env-REPLICA_ROLE=primary"
+          metadata="${metadata},tee-env-REPLICA_PEER_URL=${CUSTODIAN_PEER_URL}"
+          metadata="${metadata},tee-env-REPLICA_PEER_INSTANCE=${CUSTODIAN_NAME}"
           gcloud compute instances create "${VM_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \
@@ -199,7 +230,7 @@ jobs:
             --boot-disk-type=pd-balanced \
             --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
             --scopes=cloud-platform \
-            --tags=auth-broker-tee \
+            --tags=auth-broker-tee,auth-broker-tee-replica \
             --shielded-secure-boot \
             --shielded-vtpm \
             --shielded-integrity-monitoring \
@@ -348,22 +379,92 @@ jobs:
             || (echo "::error::Candidate epoch is not 1 after genesis"; exit 1)
           jq -e --arg digest "${IMAGE_DIGEST}" '.payload.imageDigest == $digest' active-manifest.json \
             || (echo "::error::Candidate image digest mismatch after genesis"; exit 1)
+          jq -e '.payload.replica.role == "primary"' active-manifest.json \
+            || (echo "::error::Candidate is not the primary replica"; exit 1)
+
+      - name: Provision custodian replica VM
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          IMAGE_REFERENCE: ${{ inputs.image_reference }}
+          CUSTODIAN_NAME: ${{ steps.vm.outputs.custodian_name }}
+          CUSTODIAN_ZONE: ${{ inputs.custodian_zone }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+          PRIMARY_PEER_URL: ${{ steps.vm.outputs.primary_peer_url }}
+        run: |
+          # Same image, same candidate WIF window. A custodian mints no TLS and
+          # opens no public listener; it pulls custody from slot a over the
+          # private network.
+          metadata="tee-image-reference=${IMAGE_REFERENCE}@${IMAGE_DIGEST}"
+          metadata="${metadata},tee-restart-policy=Always"
+          metadata="${metadata},tee-signed-image-repos=${IMAGE_REFERENCE}"
+          metadata="${metadata},tee-env-REPLICA_ROLE=custodian"
+          metadata="${metadata},tee-env-REPLICA_PEER_URL=${PRIMARY_PEER_URL}"
+          metadata="${metadata},tee-env-REPLICA_PEER_INSTANCE=${VM_NAME}"
+          gcloud compute instances create "${CUSTODIAN_NAME}" \
+            --project="${GCP_PROJECT_ID}" \
+            --zone="${CUSTODIAN_ZONE}" \
+            --machine-type=c3-standard-4 \
+            --confidential-compute-type=TDX \
+            --maintenance-policy=TERMINATE \
+            --image-family=confidential-space \
+            --image-project=confidential-space-images \
+            --boot-disk-size=20GB \
+            --boot-disk-type=pd-balanced \
+            --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+            --scopes=cloud-platform \
+            --tags=auth-broker-tee,auth-broker-tee-replica \
+            --shielded-secure-boot \
+            --shielded-vtpm \
+            --shielded-integrity-monitoring \
+            --metadata="${metadata}"
+
+      - name: Wait for the custodian to take custody
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          CUSTODIAN_NAME: ${{ steps.vm.outputs.custodian_name }}
+          READY_TIMEOUT: ${{ inputs.ready_timeout_seconds }}
+        run: |
+          deadline=$(( $(date +%s) + READY_TIMEOUT + 300 ))
+          while [[ $(date +%s) -lt ${deadline} ]]; do
+            curl -sSk --max-time 15 \
+              "https://${CANDIDATE_IP}/.well-known/femled-tee-governance.json" \
+              > replica-manifest.json || true
+            if jq -e --arg custodian "${CUSTODIAN_NAME}" \
+                '.payload.replica.peer.instanceName == $custodian and .payload.replica.peer.role == "custodian"' \
+                replica-manifest.json >/dev/null 2>&1; then
+              echo "Custodian ${CUSTODIAN_NAME} holds custody"
+              jq '.payload.replica' replica-manifest.json
+              exit 0
+            fi
+            echo "Custodian has not taken custody yet; sleeping 15s"
+            sleep 15
+          done
+          echo "::error::custodian ${CUSTODIAN_NAME} did not take custody in time"
+          exit 1
+
+      - name: Report new replicas
+        env:
+          CANDIDATE_IP: ${{ steps.provision.outputs.candidate_ip }}
+          VM_NAME: ${{ steps.vm.outputs.vm_name }}
+          CUSTODIAN_NAME: ${{ steps.vm.outputs.custodian_name }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
           {
             echo "## Operator-authorized re-genesis complete"
             echo ""
-            echo "**Candidate VM:** \`${VM_NAME}\`"
-            echo "**Candidate IP:** \`${CANDIDATE_IP}\`"
+            echo "**Primary (slot a):** \`${VM_NAME}\` at \`${CANDIDATE_IP}\`"
+            echo "**Custodian (slot b):** \`${CUSTODIAN_NAME}\`"
             echo "**Image digest:** \`${IMAGE_DIGEST}\`"
             echo ""
             echo "### Next operator steps (explicit, NOT automated)"
-            echo "1. Update Cloudflare DNS \`oauth-tee.femled.ai\` A record to \`${CANDIDATE_IP}\` and \`authoritative-dns-tee/src/zone-manifest.js\` to match."
+            echo "1. Move the reserved address: \`bash scripts/move-reserved-ip.sh --to ${VM_NAME} --to-zone us-west1-b --expect-digest ${IMAGE_DIGEST}\`."
             echo "2. Re-admit this broken-continuity lineage with tenants (fresh admission envelopes) and add \`${IMAGE_DIGEST}\` to authoritative-dns-tee EXTERNAL_TEE_RENEWERS so it can mint TLS."
             echo "3. Once steady-state, run \`scripts/promote-genesis.sh --image-digest ${IMAGE_DIGEST}\` to promote active IAM and REVOKE the candidate window."
             echo "4. Decommission the old VM once cutover is confirmed."
             echo ""
             echo "### Active manifest"
             echo "\`\`\`json"
-            jq '.payload | {status, epoch, imageDigest, governanceKeyId, lineageDigest, routePolicyStateDigest}' active-manifest.json
+            jq '.payload | {status, epoch, imageDigest, governanceKeyId, lineageDigest, routePolicyStateDigest, replica}' replica-manifest.json
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -378,16 +479,19 @@ jobs:
             genesis-bootstrap-body.json
             genesis-bootstrap-response.json
             active-manifest.json
+            replica-manifest.json
           retention-days: 365
 
-      - name: Cleanup on failure (revoke candidate window + delete VM)
+      - name: Cleanup on failure (revoke candidate window + delete VMs)
         if: failure()
         env:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
           VM_NAME: ${{ steps.vm.outputs.vm_name }}
+          CUSTODIAN_NAME: ${{ steps.vm.outputs.custodian_name }}
+          CUSTODIAN_ZONE: ${{ inputs.custodian_zone }}
         run: |
           # A failed genesis must not leave a standing privileged candidate WIF
-          # window or an inactive VM that would block re-dispatch (the non-collision
+          # window or inactive VMs that would block re-dispatch (the non-collision
           # check) and bill. Best-effort revoke + delete.
           node scripts/reconcile-candidate-resource-iam.mjs \
             --operation revoke --genesis \
@@ -398,4 +502,8 @@ jobs:
           if [[ -n "${VM_NAME}" ]]; then
             gcloud compute instances delete "${VM_NAME}" \
               --zone=us-west1-b --project="${GCP_PROJECT_ID}" --quiet || true
+          fi
+          if [[ -n "${CUSTODIAN_NAME}" ]]; then
+            gcloud compute instances delete "${CUSTODIAN_NAME}" \
+              --zone="${CUSTODIAN_ZONE}" --project="${GCP_PROJECT_ID}" --quiet || true
           fi

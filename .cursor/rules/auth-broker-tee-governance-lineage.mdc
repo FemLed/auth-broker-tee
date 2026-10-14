@@ -24,11 +24,10 @@ Before changing, deploying, or reviewing `auth-broker-tee`, classify the task as
    - State clearly that continuity is broken and the new TEE is trusted from
      genesis onward.
    - Trust model is SELF-ATTESTED: on a fresh INACTIVE candidate,
-     `/first-principles/adjudicate` and `/governance/genesis-bootstrap` accept the
-     candidate's OWN attested image digest as the reviewer
-     (`bootstrapGenesisFromAttestedApproval` -> `isSelfAttestedGenesis`); there is
-     no env escape hatch. `TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS` remains an
-     optional pre-blessed-seed reviewer path.
+     `/governance/genesis-bootstrap` accepts only an APPROVE that this same
+     candidate produced in `/first-principles/adjudicate` while inactive, attested
+     by its own image digest, and only with the `operator-genesis.yml` governance
+     OIDC token. There is no env escape hatch and no pre-blessed reviewer digest.
    - The security boundary is DOWNSTREAM. A genesis lineage is length-1, epoch-1,
      `femled.tee.governance.genesis.v1` with no predecessor link, so it is rejected
      by default by the external verifier (`--require-successor-lineage`), by tenants
@@ -42,9 +41,10 @@ Before changing, deploying, or reviewing `auth-broker-tee`, classify the task as
      no-CI-signing-bypass invariant.
    - Orchestration: `.github/workflows/operator-genesis.yml` opens the complete
      candidate WIF window (`scripts/reconcile-candidate-resource-iam.mjs --genesis`
-     + the project-role reconciler), provisions a fresh INACTIVE TDX candidate,
-     self-adjudicates, genesis-bootstraps, and verifies. Promotion + candidate-window
-     revoke is `scripts/promote-genesis.sh`. See `GENESIS.md`.
+     + the project-role reconciler), provisions a fresh INACTIVE TDX candidate as
+     replica slot a, self-adjudicates, genesis-bootstraps, verifies, then
+     provisions replica slot b and waits for it to take custody. Promotion +
+     candidate-window revoke is `scripts/promote-genesis.sh`. See `GENESIS.md`.
    - Pin exact image digest, source revision, prompt digest, model policy digest,
      and verification evidence.
    - The active-TEE PR/push review path and the lineage-continuation (successor)
@@ -137,6 +137,35 @@ state, delete retired TEEs, or perform operator-authorized re-genesis. Those
 remain explicit operator actions because they affect external routing,
 infrastructure state, and rollback/recovery.
 
+## Replica Custody
+
+The lineage key lives in the memory of two replicas of the same image: slot a
+and slot b, named `auth-broker-tee-{a|b}-<digest12>`. One is the primary (holds
+`oauth-tee.femled.ai`'s reserved address and serves); the other is the
+custodian (no TLS, no public listener, serves no broker routes).
+
+- A replica that restarts comes back inactive and pulls custody from its
+  configured peer over the private network (`/replica/custody-challenge`,
+  `/replica/custody-request` on port 8080) with key-bound attestation. It takes
+  the role opposite its peer's, so a restarted primary returns as primary.
+- The primary releases no governance change until the custodian has
+  acknowledged it (`/replica/sync`, signed with the lineage key and encrypted
+  to the custodian's attested activation key); an unacknowledged change is
+  reverted. While the custodian is unreachable the primary keeps serving but
+  issues no certificates.
+- Launch metadata (`REPLICA_ROLE`, `REPLICA_PEER_URL`, `REPLICA_PEER_INSTANCE`)
+  only locates the peer; custody is granted on attestation, never on metadata.
+- Losing the primary: run `replica-failover.yml`. It stops the lost primary,
+  promotes the custodian with its OIDC token (the custodian waits for three
+  minutes without a heartbeat and refuses while any probe finds the primary
+  serving), then moves the reserved address with `scripts/move-reserved-ip.sh`.
+  Then delete the lost VM and run `replica-enroll.yml` for its slot.
+- Losing the custodian: delete its VM and run `replica-enroll.yml`.
+- Losing both: the lineage is gone; only operator re-genesis remains.
+
+Neither workflow can create, import or restore a key. Each is an explicit
+operator action, like re-genesis.
+
 ## Tenant Route Document Signing
 
 When publishing or rotating `auth_broker_route_documents/{tenantId}`, the
@@ -161,11 +190,11 @@ Correct operational sequence:
 6. Write the route document containing the fresh `admissionEnvelope` and
    tenant-signed `routeEnvelope`.
 
-Admission envelopes are tied to the active TEE governance key and lineage that
-signed them. If the active TEE reboots or re-genesis occurs, discard old
-admissions and request a fresh admission before publishing a route document.
-Route registry refresh should happen in process; do not reboot the active TEE
-just to refresh routes, because that loses in-memory governance state.
+Admission envelopes are tied to the governance key and lineage that signed
+them. A replica restart or failover keeps the lineage, so admissions stay
+valid; after re-genesis, discard old admissions and request a fresh admission
+before publishing a route document. Route registry refresh should happen in
+process; do not reboot a replica just to refresh routes.
 
 Hard-coded checks may enforce only mechanically provable invariants: image/config/attestation digest equality, nonce binding, candidate key binding, complete source evidence, parseability, launch policy constraints, and forbidden dynamic imports or unbounded secrets access.
 

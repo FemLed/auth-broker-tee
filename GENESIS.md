@@ -13,10 +13,11 @@ A genesis is **self-attested** on a fresh INACTIVE candidate and is **untrusted
 by default**:
 
 - The candidate self-adjudicates (`/first-principles/adjudicate`, allowed only
-  while INACTIVE) and self-attests at `/governance/genesis-bootstrap`
-  (`isSelfAttestedGenesis`). The running image's source revision must still equal
-  the TEE-approved commit, so the self-review is bound to a specific
-  GitHub-reviewed image, not arbitrary code.
+  while INACTIVE). `/governance/genesis-bootstrap` accepts only an approval the
+  candidate produced itself that way, attested by its own image digest, and only
+  with `operator-genesis.yml`'s governance OIDC token. The running image's source
+  revision must still equal the TEE-approved commit, so the self-review is bound
+  to a specific GitHub-reviewed image, not arbitrary code.
 - The resulting lineage is length-1, epoch-1, `femled.tee.governance.genesis.v1`
   with no predecessor link. Every relying party rejects it by default:
   - the external `verifier/` run with `--require-successor-lineage`,
@@ -52,17 +53,25 @@ unchanged (every genesis relaxation is `status === INACTIVE`-only).
 2. **Genesis the candidate.** Dispatch `operator-genesis.yml` on the same ref,
    with `image_digest=D` and `source_revision` = the same commit. It opens the
    candidate WIF window (`reconcile-candidate-resource-iam.mjs`
-   + the project-role reconciler), provisions a fresh INACTIVE TDX candidate VM,
-   self-adjudicates, genesis-bootstraps to active/epoch-1, and verifies.
-   - On failure it auto-revokes the candidate window and deletes the VM.
+   + the project-role reconciler), provisions a fresh INACTIVE TDX VM as replica
+   slot a (`auth-broker-tee-a-<D12>`), self-adjudicates, genesis-bootstraps to
+   active/epoch-1 and verifies. It then provisions replica slot b
+   (`auth-broker-tee-b-<D12>`, the custodian) and waits until slot a's manifest
+   names it as custodian.
+   - On failure it auto-revokes the candidate window and deletes both VMs.
    - Rollback: re-run after fixing; the failure-cleanup keeps re-dispatch unblocked.
 
-3. **Confirm health.** The candidate VM should report `status: active`, `epoch: 1`,
-   and the expected image digest at `/.well-known/femled-tee-governance.json`.
+3. **Confirm health.** Slot a should report `status: active`, `epoch: 1`, the
+   expected image digest and `replica: {role: "primary", peer: {role:
+   "custodian"}}` at `/.well-known/femled-tee-governance.json`.
 
-4. **DNS cutover.** Point Cloudflare `oauth-tee.femled.ai` at the new VM IP and
-   update `authoritative-dns-tee/src/zone-manifest.js`.
-   - Rollback: repoint DNS to the prior VM.
+4. **Address cutover.** `oauth-tee.femled.ai` names the reserved address
+   `auth-broker-tee-oauth-ip`; move it to slot a:
+   ```
+   bash scripts/move-reserved-ip.sh --to auth-broker-tee-a-<D12> --to-zone us-west1-b --expect-digest <D>
+   ```
+   The script refuses unless slot a answers as an active primary on `D`.
+   - Rollback: move the address back to the prior VM.
 
 5. **Downstream re-admission (the real trust boundary).** A genesis is not trusted
    until each relying party explicitly re-admits the new lineage:
@@ -89,8 +98,24 @@ unchanged (every genesis relaxation is `status === INACTIVE`-only).
 
 ## Repeatability
 
-The flow is re-runnable: candidate VM names are keyed by image digest; a failed
-`operator-genesis.yml` run revokes IAM and deletes its VM in the failure-cleanup
-step. If a run was interrupted (not failure-cleaned), delete the stale candidate
-VM and re-run `reconcile-candidate-resource-iam.mjs --operation revoke --genesis`
-for that digest before re-dispatching.
+The flow is re-runnable: replica VM names are keyed by slot and image digest; a
+failed `operator-genesis.yml` run revokes IAM and deletes its VMs in the
+failure-cleanup step. If a run was interrupted (not failure-cleaned), delete the
+stale replica VMs and re-run `reconcile-candidate-resource-iam.mjs --operation
+revoke --genesis` for that digest before re-dispatching.
+
+## Losing a replica (not a genesis)
+
+A replica that restarts is re-keyed by its peer and needs nothing. A replica
+whose VM is gone for good is replaced without breaking continuity:
+
+- **Custodian lost:** delete its VM, then run `replica-enroll.yml` for its slot.
+- **Primary lost:** run `replica-failover.yml` for the custodian's slot. It
+  stops the lost primary, promotes the custodian once it has heard nothing from
+  the primary for three minutes, and moves the reserved address. Then delete
+  the lost primary's VM and run `replica-enroll.yml` for its slot.
+- **Both lost:** the lineage is gone. Re-genesis as above.
+
+The failover and enrollment workflows need `SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT`
+to create instances and move access configs, and the `auth-broker-tee-allow-replica`
+firewall rule (tcp:8080, `terraform/main.tf`) for the promotion request.

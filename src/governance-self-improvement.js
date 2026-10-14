@@ -30,7 +30,7 @@ export function stopSelfImprovementLoopForTests() {
 export async function evaluateSelfImprovementOnce({ now = new Date(), modelPolicyUpgradeOptions = {} } = {}) {
   try {
     const current = getGovernanceState();
-    if (current.status !== "active") {
+    if (current.status !== "active" || current.replicaRole === "custodian") {
       recordSelfImprovement({ status: "skipped" });
       return null;
     }

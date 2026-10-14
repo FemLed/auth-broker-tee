@@ -157,6 +157,21 @@ func TestValidateRuntimeClaims_RedirectOverrideRejected(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeClaims_ReplicaOverridesAccepted(t *testing.T) {
+	c := &csClaims{
+		Submods: map[string]any{"container": map[string]any{"env_override": map[string]any{
+			"REPLICA_ROLE":          "custodian",
+			"REPLICA_PEER_URL":      "http://auth-broker-tee-a-bc6e49d016f4.us-west1-b.c.prod-femled-couple-router.internal:8080",
+			"REPLICA_PEER_INSTANCE": "auth-broker-tee-a-bc6e49d016f4",
+		}}},
+		GoogleServiceAccounts: []string{"auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com"},
+	}
+	cfg := &config{allowedEnvOverrideKeys: defaultAllowedEnvOverrideKeys, expectedBrokerSA: "auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com"}
+	if err := validateRuntimeClaims(c, cfg, &verifyReport{}); err != nil {
+		t.Fatalf("replica location overrides should pass: %v", err)
+	}
+}
+
 func TestValidateRuntimeClaims_HappyPath(t *testing.T) {
 	c := &csClaims{
 		Submods:               map[string]any{"container": map[string]any{"cmd_override": []any{}, "env_override": map[string]any{"ACME_RENEWER_DRY_RUN": "false"}}},

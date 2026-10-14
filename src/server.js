@@ -27,16 +27,27 @@ import {
   handleGenesisBootstrap,
   handleRepairArtifact,
   handleRepairCandidate,
+  handleReplicaCustodyChallenge,
+  handleReplicaCustodyRequest,
+  handleReplicaHeartbeat,
+  handleReplicaManifest,
+  handleReplicaPromote,
+  handleReplicaSync,
   handleTenantAdmission,
+  setReplicaPromotionHandler,
 } from "./governance-routes.js";
 import {
+  getReplicaRole,
   initializeGovernanceAsync,
   isGovernanceActive,
   mayServePath,
   recordAcceptedRouteVersion,
+  setGovernanceStateReplicator,
+  setReplicaRole,
   verifyTenantAdmissionEnvelope,
   getGovernanceState,
 } from "./governance-state.js";
+import { replicaConfig, replicateToCustodian, startReplicaSupervisor } from "./governance-replica-custody.js";
 import { jsonResponse, parseRequestUrl, textResponse } from "./http-helpers.js";
 import { startRenewalLoop, bootstrapTls, getTlsRuntimeStatus } from "./acme-renewal.js";
 import { getCurrentTlsMaterial, setTlsServer } from "./tls-material.js";
@@ -49,6 +60,7 @@ import { startSelfImprovementLoop } from "./governance-self-improvement.js";
 
 const PORT = 443;
 const HEALTH_PORT = 8080;
+const PUBLIC_SERVICE_RETRY_MS = 15 * 60 * 1000;
 
 /**
  * Secret names are hardcoded here so they are auditable in the public source
@@ -81,16 +93,12 @@ async function loadSecrets() {
 
 async function main() {
   await loadSecrets();
-  // Self-bootstrap TLS before the listener binds. TLS is ephemeral: there is
-  // no sealed capsule to carry over, so every cold boot mints a fresh cert
-  // in-enclave via ACME DNS-01. The key+cert live ONLY in process memory --
-  // nothing is sealed to KMS or written to GCS/Secret Manager, so a GCP
-  // project/org IAM owner has nothing to decrypt. A non-secret mint ledger
-  // guards against a reboot loop exhausting the Let's Encrypt weekly limit.
-  await bootstrapTls();
   // Governance starts inactive with a fresh in-enclave key; it becomes active
   // only through genesis, successor activation, or replica custody.
   await initializeGovernanceAsync();
+  const replica = replicaConfig();
+  if (replica.peerUrl) setReplicaRole(replica.bootRole);
+  setGovernanceStateReplicator(replicateToCustodian);
   setTenantAdmissionVerifier(verifyTenantAdmissionEnvelope);
   setAcceptedRouteRecorder(recordAcceptedRouteVersion);
   await initializeRouteRegistry({ skipTenantRouteDocuments: !isGovernanceActive() });
@@ -105,6 +113,96 @@ async function main() {
     console.warn("[Server] APNs secrets not available -- /push/send-silent and /push/send-alert will be unavailable");
   }
 
+  const replicaServer = http.createServer(handleReplicaPortRequest);
+  replicaServer.listen(HEALTH_PORT, () => {
+    console.log(`Health and replica custody listening on port ${HEALTH_PORT} (HTTP)`);
+  });
+
+  startAttestationRefreshLoop();
+  startSelfImprovementLoop();
+  // The role a replica is re-keyed into, not its launch role, decides whether
+  // it serves: a promoted custodian that restarts comes back as primary.
+  startReplicaSupervisor({
+    config: replica,
+    onCustodyApplied: async () => {
+      await initializeRouteRegistry({ skipTenantRouteDocuments: false });
+      if (getReplicaRole() === "primary") startPublicServiceWithRetry();
+    },
+  });
+
+  // A custodian mints no certificate and opens no public listener until an
+  // explicit failover promotes it.
+  if (replica.peerUrl && replica.bootRole === "custodian") {
+    setReplicaPromotionHandler(startPublicServiceWithRetry);
+  } else {
+    await startPublicServiceWithRetry();
+  }
+}
+
+// A failed mint keeps the process, and so the in-memory lineage key, alive and
+// retries; the mint ledger refuses attempts beyond the weekly budget.
+async function startPublicServiceWithRetry() {
+  for (;;) {
+    try {
+      return await startPublicService();
+    } catch (error) {
+      console.error(`[Server] public service start failed, retrying in ${PUBLIC_SERVICE_RETRY_MS / 60000} min: ${error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, PUBLIC_SERVICE_RETRY_MS));
+    }
+  }
+}
+
+async function handleReplicaPortRequest(req, res) {
+  try {
+    const url = parseRequestUrl(req);
+    if (!url) {
+      return jsonResponse(res, 400, { error: "Malformed request URL or Host header" });
+    }
+    switch (url.pathname) {
+      case "/health": {
+        const gov = getGovernanceState();
+        return jsonResponse(res, 200, {
+          status: "ok",
+          governance: { status: gov.status, epoch: gov.epoch, replicaRole: gov.replicaRole || null },
+        });
+      }
+      case "/replica/manifest":
+        return await handleReplicaManifest(req, res);
+      case "/replica/custody-challenge":
+        return await handleReplicaCustodyChallenge(req, res);
+      case "/replica/custody-request":
+        return await handleReplicaCustodyRequest(req, res);
+      case "/replica/sync":
+        return await handleReplicaSync(req, res);
+      case "/replica/heartbeat":
+        return await handleReplicaHeartbeat(req, res);
+      case "/governance/replica-promote":
+        return await handleReplicaPromote(req, res);
+      default:
+        return textResponse(res, 404, "Not found");
+    }
+  } catch (err) {
+    console.error("Unhandled replica-port error:", err.stack || err.message);
+    return jsonResponse(res, 500, { error: "Internal server error" });
+  }
+}
+
+let publicServiceStarted = false;
+
+async function startPublicService() {
+  if (publicServiceStarted) return;
+  publicServiceStarted = true;
+  // TLS is ephemeral: every public-service start mints a fresh cert in-enclave
+  // via ACME DNS-01. The key+cert live ONLY in process memory -- nothing is
+  // sealed to KMS or written to GCS/Secret Manager, so a GCP project/org IAM
+  // owner has nothing to decrypt. A non-secret mint ledger guards against a
+  // reboot loop exhausting the Let's Encrypt weekly limit.
+  try {
+    await bootstrapTls();
+  } catch (error) {
+    publicServiceStarted = false;
+    throw error;
+  }
   const material = getCurrentTlsMaterial();
 
   const server = https.createServer({ key: material.keyPem, cert: material.certPem }, async (req, res) => {
@@ -182,16 +280,6 @@ async function main() {
     }
   });
 
-  const healthServer = http.createServer((req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-
   // Hand the listener to the TLS holder so renewals and lineage-driven
   // re-mints rotate the secure context in place (no VM reset).
   setTlsServer(server);
@@ -200,13 +288,7 @@ async function main() {
     console.log(`Auth broker listening on port ${PORT} (HTTPS)`);
   });
 
-  healthServer.listen(HEALTH_PORT, () => {
-    console.log(`Health check listening on port ${HEALTH_PORT} (HTTP)`);
-  });
-
   startRenewalLoop();
-  startAttestationRefreshLoop();
-  startSelfImprovementLoop();
 }
 
 main().catch((err) => {

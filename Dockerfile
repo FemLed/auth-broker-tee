@@ -35,10 +35,12 @@ ENV ACME_RENEWER_ENABLED="true"
 
 LABEL "tee.launch_policy.log_redirect"="never"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-# ACME_RENEWER_DRY_RUN is the only toggle exposed for staged validation via
-# add-metadata; it is not a trust root (every trust-root value is image-baked
-# above / in src).
-LABEL "tee.launch_policy.allow_env_override"="ACME_RENEWER_DRY_RUN"
+# ACME_RENEWER_DRY_RUN is a toggle for staged validation via add-metadata. The
+# REPLICA_* values only locate the other custody replica (src/governance-replica-
+# custody.js): custody is granted on that replica's key-bound attestation, never
+# on these values. None of them is a trust root (every trust-root value is
+# image-baked above / in src).
+LABEL "tee.launch_policy.allow_env_override"="ACME_RENEWER_DRY_RUN,REPLICA_ROLE,REPLICA_PEER_URL,REPLICA_PEER_INSTANCE"
 
 # OCI source/revision labels so Cosign and the verifier can correlate
 # image -> commit at a glance. COMMIT_SHA is set by the build-and-attest

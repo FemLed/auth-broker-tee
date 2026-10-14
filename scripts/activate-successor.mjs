@@ -25,6 +25,7 @@ const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "src/governance-repair-contract.js",
   "src/governance-repair-jobs.js",
   "src/governance-repair-launcher.js",
+  "src/governance-replica-custody.js",
   "src/governance-routes.js",
   "src/governance-self-improvement.js",
   "src/governance-state.js",
@@ -36,6 +37,7 @@ const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "verifier/main.go",
   "test/first-principles.test.js",
   "test/governance.test.js",
+  "test/replica-custody.test.js",
 ];
 
 export async function main(argv = process.argv.slice(2)) {

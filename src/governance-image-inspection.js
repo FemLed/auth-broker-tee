@@ -31,6 +31,7 @@ export const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "src/governance-certificates.js",
   "src/governance-crypto.js",
   "src/governance-image-inspection.js",
+  "src/governance-replica-custody.js",
   "src/governance-routes.js",
   "src/governance-state.js",
   "src/governance-successor-decision.js",
