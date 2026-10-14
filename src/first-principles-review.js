@@ -1,7 +1,7 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
 import { recordVertexParseFailure } from "./governance-monitor.js";
 
-export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v7";
+export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v8";
 export const FIRST_PRINCIPLES_MODEL = "gemini-4-argon";
 export const FIRST_PRINCIPLES_VERTEX_LOCATION = "global";
 export const FIRST_PRINCIPLES_GENERATION_TEMPERATURE = 1.0;

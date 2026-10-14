@@ -1497,6 +1497,21 @@ test("route proof failure triggers tenant contract repair immediately", async ()
   assert.equal(text.includes(routeDigest), true);
 });
 
+test("a deploy webhook forward that threw is reported as a network error, not an HTTP status", () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  initializeGovernance({ mode: "genesis" });
+  const routeDigest = digestOf("deploy-webhook-thrown");
+  recordDeployWebhook({ routeDigest, status: "failed", error: new TypeError("fetch failed") });
+  recordDeployWebhook({ routeDigest: digestOf("deploy-webhook-404"), status: "failed", httpStatus: 404 });
+
+  const routes = buildHealthSnapshot().operational.tenantContract.routes;
+  const thrown = routes.find((route) => route.routeDigest === routeDigest);
+  const notFound = routes.find((route) => route.routeDigest === digestOf("deploy-webhook-404"));
+  assert.deepEqual(thrown.lastDeployWebhookError, { category: "network_error" });
+  assert.equal(notFound.lastDeployWebhookError.httpStatusClass, "4xx");
+});
+
 test("deploy webhook failures are thresholded before repair", async () => {
   resetGovernanceForTests(null);
   resetGovernanceMonitorForTests();

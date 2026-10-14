@@ -105,7 +105,7 @@ async function main() {
   setGovernanceStateReplicator(replicateToCustodian);
   setTenantAdmissionVerifier(verifyTenantAdmissionEnvelope);
   setAcceptedRouteRecorder(recordAcceptedRouteVersion);
-  await initializeRouteRegistry({ skipTenantRouteDocuments: !isGovernanceActive() });
+  await initializeRouteRegistry({ skipTenantRouteDocuments: !isGovernanceActive(), ignoreInvalidRouteDocuments: true });
 
   if (process.env.APNS_COACH_AUTH_KEY_P8 && process.env.APNS_COACH_AUTH_KEY_ID && process.env.APPLE_TEAM_ID) {
     initApns({
@@ -129,8 +129,11 @@ async function main() {
   startReplicaSupervisor({
     config: replica,
     onCustodyApplied: async () => {
-      await initializeRouteRegistry({ skipTenantRouteDocuments: false });
-      if (getReplicaRole() === "primary") startPublicServiceWithRetry();
+      try {
+        await initializeRouteRegistry({ skipTenantRouteDocuments: false, ignoreInvalidRouteDocuments: true });
+      } finally {
+        if (getReplicaRole() === "primary") startPublicServiceWithRetry();
+      }
     },
   });
 

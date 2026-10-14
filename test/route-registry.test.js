@@ -169,6 +169,47 @@ test("inactive startup can skip tenant route documents until activation", async 
   assert.equal(getTenantApiRoute(TENANT), null);
 });
 
+test("a failed first route load still schedules the periodic refresh", async () => {
+  const {
+    initializeRouteRegistry,
+    isRouteRefreshScheduledForTests,
+    stopRouteRefreshForTests,
+  } = await import("../src/route-registry.js");
+  const previous = process.env.AUTH_BROKER_DEPLOY_ROUTE_BUNDLE_JSON;
+  process.env.AUTH_BROKER_DEPLOY_ROUTE_BUNDLE_JSON = "not json";
+  try {
+    await assert.rejects(() => initializeRouteRegistry({ trustAnchors: emptyTrustAnchors(), refreshMs: 60_000 }));
+    assert.equal(isRouteRefreshScheduledForTests(), true);
+  } finally {
+    stopRouteRefreshForTests();
+    if (previous === undefined) delete process.env.AUTH_BROKER_DEPLOY_ROUTE_BUNDLE_JSON;
+    else process.env.AUTH_BROKER_DEPLOY_ROUTE_BUNDLE_JSON = previous;
+  }
+});
+
+test("an invalid tenant route document is rejected without blocking the other routes", async () => {
+  const keys = generateEd25519PemPair();
+  const {
+    initializeRouteRegistry,
+    getRouteRegistryStatus,
+    getDeployWebhookRouteForRepo,
+    getTenantApiRoute,
+  } = await import("../src/route-registry.js");
+
+  await initializeRouteRegistry({
+    trustAnchors: trustAnchors(keys.publicPem),
+    routeDocuments: [{ invalid: "admission from another lineage" }],
+    deployBundle: { schema: ROUTE_BUNDLE_SCHEMA, routes: [signRoute(deployWebhookPayload(), keys.privatePem)] },
+    ignoreInvalidRouteDocuments: true,
+    refreshMs: 0,
+    now: NOW,
+  });
+
+  assert.equal(getTenantApiRoute(TENANT), null);
+  assert.equal(getDeployWebhookRouteForRepo("tenant-repo").payload.schema, DEPLOY_WEBHOOK_ROUTE_SCHEMA);
+  assert.equal(getRouteRegistryStatus().routeSummaries.filter((summary) => summary.rejected).length, 1);
+});
+
 test("ECDSA P-256 route signatures verify for tenant KMS-compatible keys", () => {
   const keys = generateP256PemPair();
   const envelope = signRouteEcdsa(tenantApiPayload(), keys.privatePem);
