@@ -86,10 +86,11 @@ class RepairEnvironment(LocalEnvironment):
         command = action.get("command", "")
         if command.strip().startswith(SUBMIT_COMMAND):
             payload = parse_submit(command)
+            submission = json.dumps(payload, sort_keys=True)
             raise Submitted({
                 "role": "exit",
-                "content": json.dumps(payload, sort_keys=True),
-                "extra": {"structured_submission": payload},
+                "content": submission,
+                "extra": {"exit_status": "Submitted", "submission": submission, "structured_submission": payload},
             })
         for pattern in self.config.forbidden_patterns:
             if re.search(pattern, command, re.IGNORECASE):
@@ -115,13 +116,15 @@ def parse_submit(command: str) -> dict:
 
 
 def run_agent(prompt: str, base_branch: str) -> dict:
-    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-3.1-pro-preview")
+    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-4-argon")
+    # mini-swe-agent 2.x drives the model through tool calling and passes its
+    # own `tools=[bash]` to litellm; anything named `tools` here collides with
+    # it (TypeError on every step), so no provider tools are added.
     model_kwargs = {
         "vertex_project": os.getenv("VERTEXAI_PROJECT", os.getenv("GCP_PROJECT_ID")),
         "vertex_location": os.getenv("VERTEXAI_LOCATION", "global"),
         "temperature": 1.0,
         "reasoning_effort": "high",
-        "tools": [{"googleSearch": {}}],
     }
     system_template = (
         "You are an untrusted auth-broker-tee repair worker in an isolated Cloud Run Job. "
@@ -136,18 +139,36 @@ def run_agent(prompt: str, base_branch: str) -> dict:
         "{{task}}\n\n"
         "Your changes must be minimal and proposal-bound. Finish with tee_repair_submit JSON."
     )
-    environment = RepairEnvironment(cwd=str(REPO_ROOT))
+    # Verification commands (npm test, node --check) outlive the 30 s default.
+    environment = RepairEnvironment(cwd=str(REPO_ROOT), timeout=int(os.getenv("TEE_REPAIR_COMMAND_TIMEOUT_SECONDS", "900")))
     agent = DefaultAgent(
-        LitellmModel(model_name=model_name, model_kwargs=model_kwargs),
+        # Cost is informational here (no cost limit); an unpriced model must
+        # not abort the run.
+        LitellmModel(model_name=model_name, model_kwargs=model_kwargs, cost_tracking="ignore_errors"),
         environment,
         system_template=system_template,
         instance_template=instance_template,
         step_limit=0,
         cost_limit=0,
+        # Stop with a trajectory before the Cloud Run task timeout (5400 s)
+        # kills the container without one.
+        wall_time_limit_seconds=int(os.getenv("TEE_REPAIR_WALL_TIME_LIMIT_SECONDS", "4500")),
         output_path=Path("/workspace/repair-worker.traj.json"),
     )
+    # mini-swe-agent 2.x returns the exit message's `extra` dict itself:
+    # our Submitted payload, or exit_status/submission for LimitsExceeded,
+    # TimeExceeded and RepeatedFormatError exits.
     result = agent.run(prompt, repo_root=str(REPO_ROOT), base_branch=base_branch)
-    return result.get("extra", {}).get("structured_submission") or {"summary": str(result)}
+    if not isinstance(result, dict):
+        result = {}
+    structured = result.get("structured_submission")
+    if isinstance(structured, dict):
+        return structured
+    return {
+        "title": "Repair worker exited without a submission",
+        "summary": f"exit_status={result.get('exit_status') or 'unknown'}: {str(result.get('submission') or '')[:2000]}",
+        "tests": [],
+    }
 
 
 def build_artifact_envelope(submission: dict, proposal_digest: str, prompt_digest: str) -> dict:
