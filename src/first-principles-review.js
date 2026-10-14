@@ -1,7 +1,7 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
 import { recordVertexParseFailure } from "./governance-monitor.js";
 
-export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v4";
+export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v5";
 export const FIRST_PRINCIPLES_MODEL = "gemini-4-argon";
 export const FIRST_PRINCIPLES_VERTEX_LOCATION = "global";
 export const FIRST_PRINCIPLES_GENERATION_TEMPERATURE = 1.0;
@@ -14,12 +14,10 @@ export const FIRST_PRINCIPLES_SUCCESSOR_MODEL_POLICY = {
   schema: "femled.tee.first_principles.successor_model_policy.v1",
   discoverySource: "vertex_google_publisher_catalog_evidence_only",
   allowedPublisher: "google",
-  // Google ships some Pro-class models under a codename without "-pro"
-  // (gemini-4-argon); the codename ranks with the -pro family.
-  modelNamePattern: "^gemini-[0-9][a-z0-9.\\-]*-(pro|argon)[a-z0-9.\\-]*$",
+  modelNamePattern: "^gemini-[0-9][a-z0-9.\\-]*-pro[a-z0-9.\\-]*$",
   disallowedModelNamePattern: "(flash|lite|embedding|imagen|veo|tts|image|vision-only|live|transcribe|translate|audio)",
   ranking: "catalog_version_then_pro_family_evidence_not_authority",
-  rationale: "Permit only discovered Google Gemini Pro-class text reasoning models (named -pro, or the argon Pro-class codename) as successor candidates; do not pre-name future models.",
+  rationale: "Permit only discovered Google Gemini Pro-class text reasoning models as successor candidates; do not pre-name future models.",
 };
 
 export const FIRST_PRINCIPLES_MODEL_POLICY = {

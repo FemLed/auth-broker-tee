@@ -876,35 +876,6 @@ test("model policy upgrade self-healing proposes highest passing discovered mode
   assert.equal(manifest.selfHealing.repairJobs.openJobs.length, 1);
 });
 
-test("model policy upgrade does not propose a same-version -pro name over the argon codename", async () => {
-  resetGovernanceForTests(null);
-  resetGovernanceMonitorForTests();
-  resetRepairJobsForTests();
-  initializeGovernance({ mode: "genesis" });
-  let probes = 0;
-  const result = await evaluateSelfImprovementOnce({
-    now: new Date(),
-    modelPolicyUpgradeOptions: {
-      scanIntervalMs: 0,
-      discoverModelCandidates: async () => [
-        {
-          model: "gemini-4-pro",
-          rank: 4100,
-          releaseChannel: "catalog",
-          launchStage: "GA",
-          catalogDigest: digestOf("catalog:gemini-4-pro"),
-        },
-      ],
-      probeModelCandidate: async (model) => {
-        probes += 1;
-        return { status: "passed", model, responseDigest: digestOf(`probe:${model}`) };
-      },
-    },
-  });
-  assert.equal(result, null);
-  assert.equal(probes, 0);
-});
-
 test("model policy supervisor records catalog errors without exposing raw messages", async () => {
   resetGovernanceForTests(null);
   resetGovernanceMonitorForTests();
