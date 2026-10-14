@@ -34,9 +34,6 @@ import {
   isGovernanceActive,
   mayServePath,
   recordAcceptedRouteVersion,
-  retryGovernanceRestoreIfDegraded,
-  governanceCapsuleHeartbeatIfDue,
-  getCapsuleSerial,
   verifyTenantAdmissionEnvelope,
   getGovernanceState,
 } from "./governance-state.js";
@@ -91,14 +88,8 @@ async function main() {
   // project/org IAM owner has nothing to decrypt. A non-secret mint ledger
   // guards against a reboot loop exhausting the Let's Encrypt weekly limit.
   await bootstrapTls();
-  // initializeGovernanceAsync wires up KMS-backed key material (when
-  // GOVERNANCE_KMS_SIGNER_KEY_VERSION is configured) and attempts to
-  // restore governance state from the latest GCS-backed capsule so a
-  // VM restart (host maintenance) does not surface as governance loss.
-  // On any restore-time integrity mismatch we fall back to inactive and
-  // require the standard genesis or successor flow to re-activate. (TLS is
-  // ephemeral and independent of governance restore: it was already minted
-  // fresh by bootstrapTls above.)
+  // Governance starts inactive with a fresh in-enclave key; it becomes active
+  // only through genesis, successor activation, or replica custody.
   await initializeGovernanceAsync();
   setTenantAdmissionVerifier(verifyTenantAdmissionEnvelope);
   setAcceptedRouteRecorder(recordAcceptedRouteVersion);
@@ -174,12 +165,11 @@ async function main() {
           return await handleAttestation(url, req, res);
         case "/health": {
           // Surface governance status/epoch so an external uptime probe can
-          // alert on a broker that booted but failed to (re)activate governance
-          // (e.g. fail-closed on a KMS outage), instead of it going unnoticed.
+          // alert on a broker that booted but never became active.
           const gov = getGovernanceState();
           return jsonResponse(res, 200, {
             status: "ok",
-            governance: { status: gov.status, epoch: gov.epoch, capsuleSerial: getCapsuleSerial() },
+            governance: { status: gov.status, epoch: gov.epoch },
             tls: getTlsRuntimeStatus(),
           });
         }
@@ -215,17 +205,7 @@ async function main() {
   });
 
   startRenewalLoop();
-  // Inject two governance maintenance ticks onto the attestation refresh
-  // cadence: (1) restore-retry so a boot-time KMS outage that left governance
-  // inactive (fail-closed) self-heals without operator action or a re-genesis;
-  // (2) the capsule heartbeat so the true head is re-sealed periodically and
-  // never ages out of the bucket retention window (anti-rollback).
-  startAttestationRefreshLoop({
-    onTick: async () => {
-      await retryGovernanceRestoreIfDegraded();
-      await governanceCapsuleHeartbeatIfDue();
-    },
-  });
+  startAttestationRefreshLoop();
   startSelfImprovementLoop();
 }
 

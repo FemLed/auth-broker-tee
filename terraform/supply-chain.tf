@@ -19,8 +19,8 @@ locals {
   # Operator-authorized re-genesis workflow. Pinned to the same repo + branch
   # so the WIF principal still requires master, but allows the
   # workflow_dispatch trigger that build-and-attest deliberately rejects.
-  # See .github/workflows/operator-genesis.yml for the use case (broken-
-  # continuity rollout of governance state capsule persistence).
+  # See .github/workflows/operator-genesis.yml for the use case (an
+  # operator-authorized broken-continuity re-genesis).
   gh_operator_genesis_workflow_subject = "${var.gh_repo}/.github/workflows/operator-genesis.yml@${var.gh_branch_ref}"
 
   # Operator-approved genesis image build workflow. Same repo+branch pin; allows

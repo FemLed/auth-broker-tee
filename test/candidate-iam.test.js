@@ -21,9 +21,9 @@ test("candidate resource IAM script constructs only expected bindings", () => {
   // Ephemeral TLS: a successor candidate mints its own in-enclave cert at boot,
   // so it gets NO TLS-sealing KMS or TLS-capsule bucket grant. It DOES need the
   // renewer-governance-signer (signerVerifier + viewer) to sign the DNS-01
-  // renewer envelope for that boot mint, plus secrets (accessor + adder) and
-  // Artifact Registry reader.
-  assert.equal(operations.length, SECRET_ACCESSOR_SECRETS.length + SECRET_VERSION_ADDER_SECRETS.length + 3);
+  // renewer envelope for that boot mint and the TLS mint ledger object, plus
+  // secrets (accessor + adder) and Artifact Registry reader.
+  assert.equal(operations.length, SECRET_ACCESSOR_SECRETS.length + SECRET_VERSION_ADDER_SECRETS.length + 4);
   assert.ok(operations.every((operation) => operation.command.some((part) => part === `--member=${member}`)));
 
   const secretAccessorOps = operations.filter((operation) => operation.role === "roles/secretmanager.secretAccessor");
@@ -52,7 +52,14 @@ test("candidate resource IAM script constructs only expected bindings", () => {
   assert.ok(!operations.some((operation) => /tls-capsule/.test(operation.resource)),
     "there is no TLS capsule to grant object access to");
   assert.ok(!operations.some((operation) => /\/governance-signer$/.test(operation.resource)),
-    "governance-signer is genesis-only; a successor receives its identity via the activation bundle");
+    "no candidate is granted the retired KMS governance signer");
+
+  const bucketOps = operations.filter((operation) => operation.kind === "bucket");
+  assert.equal(bucketOps.length, 1);
+  assert.match(bucketOps[0].resource, /\/tls\/mint-log\.v1\.json$/);
+  assert.equal(bucketOps[0].role, "roles/storage.objectAdmin");
+  assert.ok(bucketOps[0].command.some((part) => part.startsWith("--condition=expression=resource.name.endsWith(\"/objects/tls/mint-log.v1.json\")")),
+    "the mint ledger grant must be limited to that one object");
 
   const artifactOps = operations.filter((operation) => operation.kind === "artifactRepository");
   assert.equal(artifactOps.length, 1);
@@ -60,16 +67,11 @@ test("candidate resource IAM script constructs only expected bindings", () => {
   assert.equal(artifactOps[0].role, "roles/artifactregistry.reader");
 });
 
-test("genesis candidate additionally gets governance-signer + capsule bucket writes", () => {
+test("a genesis candidate gets exactly the successor bindings: no governance key or capsule access", () => {
   const successor = buildIamOperations({ operation: "grant", candidateImageDigest: DIGEST });
   const genesis = buildIamOperations({ operation: "grant", candidateImageDigest: DIGEST, genesis: true });
-  assert.ok(genesis.length > successor.length, "genesis needs strictly more bindings than a successor");
-  // Genesis mints its own genesis certificate -> governance-signer signerVerifier.
-  assert.ok(genesis.some((operation) => /\/governance-signer$/.test(operation.resource) && operation.role === "roles/cloudkms.signerVerifier"),
-    "genesis must be able to sign its own genesis certificate");
-  // Genesis writes its first governance capsule + latest-pointer.
-  assert.ok(genesis.some((operation) => operation.kind === "bucket" && operation.role === "roles/storage.objectCreator"),
-    "genesis must be able to write its first governance capsule");
+  assert.deepEqual(genesis, successor);
+  assert.ok(!genesis.some((operation) => /\/governance-signer$|capsules\/latest-pointer/.test(operation.resource)));
 });
 
 test("candidate resource IAM script rejects arbitrary operations and invalid digests", () => {

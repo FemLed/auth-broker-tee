@@ -23,7 +23,6 @@ export const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "package-lock.json",
   ".github/workflows/build-and-attest.yml",
   "src/attestation.js",
-  "src/capsule-store.js",
   "src/confidential-space-attestation.js",
   "src/first-principles-adjudication.js",
   "src/first-principles-review.js",
@@ -36,10 +35,8 @@ export const GOVERNANCE_CRITICAL_SOURCE_FILES = [
   "src/governance-state.js",
   "src/governance-successor-decision.js",
   "src/http-helpers.js",
-  "src/kms-governance-key.js",
   "src/route-registry.js",
   "src/server.js",
-  "src/state-capsule.js",
   "src/vertex-gemini.js",
   "verifier/main.go",
 ];

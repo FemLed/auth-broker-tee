@@ -698,7 +698,7 @@ jobs:
             --shielded-secure-boot \
             --shielded-vtpm \
             --shielded-integrity-monitoring \
-            --metadata="tee-image-reference=${CANDIDATE_IMAGE_REF}@${CANDIDATE_IMAGE_DIGEST},tee-restart-policy=Always,tee-signed-image-repos=${CANDIDATE_IMAGE_REF},tee-env-GCP_PROJECT_ID=${GCP_PROJECT_ID},tee-env-GCP_PROJECT_NUMBER=125139120897,tee-env-REDIRECT_URI=https://oauth-tee.femled.ai/callback,tee-env-GOOGLE_SCOPES=openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify,tee-env-AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION=auth_broker_route_documents"
+            --metadata="tee-image-reference=${CANDIDATE_IMAGE_REF}@${CANDIDATE_IMAGE_DIGEST},tee-restart-policy=Always,tee-signed-image-repos=${CANDIDATE_IMAGE_REF}"
           candidate_ip=$(gcloud compute instances describe "${CANDIDATE_VM_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \

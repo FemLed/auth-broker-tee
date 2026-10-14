@@ -719,6 +719,69 @@ test("inactive successor applies only its own activation bundle", async () => {
   assert.equal(manifest.governanceKeyId, candidateKeys.governanceKeyId);
 });
 
+test("production refuses to establish governance on key material held outside the enclave", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  const active = initializeGovernance({ mode: "genesis" });
+  const candidateKeys = createInMemoryGovernanceKeyMaterial();
+  const candidate = candidateEvidence();
+  const preapproval = signPreapprovalCertificate({
+    keyMaterial: active.keyMaterial,
+    predecessorEpoch: active.epoch,
+    candidate,
+    hardCheckResults: { status: "passed", failures: [], warnings: [] },
+    aiDecision: approveDecision(),
+    nonce: "n",
+  });
+  const { activationNonce } = createActivationChallenge({
+    preapprovalEnvelope: preapproval,
+    candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
+    candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
+    candidateImageDigest: candidate.candidateImageDigest,
+  });
+  const bundle = await completeActivation({
+    preapprovalEnvelope: preapproval,
+    candidate,
+    candidateAttestationToken: "fake.jwt",
+    candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
+    candidateGovernanceKeyId: candidateKeys.governanceKeyId,
+    candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
+    activationNonce,
+    verifyAttestation: async (_jwt, expected) => ({
+      dbgstat: "disabled-since-boot",
+      swname: "CONFIDENTIAL_SPACE",
+      eat_nonce: expected.expectedNonce,
+      submods: { container: { image_digest: expected.expectedImageDigest } },
+    }),
+    arbitrateSuccessor: approveSuccessorArbitration,
+  });
+
+  resetGovernanceForTests({
+    status: "inactive",
+    epoch: 0,
+    imageDigest: candidate.candidateImageDigest,
+    keyMaterial: { ...candidateKeys, kind: "kms-backed" },
+    lineage: [],
+    latestPreapproval: null,
+    latestSuccessorCertificate: null,
+    latestRetirementCertificate: null,
+    pendingSuccessorActivation: null,
+    selfHealingProposals: [],
+    pendingActivationChallenges: new Map(),
+    transferredState: {},
+  });
+  const previousNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    await assert.rejects(
+      () => applyActivationBundle({ ...bundle, activationNonce }),
+      /key material held outside the enclave/,
+    );
+  } finally {
+    process.env.NODE_ENV = previousNodeEnv;
+  }
+});
+
 test("activation hard-vetoes incomplete governance-critical source evidence", async () => {
   resetGovernanceForTests(null);
   resetGovernanceMonitorForTests();

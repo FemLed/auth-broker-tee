@@ -1,7 +1,7 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
 import { recordVertexParseFailure } from "./governance-monitor.js";
 
-export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v5";
+export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v6";
 export const FIRST_PRINCIPLES_MODEL = "gemini-4-argon";
 export const FIRST_PRINCIPLES_VERTEX_LOCATION = "global";
 export const FIRST_PRINCIPLES_GENERATION_TEMPERATURE = 1.0;
@@ -273,52 +273,19 @@ For self-governance changes, request changes if the candidate:
 - lets a production TEE become active through environment variables, VM
   metadata, Terraform variables, GitHub repository variables, KMS signer policy,
   WIF policy, Secret Manager policy, branch protection, or admin/operator
-  identity rather than predecessor-signed TEE continuity. RESTORING A PREVIOUSLY
-  PREDECESSOR-SIGNED LINEAGE on cold start from an image-attested KMS-witnessed
-  state capsule is NOT new activation: the lineage is a chain verified from
-  genesis whose ACTIVE key was handed off by a predecessor-signed successor
-  certificate, and the KMS+WIF policy is the integrity gate for retrieval, not
-  the activation authority. Capsule restore is permitted ONLY if (a) the
-  capsule AAD pins the running image digest, KMS key version, governance public
-  key digest, lineage digest, epoch, and transferred state digest; (b) capsule
-  decryption requires a KMS witness signature verifiable under a public key
-  whose access is gated by attribute.image_digest WIF; (c) the lineage verifies
-  as a chain from genesis and its ACTIVE governance key -- the successor key
-  handed off by the last activation (verifyLineage's
-  currentGovernancePublicKeyPem), NOT the lineage tail's signingKeyId, which is
-  the PREDECESSOR that signed the tail -- equals the KMS-bound governanceKeyId;
-  (d) any mismatch falls back to inactive rather than restoring partial state;
-  (e) restore is rollback-resistant: it selects the highest AUTHENTIC
-  (KMS-witness-signed) capsuleSerial by enumerating the bucket rather than
-  trusting the mutable latest-pointer, and the capsule bucket enforces a locked
-  retention policy so the true-head capsule cannot be deleted to force a
-  downgrade;
+  identity rather than predecessor-signed TEE continuity;
+- signs governance with a key held outside enclave memory (for example a Cloud
+  KMS key), which anyone administering the project could use directly;
 - lets verifiers, workflows, tenants, docs, or acceptance checks trust a new TEE
   based on image digest, GitHub status, GCP deployment state, KMS signature,
   DNS, or repo variables without also verifying governance lineage continuity;
 - stores, logs, exports, backs up, or recovers governance private keys or
-  TEE-owned transferred state outside live TEE memory. EXCEPTION: a TEE may
-  persist the recoverable subset of transferred state (lineage, epoch, accepted
-  tenant route policy, latest preapproval/successor/retirement certificates)
-  to an image-attested KMS-witnessed encrypted state capsule, provided that
-  (a) governance private signing material remains in Cloud KMS under
-  attribute.image_digest WIF (NEVER in the capsule, NEVER on disk, NEVER as
-  plaintext outside KMS), (b) the X25519 activation key stays in process
-  memory and is regenerated on cold start, (c) the capsule body is encrypted
-  application-side with an AAD-binding scheme that fails closed on any AAD
-  mismatch (see capsule restore rules above), and (d) the capsule store
-  (e.g. GCS bucket) is treated as untrusted transport whose only role is
-  carrying ciphertext between restarts of the same image digest;
+  TEE-owned transferred state outside live TEE memory;
 - allows an inactive candidate or retired predecessor to serve privileged
   broker routes;
 - approves a successor without inspecting the actual candidate image digest;
 - creates any admin recovery path that can resurrect governance after the
-  active TEE dies before handoff. EXCEPTION: the image-attested KMS-witnessed
-  state capsule above is NOT an admin recovery path; restoring the same
-  predecessor-signed lineage on the same image is a continuity mechanism, not
-  resurrection of dead governance, and explicitly cannot be invoked by any
-  operator-controlled credential since both KMS access and capsule decryption
-  require the running image's WIF principal;
+  active TEE dies before handoff;
 - adds break-glass, owner recovery, reset-to-genesis, or emergency admin paths
   that trade governance integrity for availability;
 - lets self-healing mutate the active TEE identity, model policy, governance

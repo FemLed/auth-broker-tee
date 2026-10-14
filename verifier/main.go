@@ -124,13 +124,7 @@ var expectedComplianceChecks = []string{
 // the workload operator inject at launch. Anything else in
 // `submods.container.env_override` is a sign of operator tampering.
 var defaultAllowedEnvOverrideKeys = []string{
-	"GCP_PROJECT_ID",
-	"GCP_PROJECT_NUMBER",
-	"REDIRECT_URI",
-	"GOOGLE_SCOPES",
-	"AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION",
-	"GOVERNANCE_KMS_SIGNER_KEY_VERSION",
-	"CAPSULE_BUCKET",
+	"ACME_RENEWER_DRY_RUN",
 }
 
 func main() {
@@ -597,11 +591,11 @@ func verifyGovernanceEnvelopeMap(env map[string]any, publicKeyPEM string) error 
 		return err
 	}
 	// The broker labels some legacy KMS-backed signatures as "Ed25519" even
-	// though the underlying key is ECDSA P-256 (see
-	// kms-governance-key.js comment about Node's crypto.verify(null, ...)
-	// auto-routing by key type). Be permissive here: route verification by
-	// the actual key type, not the (possibly stale) alg label. New certs
-	// signed by the patched broker carry the correct label.
+	// though the underlying key is ECDSA P-256 (the retired Cloud KMS
+	// governance signer; Node's crypto.verify(null, ...) auto-routes by key
+	// type). Be permissive here: route verification by the actual key type,
+	// not the (possibly stale) alg label, so historical lineages still
+	// verify. Current lineages are Ed25519.
 	switch typedPub := pub.(type) {
 	case ed25519.PublicKey:
 		if !ed25519.Verify(typedPub, canonical, sig) {

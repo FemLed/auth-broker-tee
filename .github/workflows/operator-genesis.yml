@@ -13,15 +13,14 @@
 ##   1. The signed genesis image exists, built by genesis-build.yml under the
 ##      `genesis` GitHub Environment (required-reviewer approval). Pass its
 ##      digest as image_digest and the same commit as source_revision.
-##   2. This workflow opens the candidate WIF window itself (the --genesis
+##   2. This workflow opens the candidate WIF window itself (the candidate
 ##      reconciler), so no manual Terraform candidate_image_digests edit is needed.
-##   3. The KMS governance signer key and GCS capsule bucket exist.
 ##
 ## What this workflow does:
-##   1. Opens the COMPLETE genesis candidate WIF window for the image digest
-##      (reconcile-candidate-resource-iam.mjs --genesis + the project-role
-##      reconciler) so the candidate can sign its genesis cert, mint TLS, and
-##      write its first capsule.
+##   1. Opens the candidate WIF window for the image digest
+##      (reconcile-candidate-resource-iam.mjs + the project-role reconciler) so
+##      the candidate can read its secrets and mint TLS. It signs its genesis
+##      certificate with a key generated in its own enclave.
 ##   2. Provisions a fresh INACTIVE Intel TDX candidate VM running the image.
 ##   3. Waits for its HTTPS endpoint and confirms it reports inactive.
 ##   4. Builds the first-principles adjudication request and asks the candidate
@@ -81,8 +80,6 @@ env:
   IMAGE_NAME: auth-broker-tee
   GCP_PROJECT_ID: prod-femled-couple-router
   GCP_PROJECT_NUMBER: "125139120897"
-  CAPSULE_BUCKET_SUFFIX: auth-broker-tee-governance-capsules
-  GOVERNANCE_KMS_KEY_VERSION_TEMPLATE: projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/1
 
 jobs:
   operator-genesis:
@@ -136,19 +133,16 @@ jobs:
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Open genesis candidate WIF window (complete binding set)
+      - name: Open genesis candidate WIF window
         env:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
         run: |
-          # Genesis needs the FULL candidate binding set (--genesis): the
-          # base/successor subset (secrets, artifact reader, project roles, and
-          # the renewer-signer needed to mint ephemeral TLS at boot) PLUS the
-          # genesis-only governance-signer (signerVerifier/viewer) and capsule
-          # reader/writer/latest-pointer, so a self-attested genesis can sign its
-          # cert, mint TLS (ephemeral, in-enclave), and write its first
-          # governance capsule. Scoped to the exact image-digest principalSet;
-          # revoked by the failure-cleanup step and by scripts/promote-genesis.sh
-          # after promotion.
+          # The candidate binding set: secrets, artifact reader, project roles,
+          # the renewer signer and mint ledger needed to mint ephemeral TLS at
+          # boot. No governance key or capsule access: the genesis certificate is
+          # signed with a key generated in the candidate's enclave. Scoped to the
+          # exact image-digest principalSet; revoked by the failure-cleanup step,
+          # and kept as the active access after promotion.
           node scripts/reconcile-candidate-resource-iam.mjs \
             --operation grant --genesis \
             --candidate-image-digest "${IMAGE_DIGEST}"
@@ -175,7 +169,7 @@ jobs:
           echo "vm_name=${vm_name}" >> "$GITHUB_OUTPUT"
           echo "Candidate VM name: ${vm_name}"
 
-      - name: Provision inactive candidate VM with KMS+CAPSULE env
+      - name: Provision inactive candidate VM
         id: provision
         env:
           IMAGE_DIGEST: ${{ inputs.image_digest }}
@@ -185,21 +179,14 @@ jobs:
           # Self-attested genesis is permitted by the image code while INACTIVE
           # (bootstrapGenesisFromAttestedApproval accepts the candidate's own
           # attested image digest); there is no VM-metadata escape-hatch flag. The
-          # candidate WIF window opened above lets it sign its genesis cert, mint
-          # TLS, and write its first capsule.
+          # candidate WIF window opened above lets it read its secrets and mint TLS;
+          # it signs its genesis certificate with a key generated in its enclave.
+          # The OAuth redirect, scopes, project and route collection are baked into
+          # the image and are not overridable: the launcher refuses any tee-env
+          # value outside allow_env_override.
           metadata="tee-image-reference=${IMAGE_REFERENCE}@${IMAGE_DIGEST}"
           metadata="${metadata},tee-restart-policy=Always"
           metadata="${metadata},tee-signed-image-repos=${IMAGE_REFERENCE}"
-          metadata="${metadata},tee-env-GCP_PROJECT_ID=${GCP_PROJECT_ID}"
-          metadata="${metadata},tee-env-GCP_PROJECT_NUMBER=${GCP_PROJECT_NUMBER}"
-          metadata="${metadata},tee-env-REDIRECT_URI=https://oauth-tee.femled.ai/callback"
-          metadata="${metadata},tee-env-GOOGLE_SCOPES=openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
-          metadata="${metadata},tee-env-AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION=auth_broker_route_documents"
-          # GOVERNANCE_KMS_SIGNER_KEY_VERSION and CAPSULE_BUCKET are image-PINNED
-          # (Dockerfile ENV) and dropped from allow_env_override, so they must NOT
-          # be passed as overridable tee-env metadata (the launcher rejects env not
-          # in allow_env_override). There is no genesis escape-hatch env var:
-          # self-attested genesis is enforced in code (INACTIVE-only), not metadata.
           gcloud compute instances create "${VM_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \
@@ -270,9 +257,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_HEAD_SHA: ${{ inputs.source_revision }}
         run: |
-          # The candidate TEE adjudicates the diff that produced its own
-          # image. With the updated first-principles carve-outs in that
-          # image, the diff (capsule code + carve-outs) is now permitted.
+          # The candidate TEE adjudicates the diff that produced its own image.
           node .github/scripts/create-first-principles-request.mjs first-principles-request.json
           echo "Request preview:"
           jq '{repository, headSha, eventName, workflowRunId, changedFileCount: (.changedFiles | length)}' first-principles-request.json

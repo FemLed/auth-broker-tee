@@ -98,9 +98,9 @@ resource "google_project_iam_custom_role" "candidate_project_role_reconciler_inv
   ]
 }
 
-# Successor candidate bucket windows: the activator's reconcile-candidate-resource-iam
-# step may grant/revoke the candidate WIF principal on the governance state
-# capsule bucket. The former tls-sealing KMS IAM-admin grant is REMOVED: TLS is
+# Candidate bucket windows: the activator's reconcile-candidate-resource-iam step
+# grants/revokes the candidate WIF principal on the TLS mint ledger object in
+# this bucket. The former tls-sealing KMS IAM-admin grant is REMOVED: TLS is
 # ephemeral now (each candidate mints its own in-enclave cert at boot), so there
 # is no TLS-sealing key or TLS-capsule object for the activator to delegate.
 resource "google_project_iam_custom_role" "successor_bucket_iam" {

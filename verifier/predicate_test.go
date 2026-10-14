@@ -147,9 +147,19 @@ func TestValidateRuntimeClaims_MissingBrokerSARejected(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeClaims_RedirectOverrideRejected(t *testing.T) {
+	c := &csClaims{Submods: map[string]any{
+		"container": map[string]any{"env_override": map[string]any{"REDIRECT_URI": "https://attacker.example/callback"}},
+	}}
+	cfg := &config{allowedEnvOverrideKeys: defaultAllowedEnvOverrideKeys, expectedBrokerSA: ""}
+	if err := validateRuntimeClaims(c, cfg, &verifyReport{}); err == nil {
+		t.Fatal("expected an overridden REDIRECT_URI to fail")
+	}
+}
+
 func TestValidateRuntimeClaims_HappyPath(t *testing.T) {
 	c := &csClaims{
-		Submods:               map[string]any{"container": map[string]any{"cmd_override": []any{}, "env_override": map[string]any{"GCP_PROJECT_ID": "x"}}},
+		Submods:               map[string]any{"container": map[string]any{"cmd_override": []any{}, "env_override": map[string]any{"ACME_RENEWER_DRY_RUN": "false"}}},
 		GoogleServiceAccounts: []string{"auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com"},
 	}
 	cfg := &config{allowedEnvOverrideKeys: defaultAllowedEnvOverrideKeys, expectedBrokerSA: "auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com"}
