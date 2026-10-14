@@ -37,6 +37,32 @@ export function validateConfidentialSpaceClaims(payload, { expectedAudience = CO
   return payload;
 }
 
+const BROKER_PROJECT_ID = "prod-femled-couple-router";
+const BROKER_PROJECT_NUMBER = "125139120897";
+const BROKER_SERVICE_ACCOUNT = "auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com";
+const BROKER_INSTANCE_PREFIX = "auth-broker-tee-";
+
+// The workload claims every broker enclave this one trusts with governance
+// material must carry: this project, the broker service account, a STABLE
+// Confidential Space image, and a broker instance. Returns the instance name.
+export function assertBrokerWorkloadClaims(claims) {
+  const gce = claims?.submods?.gce || {};
+  if (gce.project_id !== BROKER_PROJECT_ID || String(gce.project_number ?? "") !== BROKER_PROJECT_NUMBER) {
+    throw new Error("attestation is from another project");
+  }
+  if (!(claims.google_service_accounts || []).includes(BROKER_SERVICE_ACCOUNT)) {
+    throw new Error("attestation does not run as the broker service account");
+  }
+  if (!(claims.submods?.confidential_space?.support_attributes || []).includes("STABLE")) {
+    throw new Error("attestation lacks STABLE Confidential Space support");
+  }
+  const instanceName = String(gce.instance_name || "");
+  if (!instanceName.startsWith(BROKER_INSTANCE_PREFIX)) {
+    throw new Error("attestation is not from a broker instance");
+  }
+  return instanceName;
+}
+
 export function nonceMatches(eatNonce, expected) {
   if (Array.isArray(eatNonce)) return eatNonce.includes(expected);
   return eatNonce === expected;

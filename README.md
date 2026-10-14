@@ -237,7 +237,15 @@ Successor activation hands governance to a new image without the key ever
 leaving an enclave: the predecessor signs a successor certificate naming the
 candidate's own in-enclave key, and encrypts the transferred state (lineage,
 epoch, accepted tenant route policy) to the candidate's attested X25519
-activation key.
+activation key. Before it does, the candidate proves it holds those keys
+(`/governance/activation-readiness`): a statement signed with its governance
+key, plus a Confidential Space token, under an audience `/attestation` never
+requests, whose nonce the candidate computed over its own key ids. Offering
+the predecessor someone else's keys therefore fails. A handoff that stops
+halfway is finished by a late finalize, or unwound by the candidate's signed
+decline or, once the successor certificate has expired, by an abort; a
+predecessor that has seen the successor's proof never aborts
+(`successor-recovery.yml` runs either from a failed run's evidence).
 
 Two replicas of the same image keep the broker alive through a restart
 ([`src/governance-replica-custody.js`](src/governance-replica-custody.js)).

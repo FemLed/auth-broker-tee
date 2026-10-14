@@ -151,6 +151,7 @@ function createHarness(t) {
         status = 409;
         result = { error: error.message };
       }
+      if (harness.tamper && status === 200) result = await harness.tamper(pathname, result);
       const text = JSON.stringify(result);
       traffic.push({ pathname, request: options.body || "", response: text });
       if (target.dropReplies) throw new Error("socket hang up");
@@ -281,6 +282,28 @@ test("custody requires an attestation bound to the requester's own keys and a fr
     /unknown or expired custody challenge/,
   );
   assert.equal(a.state.replicaPeer, null);
+});
+
+test("a custody bundle is applied only with the sender's own attestation", async (t) => {
+  const harness = createHarness(t);
+  const { b } = addPrimaryAndCustodian(harness);
+  const c = harness.add("c", { instanceName: "auth-broker-tee-c-bc6e49d016f4", address: "10.138.0.13", peer: { instanceName: A_INSTANCE, address: A_ADDRESS } });
+
+  harness.tamper = (pathname, result) => (pathname === "/replica/custody-request" ? { ...result, senderAttestation: undefined } : result);
+  await assert.rejects(harness.as("b", () => pullCustodyFromPeer({ config: b.config })), /does not answer this custody-send challenge/);
+
+  // A genuine attestation, but from another broker instance, over the bundle.
+  harness.tamper = (pathname, result) => {
+    if (pathname !== "/replica/custody-request") return result;
+    const elsewhere = { ...result };
+    return harness.as("c", async () => ({
+      ...elsewhere,
+      senderAttestation: await buildKeyAttestation({ purpose: "custody-send", challenge: result.bundle.payloadDigest }),
+    }));
+  };
+  await assert.rejects(harness.as("b", () => pullCustodyFromPeer({ config: b.config })), /not the configured peer/);
+  assert.equal(b.state.status, "inactive");
+  assert.equal(c.state.status, "inactive");
 });
 
 test("custody is applied only by a fresh inactive replica", async (t) => {

@@ -20,7 +20,7 @@
 import crypto from "node:crypto";
 import { canonicalStringify, publicKeyFingerprint, sha256Digest } from "./canonical-json.js";
 import { requestAttestationToken } from "./attestation.js";
-import { verifyConfidentialSpaceAttestation } from "./confidential-space-attestation.js";
+import { assertBrokerWorkloadClaims, verifyConfidentialSpaceAttestation } from "./confidential-space-attestation.js";
 import { signGovernancePayload, verifyGovernanceEnvelope } from "./governance-crypto.js";
 import {
   applyReplicaCustodyTransfer,
@@ -45,10 +45,6 @@ const CUSTODY_BUNDLE_SCHEMA = "femled.auth_broker.replica_custody_bundle.v1";
 const SYNC_BUNDLE_SCHEMA = "femled.auth_broker.replica_sync_bundle.v1";
 const HEARTBEAT_SCHEMA = "femled.auth_broker.replica_heartbeat.v1";
 const REPLICA_MANIFEST_SCHEMA = "femled.auth_broker.replica_manifest.v1";
-const EXPECTED_PROJECT_ID = "prod-femled-couple-router";
-const EXPECTED_PROJECT_NUMBER = "125139120897";
-const EXPECTED_SERVICE_ACCOUNT = "auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com";
-const REPLICA_INSTANCE_PREFIX = "auth-broker-tee-";
 const CUSTODY_PORT = 8080;
 const CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const MAX_OPEN_CHALLENGES = 32;
@@ -140,20 +136,7 @@ export async function verifyKeyAttestation(evidence, { purpose, challenge, expec
 }
 
 function assertReplicaClaims(claims, { expectedInstance }) {
-  const gce = claims?.submods?.gce || {};
-  if (gce.project_id !== EXPECTED_PROJECT_ID || String(gce.project_number ?? "") !== EXPECTED_PROJECT_NUMBER) {
-    throw new Error("replica attestation is from another project");
-  }
-  if (!(claims.google_service_accounts || []).includes(EXPECTED_SERVICE_ACCOUNT)) {
-    throw new Error("replica attestation does not run as the broker service account");
-  }
-  if (!(claims.submods?.confidential_space?.support_attributes || []).includes("STABLE")) {
-    throw new Error("replica attestation lacks STABLE Confidential Space support");
-  }
-  const instanceName = String(gce.instance_name || "");
-  if (!instanceName.startsWith(REPLICA_INSTANCE_PREFIX)) {
-    throw new Error("replica attestation is not from a broker instance");
-  }
+  const instanceName = assertBrokerWorkloadClaims(claims);
   if (expectedInstance && instanceName !== expectedInstance) {
     throw new Error(`replica attestation is from ${instanceName}, not the configured peer ${expectedInstance}`);
   }

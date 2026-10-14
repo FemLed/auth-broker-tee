@@ -2,7 +2,13 @@ import { canonicalStringify, publicKeyFingerprint, sha256Digest } from "./canoni
 import { getAttestedImageDigest, getAttestedImageReference, getLauncherAttestationClaims, getWifAccessToken } from "./gcp-auth.js";
 import { requestAttestationToken } from "./attestation.js";
 import { getRouteRegistryStatus } from "./route-registry.js";
-import { createInMemoryGovernanceKeyMaterial, buildActivationNonce, verifyGovernanceEnvelope } from "./governance-crypto.js";
+import {
+  buildActivationNonce,
+  buildActivationReadinessNonce,
+  createInMemoryGovernanceKeyMaterial,
+  signGovernancePayload,
+  verifyGovernanceEnvelope,
+} from "./governance-crypto.js";
 import {
   ACTIVATION_PROOF_SCHEMA,
   assertPreapprovalMatchesCandidate,
@@ -19,7 +25,7 @@ import {
   verifyLineage,
 } from "./governance-certificates.js";
 import { GOVERNANCE_SECURITY_BOUNDARY, SECRET_GOVERNANCE_CLASSIFICATION } from "./governance-boundary.js";
-import { verifyConfidentialSpaceAttestation } from "./confidential-space-attestation.js";
+import { assertBrokerWorkloadClaims, nonceMatches, verifyConfidentialSpaceAttestation } from "./confidential-space-attestation.js";
 import {
   buildHealthSnapshot,
   recordActivation,
@@ -47,6 +53,17 @@ const INACTIVE = "inactive";
 const ACTIVATING_SUCCESSOR = "activating_successor";
 const RETIRED = "retired";
 const GENESIS_SELF_ADJUDICATION_LIMIT = 8;
+export const ACTIVATION_READINESS_AUDIENCE = "https://oauth-tee.femled.ai/activation-readiness";
+const ACTIVATION_READINESS_SCHEMA = "femled.tee.governance.activation_readiness.v1";
+const ACTIVATION_DECLINE_SCHEMA = "femled.tee.governance.activation_decline.v1";
+const ACTIVATION_READINESS_TTL_MS = 10 * 60 * 1000;
+const ACTIVATION_READINESS_LIMIT = 8;
+// An expired pending activation becomes abortable only after this grace: the
+// candidate can no longer apply the expired certificate, and a proof produced
+// before expiry has had time to reach finalize.
+export const ACTIVATION_ABORT_GRACE_MS = 5 * 60 * 1000;
+const PROVED_AT_SKEW_MS = 60 * 1000;
+const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 let state = null;
 
@@ -104,6 +121,11 @@ export function initializeGovernance({ mode = "inactive", keyMaterial: providedK
     },
     pendingActivationChallenges: new Map(),
     genesisSelfAdjudications: new Map(),
+    activationReadiness: new Map(),
+    declinedActivationNonces: new Set(),
+    latestActivationProof: null,
+    latestAbortedActivation: null,
+    expiredSuccessorActivation: null,
     replicaRole: null,
     replicaSerial: 0,
     replicaPeer: null,
@@ -498,7 +520,7 @@ export function createActivationChallenge({ preapprovalEnvelope, candidateGovern
 export async function completeActivation({
   preapprovalEnvelope,
   candidate,
-  candidateAttestationToken,
+  candidateReadiness,
   candidateGovernancePublicKeyPem,
   candidateGovernanceKeyId,
   candidateActivationPublicKeyPem,
@@ -513,6 +535,7 @@ export async function completeActivation({
   let challenge;
   let preapproval;
   let attestation;
+  let candidateAttestationToken;
   let successorDecision;
   try {
     challenge = current.pendingActivationChallenges.get(activationNonce);
@@ -536,10 +559,16 @@ export async function completeActivation({
 
     preapproval = verifyGovernanceEnvelope(preapprovalEnvelope, current.keyMaterial.governancePublicKeyPem, { now });
     assertPreapprovalMatchesCandidate(preapproval, candidate);
-    attestation = await verifyAttestation(candidateAttestationToken, {
-      expectedNonce: activationNonce,
-      expectedImageDigest: candidate.candidateImageDigest,
-    });
+    ({ attestation, attestationToken: candidateAttestationToken } = await verifyActivationReadiness({
+      candidateReadiness,
+      activationNonce,
+      candidateImageDigest: candidate.candidateImageDigest,
+      candidateGovernancePublicKeyPem,
+      candidateGovernanceKeyId,
+      candidateActivationPublicKeyPem,
+      now,
+      verifyAttestation,
+    }));
     const { packet, packetDigest } = buildSuccessorDecisionPacket({
       currentManifest: buildGovernanceManifestPayload(),
       candidate,
@@ -614,6 +643,7 @@ export async function completeActivation({
     }, transferAad);
 
     current.status = ACTIVATING_SUCCESSOR;
+    current.expiredSuccessorActivation = null;
     current.pendingSuccessorActivation = {
       schema: "femled.tee.governance.pending_successor_activation.v1",
       activationNonce,
@@ -672,6 +702,12 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
   if (successorCertificate.payload.candidateAttestationNonce !== activationNonce) {
     throw new Error("activation bundle nonce mismatch");
   }
+  if (!current.activationReadiness.has(activationNonce)) {
+    throw new Error("this candidate issued no readiness proof for that activation");
+  }
+  if (current.declinedActivationNonces.has(activationNonce)) {
+    throw new Error("this candidate declined that activation");
+  }
   const transferAad = {
     successorPayloadDigest: successorCertificate.payloadDigest,
     predecessorGovernanceKeyId: successorCertificate.payload.predecessorGovernanceKeyId,
@@ -694,25 +730,30 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
   if (terminalCertificate?.payloadDigest !== successorCertificate.payloadDigest) {
     throw new Error("transferred lineage does not end with supplied successor certificate");
   }
-  await withGovernanceCommit(() => {
+  const activationProof = await withGovernanceCommit(async () => {
     if (current.status !== INACTIVE || current.lineage.length > 0) {
       throw new Error("activation bundle can only be applied to inactive candidate");
+    }
+    if (current.declinedActivationNonces.has(activationNonce)) {
+      throw new Error("this candidate declined that activation");
     }
     current.status = ACTIVE;
     current.epoch = transferred.epoch;
     current.lineage = transferred.lineage;
     current.transferredState = normalizeTransferredState(transferred.transferredState);
     current.latestSuccessorCertificate = successorCertificate;
-  });
-  const lineageDigest = sha256Digest(canonicalStringify(current.lineage));
-  const activationProof = await signActivationProofCertificate({
-    keyMaterial: current.keyMaterial,
-    epoch: current.epoch,
-    successorPayloadDigest: successorCertificate.payloadDigest,
-    activationNonce,
-    candidateImageDigest: current.imageDigest,
-    lineageDigest,
-    now,
+    // Kept so the proof can be served again (/governance/activation-proof) if
+    // finalize has to be retried after the candidate's certificate expired.
+    current.latestActivationProof = await signActivationProofCertificate({
+      keyMaterial: current.keyMaterial,
+      epoch: current.epoch,
+      successorPayloadDigest: successorCertificate.payloadDigest,
+      activationNonce,
+      candidateImageDigest: current.imageDigest,
+      lineageDigest: sha256Digest(canonicalStringify(current.lineage)),
+      now,
+    });
+    return current.latestActivationProof;
   });
 
   return {
@@ -723,10 +764,13 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
 
 export async function finalizeActivation({ activationProof, now = new Date() } = {}) {
   const current = getGovernanceState();
-  if (current.status !== ACTIVATING_SUCCESSOR) {
+  // A successor whose activation was aborted on expiry may have applied
+  // unseen; its proof still finalizes it while nothing newer was certified.
+  const reopened = current.status === ACTIVE ? current.expiredSuccessorActivation || null : null;
+  if (current.status !== ACTIVATING_SUCCESSOR && !reopened) {
     throw new Error(`activation finalize requires activating_successor governance, got ${current.status}`);
   }
-  const pending = current.pendingSuccessorActivation;
+  const pending = reopened || current.pendingSuccessorActivation;
   if (!pending?.successorCertificate) {
     throw new Error("activation finalize requires pending successor activation");
   }
@@ -748,7 +792,37 @@ export async function finalizeActivation({ activationProof, now = new Date() } =
       throw new Error(`activation proof ${key} mismatch`);
     }
   }
-  verifyLineage(expectedLineage, { now, enforceTerminalExpiry: true });
+  // Late finalize: the successor certificate may have expired since, but the
+  // candidate must have applied it while it was valid.
+  const provedAt = Date.parse(proof.provedAt);
+  if (!Number.isFinite(provedAt)
+    || provedAt < Date.parse(pending.issuedAt) - PROVED_AT_SKEW_MS
+    || provedAt > Date.parse(pending.expiresAt) + PROVED_AT_SKEW_MS) {
+    throw new Error("activation proof was not produced while the successor certificate was valid");
+  }
+  verifyLineage(expectedLineage, { now, enforceTerminalExpiry: false });
+  // Recorded first, and replicated: once the predecessor has seen the
+  // successor's proof it can only finalize, never abort into a fork.
+  if (reopened) {
+    await withGovernanceCommit(() => {
+      if (current.status !== ACTIVE
+        || current.expiredSuccessorActivation?.successorPayloadDigest !== pending.successorPayloadDigest) {
+        throw new Error("the expired successor activation changed before finalize");
+      }
+      current.status = ACTIVATING_SUCCESSOR;
+      current.pendingSuccessorActivation = { ...pending, activationProof };
+      current.latestSuccessorCertificate = pending.successorCertificate;
+      current.expiredSuccessorActivation = null;
+    });
+  } else if (!pending.activationProof) {
+    await withGovernanceCommit(() => {
+      if (current.status !== ACTIVATING_SUCCESSOR
+        || current.pendingSuccessorActivation?.successorPayloadDigest !== pending.successorPayloadDigest) {
+        throw new Error("pending successor activation changed before finalize");
+      }
+      current.pendingSuccessorActivation = { ...current.pendingSuccessorActivation, activationProof };
+    });
+  }
   const retirementCertificate = await withGovernanceCommit(async () => {
     if (current.status !== ACTIVATING_SUCCESSOR
       || current.pendingSuccessorActivation?.successorPayloadDigest !== pending.successorPayloadDigest) {
@@ -778,6 +852,171 @@ export async function finalizeActivation({ activationProof, now = new Date() } =
   };
 }
 
+// Predecessor side of the readiness proof. The offered keys must be the keys
+// the candidate enclave holds: the readiness statement is signed with the
+// candidate's governance key, and the attestation (under an audience
+// /attestation never requests) carries a nonce the candidate computed over its
+// own key ids, which is recomputed here over the offered ones.
+async function verifyActivationReadiness({
+  candidateReadiness,
+  activationNonce,
+  candidateImageDigest,
+  candidateGovernancePublicKeyPem,
+  candidateGovernanceKeyId,
+  candidateActivationPublicKeyPem,
+  now,
+  verifyAttestation,
+}) {
+  const readiness = verifyGovernanceEnvelope(candidateReadiness?.readiness, candidateGovernancePublicKeyPem, { now });
+  const activationKeyId = `sha256:${publicKeyFingerprint(candidateActivationPublicKeyPem)}`;
+  for (const [key, value] of Object.entries({
+    schema: ACTIVATION_READINESS_SCHEMA,
+    activationNonce,
+    candidateImageDigest,
+    governanceKeyId: candidateGovernanceKeyId,
+    activationKeyId,
+    custody: "in-enclave-memory",
+  })) {
+    if (readiness[key] !== value) throw new Error(`activation readiness ${key} mismatch`);
+  }
+  const attestationToken = candidateReadiness.attestationToken;
+  const attestation = await verifyAttestation(attestationToken, {
+    expectedNonce: buildActivationReadinessNonce({
+      activationNonce,
+      governanceKeyId: candidateGovernanceKeyId,
+      activationKeyId,
+      imageDigest: candidateImageDigest,
+    }),
+    expectedImageDigest: candidateImageDigest,
+    expectedAudience: ACTIVATION_READINESS_AUDIENCE,
+  });
+  if (!nonceMatches(attestation.eat_nonce, activationNonce)) {
+    throw new Error("activation readiness attestation does not bind the activation nonce");
+  }
+  assertBrokerWorkloadClaims(attestation);
+  return { attestation, attestationToken };
+}
+
+// Candidate side of the readiness proof: states, under this enclave's own
+// key, which keys it holds for this activation nonce.
+export async function issueActivationReadiness({ activationNonce, now = new Date(), requestToken = requestAttestationToken } = {}) {
+  const current = getGovernanceState();
+  if (current.status !== INACTIVE || current.lineage.length > 0) {
+    throw new Error("activation readiness is issued only by a fresh inactive candidate");
+  }
+  if (!SHA256_DIGEST_PATTERN.test(String(activationNonce))) throw new Error("activationNonce must be a sha256 digest");
+  if (current.declinedActivationNonces.has(activationNonce)) throw new Error("this candidate declined that activation");
+  assertEnclaveGovernanceKeyInProduction(current);
+  const { keyMaterial, imageDigest } = current;
+  const readiness = await signGovernancePayload({
+    schema: ACTIVATION_READINESS_SCHEMA,
+    activationNonce,
+    candidateImageDigest: imageDigest,
+    governanceKeyId: keyMaterial.governanceKeyId,
+    activationKeyId: keyMaterial.activationKeyId,
+    custody: "in-enclave-memory",
+    issuedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + ACTIVATION_READINESS_TTL_MS).toISOString(),
+  }, keyMaterial);
+  const readinessNonce = buildActivationReadinessNonce({
+    activationNonce,
+    governanceKeyId: keyMaterial.governanceKeyId,
+    activationKeyId: keyMaterial.activationKeyId,
+    imageDigest,
+  });
+  const attestationToken = await requestToken([activationNonce, readinessNonce], { audience: ACTIVATION_READINESS_AUDIENCE });
+  current.activationReadiness.set(activationNonce, readiness.payload.issuedAt);
+  while (current.activationReadiness.size > ACTIVATION_READINESS_LIMIT) {
+    current.activationReadiness.delete(current.activationReadiness.keys().next().value);
+  }
+  return { readiness, attestationToken };
+}
+
+// Candidate side of an abort: refuses the nonce for the life of this process
+// and signs a decline the predecessor can verify against the pending key.
+export function declineActivation({ activationNonce, now = new Date() } = {}) {
+  if (!SHA256_DIGEST_PATTERN.test(String(activationNonce))) throw new Error("activationNonce must be a sha256 digest");
+  return withGovernanceLock(async (current) => {
+    if (current.status !== INACTIVE || current.lineage.length > 0) {
+      throw new Error("only a candidate that has not applied an activation can decline it");
+    }
+    current.declinedActivationNonces.add(activationNonce);
+    return signGovernancePayload({
+      schema: ACTIVATION_DECLINE_SCHEMA,
+      activationNonce,
+      candidateImageDigest: current.imageDigest,
+      governanceKeyId: current.keyMaterial.governanceKeyId,
+      declinedAt: now.toISOString(),
+    }, current.keyMaterial);
+  });
+}
+
+export function getActivationProof() {
+  const current = getGovernanceState();
+  if (!current.latestActivationProof) throw new Error("this TEE holds no activation proof");
+  return { activationProof: current.latestActivationProof };
+}
+
+// Predecessor side of an abort: back to active, either on the pending
+// candidate's own decline or, once the pending certificate has expired and the
+// grace has passed, on the workflow's request. Never after the predecessor has
+// seen the successor's activation proof.
+export async function abortActivation({ decline = null, expired = false, activationNonce = null, now = new Date() } = {}) {
+  const result = await withGovernanceCommit((current) => {
+    const pending = current.pendingSuccessorActivation;
+    if (current.status !== ACTIVATING_SUCCESSOR || !pending) {
+      throw new Error(`activation abort requires activating_successor governance, got ${current.status}`);
+    }
+    if (pending.activationProof) {
+      throw new Error("the successor proved its activation; finalize it instead of aborting");
+    }
+    let reason;
+    if (decline) {
+      const payload = verifyGovernanceEnvelope(decline, pending.candidateGovernancePublicKeyPem, { now, enforceExpiry: false });
+      if (payload.schema !== ACTIVATION_DECLINE_SCHEMA
+        || payload.activationNonce !== pending.activationNonce
+        || payload.governanceKeyId !== pending.candidateGovernanceKeyId
+        || payload.candidateImageDigest !== pending.candidateImageDigest) {
+        throw new Error("activation decline does not match the pending successor");
+      }
+      reason = "declined";
+    } else if (expired === true) {
+      if (activationNonce !== pending.activationNonce) {
+        throw new Error("an expired abort must name the pending activation nonce");
+      }
+      const abortableAt = Date.parse(pending.expiresAt) + ACTIVATION_ABORT_GRACE_MS;
+      if (now.getTime() < abortableAt) {
+        throw new Error(`the pending activation becomes abortable at ${new Date(abortableAt).toISOString()}`);
+      }
+      reason = "expired";
+    } else {
+      throw new Error("activation abort requires the candidate's decline or an expired pending activation");
+    }
+    current.status = ACTIVE;
+    current.pendingSuccessorActivation = null;
+    current.latestSuccessorCertificate = null;
+    // A candidate that declined cannot have applied. One that merely expired
+    // might have applied unseen, so its activation stays finalizable by its
+    // proof until another successor is certified.
+    current.expiredSuccessorActivation = reason === "expired" ? pending : null;
+    current.latestAbortedActivation = {
+      activationNonce: pending.activationNonce,
+      successorPayloadDigest: pending.successorPayloadDigest,
+      candidateImageDigest: pending.candidateImageDigest,
+      reason,
+      abortedAt: now.toISOString(),
+    };
+    return { status: ACTIVE, abortedActivation: current.latestAbortedActivation };
+  });
+  getGovernanceState().pendingActivationChallenges.delete(result.abortedActivation.activationNonce);
+  recordActivation({
+    status: "failed",
+    reason: `aborted: ${result.abortedActivation.reason}`,
+    candidateDigest: result.abortedActivation.candidateImageDigest,
+  });
+  return result;
+}
+
 export function buildGovernanceManifestPayload() {
   const current = getGovernanceState();
   const routeRegistry = getRouteRegistryStatus();
@@ -805,6 +1044,7 @@ export function buildGovernanceManifestPayload() {
     latestSuccessorCertificate: current.latestSuccessorCertificate,
     latestRetirementCertificate: current.latestRetirementCertificate,
     pendingSuccessorActivation: current.pendingSuccessorActivation,
+    latestAbortedActivation: current.latestAbortedActivation || null,
     replica: {
       role: current.replicaRole || null,
       serial: current.replicaSerial || 0,
@@ -1173,6 +1413,9 @@ function exportReplicaSnapshot(current) {
     latestSuccessorCertificate: current.latestSuccessorCertificate,
     latestRetirementCertificate: current.latestRetirementCertificate,
     pendingSuccessorActivation: current.pendingSuccessorActivation,
+    latestActivationProof: current.latestActivationProof || null,
+    latestAbortedActivation: current.latestAbortedActivation || null,
+    expiredSuccessorActivation: current.expiredSuccessorActivation || null,
     replicaSerial: current.replicaSerial || 0,
   };
 }
@@ -1196,6 +1439,9 @@ function applyReplicaSnapshot(current, snapshot) {
   current.latestSuccessorCertificate = snapshot.latestSuccessorCertificate || null;
   current.latestRetirementCertificate = snapshot.latestRetirementCertificate || null;
   current.pendingSuccessorActivation = snapshot.pendingSuccessorActivation || null;
+  current.latestActivationProof = snapshot.latestActivationProof || null;
+  current.latestAbortedActivation = snapshot.latestAbortedActivation || null;
+  current.expiredSuccessorActivation = snapshot.expiredSuccessorActivation || null;
   current.replicaSerial = snapshot.replicaSerial || 0;
 }
 

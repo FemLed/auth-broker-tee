@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { canonicalStringify, sha256Digest } from "../src/canonical-json.js";
-import { createInMemoryGovernanceKeyMaterial, verifyGovernanceEnvelope } from "../src/governance-crypto.js";
+import { createInMemoryGovernanceKeyMaterial, signGovernancePayload, verifyGovernanceEnvelope } from "../src/governance-crypto.js";
 import {
   assertPreapprovalMatchesCandidate,
+  signActivationProofCertificate,
   signGenesisCertificate,
   signPreapprovalCertificate,
   signSuccessorCertificate,
@@ -33,6 +34,13 @@ import {
   verifyTenantAdmissionEnvelope,
   resetGovernanceForTests,
   getGovernanceState,
+  ACTIVATION_ABORT_GRACE_MS,
+  ACTIVATION_READINESS_AUDIENCE,
+  abortActivation,
+  declineActivation,
+  getActivationProof,
+  issueActivationReadiness,
+  setGovernanceStateReplicator,
 } from "../src/governance-state.js";
 import {
   buildHealthSnapshot,
@@ -60,6 +68,9 @@ import { buildRepairJobOverrides } from "../src/governance-repair-launcher.js";
 import { evaluateSelfImprovementOnce } from "../src/governance-self-improvement.js";
 import { evaluateModelPolicyUpgradeOpportunity } from "../src/governance-model-policy-supervisor.js";
 import {
+  handleActivationAbort,
+  handleActivationComplete,
+  handleActivationFinalize,
   handleActivationOffer,
   handleGenesisBootstrap,
   handleGovernanceChallenge,
@@ -521,6 +532,7 @@ test("activation signs successor, transfers state, and retires predecessor", asy
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -531,17 +543,12 @@ test("activation signs successor, transfers state, and retires predecessor", asy
   const bundle = await completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: approveSuccessorArbitration,
   });
 
@@ -555,20 +562,7 @@ test("activation signs successor, transfers state, and retires predecessor", asy
   assert.equal(verifyLineage([active.lineage[0], bundle.successorCertificate]).currentEpoch, 2);
 
   const predecessorState = getGovernanceState();
-  resetGovernanceForTests({
-    status: "inactive",
-    epoch: 0,
-    imageDigest: candidate.candidateImageDigest,
-    keyMaterial: candidateKeys,
-    lineage: [],
-    latestPreapproval: null,
-    latestSuccessorCertificate: null,
-    latestRetirementCertificate: null,
-    pendingSuccessorActivation: null,
-    selfHealingProposals: [],
-    pendingActivationChallenges: new Map(),
-    transferredState: {},
-  });
+  resetGovernanceForTests(candidateState);
   const candidateManifest = await applyActivationBundle({ ...bundle, activationNonce });
   assert.equal(candidateManifest.status, "active");
   assert.match(candidateManifest.activationProof.payloadDigest, /^sha256:/);
@@ -593,6 +587,7 @@ test("activation refuses successor when final Gemini arbitration requests change
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -600,20 +595,15 @@ test("activation refuses successor when final Gemini arbitration requests change
     candidateImageDigest: candidate.candidateImageDigest,
   });
 
-  await assert.rejects(() => completeActivation({
+  await assert.rejects(async () => completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: async () => ({
       aiDecision: { ...approveDecision(), decision: "REQUEST_CHANGES", reasoning: "Mission risk remains." },
       arbitrationDigest: digestOf("rejected-arbitration"),
@@ -687,6 +677,7 @@ test("candidate apply failure does not retire predecessor", async () => {
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -696,17 +687,12 @@ test("candidate apply failure does not retire predecessor", async () => {
   await completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: approveSuccessorArbitration,
   });
 
@@ -729,6 +715,7 @@ test("inactive successor applies only its own activation bundle", async () => {
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -738,34 +725,16 @@ test("inactive successor applies only its own activation bundle", async () => {
   const bundle = await completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: approveSuccessorArbitration,
   });
 
-  resetGovernanceForTests({
-    status: "inactive",
-    epoch: 0,
-    imageDigest: candidate.candidateImageDigest,
-    keyMaterial: candidateKeys,
-    lineage: [],
-    latestPreapproval: null,
-    latestSuccessorCertificate: null,
-    latestRetirementCertificate: null,
-    pendingSuccessorActivation: null,
-    selfHealingProposals: [],
-    pendingActivationChallenges: new Map(),
-    transferredState: {},
-  });
+  resetGovernanceForTests(candidateState);
   await assert.rejects(() => applyActivationBundle({
     ...bundle,
     successorCertificate: {
@@ -796,6 +765,7 @@ test("production refuses to establish governance on key material held outside th
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -805,34 +775,17 @@ test("production refuses to establish governance on key material held outside th
   const bundle = await completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: approveSuccessorArbitration,
   });
 
-  resetGovernanceForTests({
-    status: "inactive",
-    epoch: 0,
-    imageDigest: candidate.candidateImageDigest,
-    keyMaterial: { ...candidateKeys, kind: "kms-backed" },
-    lineage: [],
-    latestPreapproval: null,
-    latestSuccessorCertificate: null,
-    latestRetirementCertificate: null,
-    pendingSuccessorActivation: null,
-    selfHealingProposals: [],
-    pendingActivationChallenges: new Map(),
-    transferredState: {},
-  });
+  candidateState.keyMaterial = { ...candidateKeys, kind: "kms-backed" };
+  resetGovernanceForTests(candidateState);
   const previousNodeEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = "production";
   try {
@@ -868,6 +821,7 @@ test("activation hard-vetoes incomplete governance-critical source evidence", as
     aiDecision: approveDecision(),
     nonce: "n",
   });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
   const { activationNonce } = createActivationChallenge({
     preapprovalEnvelope: preapproval,
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
@@ -875,22 +829,299 @@ test("activation hard-vetoes incomplete governance-critical source evidence", as
     candidateImageDigest: candidate.candidateImageDigest,
   });
 
-  await assert.rejects(() => completeActivation({
+  await assert.rejects(async () => completeActivation({
     preapprovalEnvelope: preapproval,
     candidate,
-    candidateAttestationToken: "fake.jwt",
+    candidateReadiness: await readinessFrom(candidateState, activationNonce),
     candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
     candidateGovernanceKeyId: candidateKeys.governanceKeyId,
     candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
     activationNonce,
-    verifyAttestation: async (_jwt, expected) => ({
-      dbgstat: "disabled-since-boot",
-      swname: "CONFIDENTIAL_SPACE",
-      eat_nonce: expected.expectedNonce,
-      submods: { container: { image_digest: expected.expectedImageDigest } },
-    }),
+    verifyAttestation: readinessAttestation(),
     arbitrateSuccessor: approveSuccessorArbitration,
   }), /governance-critical source evidence is incomplete/);
+});
+
+// A predecessor with one pending successor activation, its candidate's state,
+// and what the activation job holds afterwards.
+async function pendingActivation({ now = new Date() } = {}) {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  const active = initializeGovernance({ mode: "genesis" });
+  const candidateKeys = createInMemoryGovernanceKeyMaterial();
+  const candidate = candidateEvidence();
+  const preapproval = signPreapprovalCertificate({
+    keyMaterial: active.keyMaterial,
+    predecessorEpoch: active.epoch,
+    candidate,
+    hardCheckResults: { status: "passed", failures: [], warnings: [] },
+    aiDecision: approveDecision(),
+    nonce: "n",
+  });
+  const candidateState = createCandidateState(candidateKeys, candidate.candidateImageDigest);
+  const { activationNonce } = createActivationChallenge({
+    preapprovalEnvelope: preapproval,
+    candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
+    candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
+    candidateImageDigest: candidate.candidateImageDigest,
+  });
+  const completeRequest = {
+    preapprovalEnvelope: preapproval,
+    candidate,
+    candidateGovernancePublicKeyPem: candidateKeys.governancePublicKeyPem,
+    candidateGovernanceKeyId: candidateKeys.governanceKeyId,
+    candidateActivationPublicKeyPem: candidateKeys.activationPublicKeyPem,
+    activationNonce,
+    now,
+    verifyAttestation: readinessAttestation(),
+    arbitrateSuccessor: approveSuccessorArbitration,
+  };
+  const candidateReadiness = await readinessFrom(candidateState, activationNonce);
+  return { active, predecessorState: getGovernanceState(), candidateKeys, candidate, candidateState, activationNonce, completeRequest, candidateReadiness };
+}
+
+async function asState(state, fn) {
+  const previous = getGovernanceState();
+  resetGovernanceForTests(state);
+  try {
+    return await fn();
+  } finally {
+    resetGovernanceForTests(previous);
+  }
+}
+
+test("activation requires the candidate's readiness proof", async () => {
+  const { completeRequest } = await pendingActivation();
+  await assert.rejects(() => completeActivation(completeRequest));
+  assert.equal(getGovernanceState().status, "active");
+  assert.equal(getGovernanceState().pendingSuccessorActivation, null);
+});
+
+test("a readiness proof cannot vouch for keys the candidate does not hold", async () => {
+  const { completeRequest, candidateReadiness, candidate, activationNonce, candidateState } = await pendingActivation();
+  const attacker = createInMemoryGovernanceKeyMaterial();
+
+  // The candidate's own readiness, offered with someone else's keys.
+  await assert.rejects(() => completeActivation({
+    ...completeRequest,
+    candidateReadiness,
+    candidateGovernancePublicKeyPem: attacker.governancePublicKeyPem,
+    candidateGovernanceKeyId: attacker.governanceKeyId,
+  }));
+
+  // An offer made for the attacker's keys, the candidate's genuine attestation
+  // for that nonce, and a statement the attacker signed for its own keys: the
+  // key-bound nonce was computed over the candidate's keys and does not match.
+  const { activationNonce: attackerNonce } = createActivationChallenge({
+    preapprovalEnvelope: completeRequest.preapprovalEnvelope,
+    candidateGovernancePublicKeyPem: attacker.governancePublicKeyPem,
+    candidateActivationPublicKeyPem: attacker.activationPublicKeyPem,
+    candidateImageDigest: candidate.candidateImageDigest,
+  });
+  const genuine = await readinessFrom(candidateState, attackerNonce);
+  const forgedStatement = signGovernancePayload({
+    ...genuine.readiness.payload,
+    governanceKeyId: attacker.governanceKeyId,
+    activationKeyId: attacker.activationKeyId,
+  }, attacker);
+  await assert.rejects(() => completeActivation({
+    ...completeRequest,
+    activationNonce: attackerNonce,
+    candidateReadiness: { readiness: forgedStatement, attestationToken: genuine.attestationToken },
+    candidateGovernancePublicKeyPem: attacker.governancePublicKeyPem,
+    candidateGovernanceKeyId: attacker.governanceKeyId,
+    candidateActivationPublicKeyPem: attacker.activationPublicKeyPem,
+  }), /attestation nonce mismatch/);
+
+  // A token from the generic /attestation endpoint carries its audience.
+  const oracleToken = JSON.stringify({ nonces: JSON.parse(candidateReadiness.attestationToken).nonces, audience: "https://oauth-tee.femled.ai" });
+  await assert.rejects(() => completeActivation({
+    ...completeRequest,
+    candidateReadiness: { ...candidateReadiness, attestationToken: oracleToken },
+  }), /aud/);
+  assert.equal(getGovernanceState().status, "active");
+  assert.equal(candidate.candidateImageDigest, candidateReadiness.readiness.payload.candidateImageDigest);
+  assert.equal(activationNonce, candidateReadiness.readiness.payload.activationNonce);
+  assert.equal(JSON.parse(candidateReadiness.attestationToken).audience, ACTIVATION_READINESS_AUDIENCE);
+});
+
+test("a candidate applies only an activation it issued readiness for", async () => {
+  const { completeRequest, candidateReadiness, candidateKeys, candidate, activationNonce } = await pendingActivation();
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  const unprepared = createCandidateState(candidateKeys, candidate.candidateImageDigest);
+  await assert.rejects(
+    () => asState(unprepared, () => applyActivationBundle({ ...bundle, activationNonce })),
+    /issued no readiness proof/,
+  );
+  assert.equal(unprepared.status, "inactive");
+});
+
+test("a declined activation returns the predecessor to active and can never be applied", async () => {
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation();
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  assert.equal(predecessorState.status, "activating_successor");
+
+  const decline = await asState(candidateState, () => declineActivation({ activationNonce }));
+  const forged = signGovernancePayload(decline.payload, createInMemoryGovernanceKeyMaterial());
+  await assert.rejects(() => abortActivation({ decline: forged }));
+  assert.equal(predecessorState.status, "activating_successor");
+
+  const aborted = await abortActivation({ decline });
+  assert.equal(aborted.abortedActivation.reason, "declined");
+  assert.equal(predecessorState.status, "active");
+  assert.equal(predecessorState.pendingSuccessorActivation, null);
+  assert.equal(predecessorState.latestSuccessorCertificate, null);
+  assert.equal(buildGovernanceManifestPayload().latestAbortedActivation.activationNonce, activationNonce);
+
+  await assert.rejects(
+    () => asState(candidateState, () => applyActivationBundle({ ...bundle, activationNonce })),
+    /declined/,
+  );
+  await assert.rejects(
+    () => asState(candidateState, () => issueActivationReadiness({ activationNonce, requestToken: async () => "{}" })),
+    /declined/,
+  );
+});
+
+test("a successor that applied in time is finalized late, and serves its proof again", async () => {
+  const issuedAt = new Date();
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation({ now: issuedAt });
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+
+  const applied = await asState(candidateState, () => applyActivationBundle({
+    ...bundle,
+    activationNonce,
+    now: new Date(issuedAt.getTime() + 60 * 1000),
+  }));
+  const served = await asState(candidateState, () => getActivationProof());
+  assert.deepEqual(served.activationProof, applied.activationProof);
+
+  const finalized = await finalizeActivation({
+    activationProof: served.activationProof,
+    now: new Date(issuedAt.getTime() + 30 * 60 * 1000),
+  });
+  assert.equal(finalized.status, "retired");
+  assert.equal(predecessorState.status, "retired");
+});
+
+test("a proof produced after the successor certificate expired is refused", async () => {
+  const issuedAt = new Date();
+  const { completeRequest, candidateReadiness, candidateKeys, candidate, activationNonce } = await pendingActivation({ now: issuedAt });
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  const lineage = [...getGovernanceState().lineage, bundle.successorCertificate];
+  const lateProof = signActivationProofCertificate({
+    keyMaterial: candidateKeys,
+    epoch: 2,
+    successorPayloadDigest: bundle.successorCertificate.payloadDigest,
+    activationNonce,
+    candidateImageDigest: candidate.candidateImageDigest,
+    lineageDigest: sha256Digest(canonicalStringify(lineage)),
+    now: new Date(issuedAt.getTime() + 13 * 60 * 1000),
+  });
+  await assert.rejects(
+    () => finalizeActivation({ activationProof: lateProof, now: new Date(issuedAt.getTime() + 14 * 60 * 1000) }),
+    /not produced while the successor certificate was valid/,
+  );
+  assert.equal(getGovernanceState().status, "activating_successor");
+});
+
+test("an expired activation is abortable only after the grace, and its certificate can no longer be applied", async () => {
+  const issuedAt = new Date();
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation({ now: issuedAt });
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  const expiresAt = Date.parse(bundle.successorCertificate.payload.expiresAt);
+
+  await assert.rejects(
+    () => abortActivation({ expired: true, activationNonce, now: new Date(expiresAt + ACTIVATION_ABORT_GRACE_MS - 1000) }),
+    /becomes abortable at/,
+  );
+  await assert.rejects(() => abortActivation({ expired: true, activationNonce: digestOf("other"), now: new Date(expiresAt + ACTIVATION_ABORT_GRACE_MS + 1000) }));
+  const aborted = await abortActivation({ expired: true, activationNonce, now: new Date(expiresAt + ACTIVATION_ABORT_GRACE_MS + 1000) });
+  assert.equal(aborted.abortedActivation.reason, "expired");
+  assert.equal(predecessorState.status, "active");
+
+  await assert.rejects(
+    () => asState(candidateState, () => applyActivationBundle({ ...bundle, activationNonce, now: new Date(expiresAt + 1000) })),
+    /expired/,
+  );
+});
+
+test("a successor that applied unseen before an expiry abort is still finalized by its proof", async () => {
+  const issuedAt = new Date();
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation({ now: issuedAt });
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  const applied = await asState(candidateState, () => applyActivationBundle({ ...bundle, activationNonce, now: issuedAt }));
+  const afterGrace = new Date(Date.parse(bundle.successorCertificate.payload.expiresAt) + ACTIVATION_ABORT_GRACE_MS + 1000);
+
+  await abortActivation({ expired: true, activationNonce, now: afterGrace });
+  assert.equal(predecessorState.status, "active");
+
+  const finalized = await finalizeActivation({ activationProof: applied.activationProof, now: afterGrace });
+  assert.equal(finalized.status, "retired");
+  assert.equal(predecessorState.status, "retired");
+  assert.equal(predecessorState.expiredSuccessorActivation, null);
+});
+
+test("a declined activation cannot be finalized afterwards", async () => {
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation();
+  await completeActivation({ ...completeRequest, candidateReadiness });
+  const decline = await asState(candidateState, () => declineActivation({ activationNonce }));
+  await abortActivation({ decline });
+  await assert.rejects(() => finalizeActivation({ activationProof: decline }), /requires activating_successor/);
+  assert.equal(predecessorState.status, "active");
+});
+
+test("a predecessor that has seen the successor's proof finalizes and never aborts", async () => {
+  const issuedAt = new Date();
+  const { completeRequest, candidateReadiness, candidateState, activationNonce, predecessorState } = await pendingActivation({ now: issuedAt });
+  const bundle = await completeActivation({ ...completeRequest, candidateReadiness });
+  const applied = await asState(candidateState, () => applyActivationBundle({ ...bundle, activationNonce, now: issuedAt }));
+
+  let commits = 0;
+  setGovernanceStateReplicator(async () => {
+    commits += 1;
+    if (commits === 2) throw new Error("custodian unreachable");
+  });
+  try {
+    await assert.rejects(() => finalizeActivation({ activationProof: applied.activationProof, now: issuedAt }), /custodian unreachable/);
+    assert.equal(predecessorState.status, "activating_successor");
+    assert.ok(predecessorState.pendingSuccessorActivation.activationProof);
+
+    const farFuture = new Date(Date.parse(bundle.successorCertificate.payload.expiresAt) + 60 * 60 * 1000);
+    await assert.rejects(() => abortActivation({ expired: true, activationNonce, now: farFuture }), /finalize it instead of aborting/);
+
+    const finalized = await finalizeActivation({ activationProof: applied.activationProof, now: farFuture });
+    assert.equal(finalized.status, "retired");
+  } finally {
+    setGovernanceStateReplicator(null);
+  }
+});
+
+test("finalize, decline, abort and proof accept the successor-recovery workflow; the handoff itself does not", async () => {
+  resetGovernanceRouteSecurityForTests();
+  resetGovernanceForTests(null);
+  initializeGovernance({ mode: "genesis" });
+  setGovernanceOidcVerifierForTests(async (authHeader, expected) => {
+    const recovery = expected.workflowRefs[0].endsWith("/successor-recovery.yml@refs/heads/master");
+    if (authHeader !== "Bearer recovery-workflow" || !recovery) throw new Error("invalid test OIDC token");
+    assert.deepEqual([...expected.allowedEvents], ["workflow_dispatch"]);
+    return { event_name: "workflow_dispatch", job_workflow_ref: expected.workflowRefs[0], sub: "recovery" };
+  });
+  const recoveryRequest = (body) => governanceRequest({ body, authorization: "Bearer recovery-workflow", remoteAddress: "198.51.100.60" });
+
+  const abort = createMockResponse();
+  await handleActivationAbort(recoveryRequest({ expired: true, activationNonce: digestOf("x") }), abort);
+  assert.equal(abort.statusCode, 409);
+  assert.match(JSON.parse(abort.body).error, /requires activating_successor/);
+
+  const finalize = createMockResponse();
+  await handleActivationFinalize(recoveryRequest({ activationProof: null }), finalize);
+  assert.equal(finalize.statusCode, 400);
+
+  const complete = createMockResponse();
+  await handleActivationComplete(recoveryRequest({}), complete);
+  assert.equal(complete.statusCode, 401);
+  resetGovernanceRouteSecurityForTests();
 });
 
 test("self-healing proposals are signed telemetry, not activation authority", async () => {
@@ -1962,6 +2193,51 @@ function tenantAdmissionFields() {
     allowedAppHosts: ["app-019a8314-3e69-7bb1-b8ee-19bc54723979.femled.ai"],
     allowedBrokerAudiences: ["https://oauth-tee.femled.ai"],
     now: new Date("2026-05-05T00:00:00Z"),
+  };
+}
+
+// An inactive candidate TEE of the given image holding the given keys; the
+// predecessor's state stays swapped in.
+function createCandidateState(candidateKeys, imageDigest) {
+  const predecessor = getGovernanceState();
+  resetGovernanceForTests(null);
+  const candidateState = initializeGovernance({ keyMaterial: candidateKeys });
+  candidateState.imageDigest = imageDigest;
+  resetGovernanceForTests(predecessor);
+  return candidateState;
+}
+
+async function readinessFrom(candidateState, activationNonce) {
+  const predecessor = getGovernanceState();
+  resetGovernanceForTests(candidateState);
+  try {
+    return await issueActivationReadiness({
+      activationNonce,
+      requestToken: async (nonces, { audience }) => JSON.stringify({ nonces, audience }),
+    });
+  } finally {
+    resetGovernanceForTests(predecessor);
+  }
+}
+
+// Verifies the fake launcher tokens readinessFrom produces the way the real
+// verifier does: audience and nonce, plus the workload claims.
+function readinessAttestation({ instanceName = "auth-broker-tee-a-bbbbbbbbbbbb" } = {}) {
+  return async (jwt, expected) => {
+    const token = JSON.parse(jwt);
+    if (token.audience !== expected.expectedAudience) throw new Error("Confidential Space claim validation failed: aud");
+    if (!token.nonces.includes(expected.expectedNonce)) throw new Error("Confidential Space attestation nonce mismatch");
+    return {
+      dbgstat: "disabled-since-boot",
+      swname: "CONFIDENTIAL_SPACE",
+      eat_nonce: token.nonces,
+      google_service_accounts: ["auth-broker-tee@prod-femled-couple-router.iam.gserviceaccount.com"],
+      submods: {
+        container: { image_digest: expected.expectedImageDigest },
+        gce: { project_id: "prod-femled-couple-router", project_number: "125139120897", instance_name: instanceName },
+        confidential_space: { support_attributes: ["LATEST", "STABLE", "USABLE"] },
+      },
+    };
   };
 }
 

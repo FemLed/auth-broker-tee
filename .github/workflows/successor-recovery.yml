@@ -1,0 +1,132 @@
+## Finish or unwind a successor handoff that the activation job could not
+## complete, from that run's saved evidence.
+##
+##   finalize  the successor applied: finalize at the predecessor with the
+##             successor's proof (fetched from the successor if the apply
+##             response was lost). The predecessor accepts it after the successor
+##             certificate expired, as long as the successor applied in time.
+##   abort     the successor never applied: the candidate declines and the
+##             predecessor returns to active; with `expired`, once the candidate
+##             is gone and the pending certificate expired plus five minutes.
+##
+## This workflow's governance OIDC token is accepted by the finalize, decline,
+## proof and abort routes only; it cannot start a handoff. Once the predecessor
+## has seen the successor's proof it refuses to abort.
+
+name: successor-recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      activation_run_id:
+        description: "Run id of the build-and-attest run whose successor-activation-evidence to use"
+        required: true
+        type: string
+      stage:
+        description: "finalize or abort"
+        required: true
+        type: choice
+        options:
+          - finalize
+          - abort
+      candidate_ip:
+        description: "Successor candidate address (slot a); needed to fetch its proof or its decline"
+        required: false
+        type: string
+      predecessor_ip:
+        description: "Predecessor address, if oauth-tee.femled.ai no longer resolves to it"
+        required: false
+        type: string
+      expired:
+        description: "abort only: abort on expiry without the candidate's decline"
+        required: false
+        default: false
+        type: boolean
+      operator_statement:
+        description: "Must explicitly contain 'operator-authorized successor recovery'"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+jobs:
+  recover:
+    name: successor recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout at exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate inputs and operator statement
+        env:
+          RUN_ID: ${{ inputs.activation_run_id }}
+          CANDIDATE_IP: ${{ inputs.candidate_ip }}
+          PREDECESSOR_IP: ${{ inputs.predecessor_ip }}
+          OPERATOR_STATEMENT: ${{ inputs.operator_statement }}
+        run: |
+          if [[ ! "${RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::activation_run_id must be a run id"
+            exit 1
+          fi
+          for ip in "${CANDIDATE_IP}" "${PREDECESSOR_IP}"; do
+            if [[ -n "${ip}" && ! "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::addresses must be IPv4"
+              exit 1
+            fi
+          done
+          if ! echo "${OPERATOR_STATEMENT}" | grep -qiE 'operator[- ]authorized.*successor recovery'; then
+            echo "::error::operator_statement must explicitly contain 'operator-authorized successor recovery'"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download the activation evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.activation_run_id }}
+        run: |
+          gh run download "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" --name successor-activation-evidence --dir evidence
+          offer=$(find evidence -name activation-offer-response.json -print -quit)
+          if [[ -z "${offer}" ]]; then
+            echo "::error::the run's evidence holds no activation offer"
+            exit 1
+          fi
+          echo "work_dir=$(dirname "${offer}")" >> "$GITHUB_OUTPUT"
+
+      - name: Recover
+        env:
+          STAGE: ${{ inputs.stage }}
+          WORK_DIR: ${{ steps.evidence.outputs.work_dir }}
+          CANDIDATE_IP: ${{ inputs.candidate_ip }}
+          PREDECESSOR_IP: ${{ inputs.predecessor_ip }}
+          EXPIRED: ${{ inputs.expired }}
+        run: |
+          # Each governance call mints its own OIDC token (id-token: write).
+          args=(--stage "${STAGE}" --work-dir "${WORK_DIR}")
+          [[ -n "${CANDIDATE_IP}" ]] && args+=(--candidate-ip "${CANDIDATE_IP}")
+          [[ -n "${PREDECESSOR_IP}" ]] && args+=(--predecessor-ip "${PREDECESSOR_IP}")
+          [[ "${STAGE}" == "abort" && "${EXPIRED}" == "true" ]] && args+=(--expired)
+          node scripts/activate-successor.mjs "${args[@]}" | tee recovery-report.json
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: successor-recovery-evidence
+          path: |
+            ${{ steps.evidence.outputs.work_dir }}
+            recovery-report.json
+          if-no-files-found: ignore
+          retention-days: 90

@@ -17,6 +17,8 @@ export const GOVERNANCE_SECURITY_BOUNDARY = {
     "Every governance change the primary releases has first been acknowledged by the custodian replica, so whichever replica survives holds everything that was released.",
     "A custodian replica serves no broker routes until an explicit failover promotes it; promotion is refused until the primary has been silent for a quiet period and does not answer as serving, and the promoted replica no longer acknowledges the old primary's changes.",
     "GitHub and GCP may build or deploy candidates, but cannot activate them without predecessor signature.",
+    "A predecessor certifies successor keys only after the candidate enclave proved it holds them: a readiness statement signed with its in-enclave key and an attestation, under an audience /attestation never requests, of a nonce it computed over its own key ids.",
+    "An unfinished handoff is finished by a late finalize or unwound by the candidate's signed decline or by expiry of the pending certificate; a predecessor that has seen the successor's proof never aborts, an expired certificate can no longer be applied, and a successor that applied unseen before an expiry abort is still finalized by its proof while nothing newer was certified.",
     "AI first-principles approval is required but cannot override failed hard checks.",
     "Governance survives while either custody replica is alive; losing both before successor handoff bricks governance instead of enabling recovery.",
     "The OAuth redirect URI, scopes, project and route collection are image-pinned; launch metadata may only toggle the ACME renewer dry run and locate the custody peer.",

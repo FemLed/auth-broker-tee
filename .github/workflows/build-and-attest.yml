@@ -584,13 +584,18 @@ jobs:
       github.ref == 'refs/heads/master' &&
       vars.ENABLE_SUCCESSOR_ACTIVATION == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout at exact commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Prepare the evidence directory
+        run: |
+          echo "WORK_DIR=${RUNNER_TEMP}/tee-successor-activation" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/tee-successor-activation"
 
       - name: Download compliance summary from gate job
         uses: actions/download-artifact@v4
@@ -605,6 +610,7 @@ jobs:
           SUCCESSOR_CANDIDATE_IP: ${{ vars.SUCCESSOR_CANDIDATE_IP }}
           SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
           ENABLE_SUCCESSOR_CANDIDATE_CREATE: ${{ vars.ENABLE_SUCCESSOR_CANDIDATE_CREATE }}
+          CUSTODIAN_ZONE: ${{ vars.SUCCESSOR_CUSTODIAN_ZONE || 'us-west1-b' }}
         run: |
           if [[ -z "${CANDIDATE_IMAGE_DIGEST}" ]]; then
             echo "::error::build-and-sign did not expose an image digest"
@@ -618,38 +624,57 @@ jobs:
             echo "::error::Do not use gh-actions-publisher for successor activation; keep image publishing separate from deploy authority"
             exit 1
           fi
-          digest_hex="${CANDIDATE_IMAGE_DIGEST#sha256:}"
-          candidate_vm_name="auth-broker-tee-candidate-${digest_hex:0:12}"
           if [[ -n "${SUCCESSOR_CANDIDATE_IP}" ]]; then
-            if [[ ! "${SUCCESSOR_CANDIDATE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::SUCCESSOR_CANDIDATE_IP must be an IPv4 address"
-              exit 1
-            fi
-            echo "mode=prepared" >> "$GITHUB_OUTPUT"
-            echo "candidate_ip=${SUCCESSOR_CANDIDATE_IP}" >> "$GITHUB_OUTPUT"
-          elif [[ "${ENABLE_SUCCESSOR_CANDIDATE_CREATE}" == "true" ]]; then
-            echo "mode=managed" >> "$GITHUB_OUTPUT"
-            echo "candidate_vm_name=${candidate_vm_name}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::SUCCESSOR_CANDIDATE_IP is required unless ENABLE_SUCCESSOR_CANDIDATE_CREATE is true"
+            echo "::error::SUCCESSOR_CANDIDATE_IP is not supported: the successor runs as two custody replicas that this job creates"
             exit 1
           fi
+          if [[ "${ENABLE_SUCCESSOR_CANDIDATE_CREATE}" != "true" ]]; then
+            echo "::error::ENABLE_SUCCESSOR_CANDIDATE_CREATE must be true; this job creates the successor replicas"
+            exit 1
+          fi
+          if [[ ! "${CUSTODIAN_ZONE}" =~ ^us-west1-[a-c]$ ]]; then
+            echo "::error::SUCCESSOR_CUSTODIAN_ZONE must be a us-west1 zone"
+            exit 1
+          fi
+          digest_hex="${CANDIDATE_IMAGE_DIGEST#sha256:}"
+          primary="auth-broker-tee-a-${digest_hex:0:12}"
+          custodian="auth-broker-tee-b-${digest_hex:0:12}"
+          {
+            echo "primary_name=${primary}"
+            echo "custodian_name=${custodian}"
+            echo "custodian_zone=${CUSTODIAN_ZONE}"
+            echo "primary_peer_url=http://${primary}.us-west1-b.c.${GCP_PROJECT_ID}.internal:8080"
+            echo "custodian_peer_url=http://${custodian}.${CUSTODIAN_ZONE}.c.${GCP_PROJECT_ID}.internal:8080"
+          } >> "$GITHUB_OUTPUT"
           test -s .compliance-results/summary.json
 
-      - name: Authenticate to GCP for activation evidence
-        id: activation-gcp-auth
+      - name: Authenticate to GCP for activation
         uses: google-github-actions/auth@v2
         with:
           token_format: access_token
           workload_identity_provider: projects/125139120897/locations/global/workloadIdentityPools/gh-actions-pool/providers/github-oidc
           service_account: ${{ vars.SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT }}
-          access_token_lifetime: 1200s
+          access_token_lifetime: 3600s
 
-      - name: Setup gcloud for activation evidence
+      - name: Setup gcloud for activation
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Locate the predecessor
+        id: predecessor
+        run: |
+          holder=$(gcloud compute addresses describe auth-broker-tee-oauth-ip \
+            --project="${GCP_PROJECT_ID}" --region=us-west1 --format='value(users[0])')
+          if [[ -z "${holder}" ]]; then
+            echo "::error::the reserved address auth-broker-tee-oauth-ip is not attached to a predecessor"
+            exit 1
+          fi
+          {
+            echo "name=${holder##*/}"
+            echo "zone=$(sed -E 's#.*/zones/([^/]+)/.*#\1#' <<<"${holder}")"
+          } >> "$GITHUB_OUTPUT"
+          echo "Predecessor: ${holder##*/}"
+
       - name: Open resource-level candidate IAM
-        if: steps.activation-inputs.outputs.mode == 'managed'
         env:
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
         run: |
@@ -658,7 +683,6 @@ jobs:
             --candidate-image-digest "${CANDIDATE_IMAGE_DIGEST}"
 
       - name: Open constrained project-level candidate IAM
-        if: steps.activation-inputs.outputs.mode == 'managed'
         env:
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
         run: |
@@ -668,82 +692,62 @@ jobs:
             --wait \
             --update-env-vars="RECONCILE_OPERATION=grant,CANDIDATE_IMAGE_DIGEST=${CANDIDATE_IMAGE_DIGEST}"
 
-      - name: Create inactive candidate VM
-        if: steps.activation-inputs.outputs.mode == 'managed'
+      - name: Create inactive successor replicas
         id: create-candidate
         env:
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
           CANDIDATE_IMAGE_REF: ${{ needs.build-and-sign.outputs.image_ref }}
-          CANDIDATE_VM_NAME: ${{ steps.activation-inputs.outputs.candidate_vm_name }}
+          PRIMARY_NAME: ${{ steps.activation-inputs.outputs.primary_name }}
+          CUSTODIAN_NAME: ${{ steps.activation-inputs.outputs.custodian_name }}
+          CUSTODIAN_ZONE: ${{ steps.activation-inputs.outputs.custodian_zone }}
+          PRIMARY_PEER_URL: ${{ steps.activation-inputs.outputs.primary_peer_url }}
+          CUSTODIAN_PEER_URL: ${{ steps.activation-inputs.outputs.custodian_peer_url }}
         run: |
-          if gcloud compute instances describe "${CANDIDATE_VM_NAME}" \
+          # Slot a takes the handoff; slot b pulls custody from it once it is
+          # active. The REPLICA_* values only locate the peer.
+          for pair in "${PRIMARY_NAME}:us-west1-b" "${CUSTODIAN_NAME}:${CUSTODIAN_ZONE}"; do
+            if gcloud compute instances describe "${pair%%:*}" --project="${GCP_PROJECT_ID}" --zone="${pair##*:}" >/dev/null 2>&1; then
+              echo "::error::Successor replica ${pair%%:*} already exists"
+              exit 1
+            fi
+          done
+          base="tee-image-reference=${CANDIDATE_IMAGE_REF}@${CANDIDATE_IMAGE_DIGEST},tee-restart-policy=Always,tee-signed-image-repos=${CANDIDATE_IMAGE_REF}"
+          create() {
+            gcloud compute instances create "$1" \
               --project="${GCP_PROJECT_ID}" \
-              --zone=us-west1-b >/dev/null 2>&1; then
-            echo "::error::Candidate VM ${CANDIDATE_VM_NAME} already exists"
-            exit 1
-          fi
-          gcloud compute instances create "${CANDIDATE_VM_NAME}" \
-            --project="${GCP_PROJECT_ID}" \
-            --zone=us-west1-b \
-            --machine-type=c3-standard-4 \
-            --confidential-compute-type=TDX \
-            --maintenance-policy=TERMINATE \
-            --image-family=confidential-space \
-            --image-project=confidential-space-images \
-            --boot-disk-size=20GB \
-            --boot-disk-type=pd-balanced \
-            --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
-            --scopes=cloud-platform \
-            --tags=auth-broker-tee \
-            --shielded-secure-boot \
-            --shielded-vtpm \
-            --shielded-integrity-monitoring \
-            --metadata="tee-image-reference=${CANDIDATE_IMAGE_REF}@${CANDIDATE_IMAGE_DIGEST},tee-restart-policy=Always,tee-signed-image-repos=${CANDIDATE_IMAGE_REF}"
-          candidate_ip=$(gcloud compute instances describe "${CANDIDATE_VM_NAME}" \
+              --zone="$2" \
+              --machine-type=c3-standard-4 \
+              --confidential-compute-type=TDX \
+              --maintenance-policy=TERMINATE \
+              --image-family=confidential-space \
+              --image-project=confidential-space-images \
+              --boot-disk-size=20GB \
+              --boot-disk-type=pd-balanced \
+              --service-account="auth-broker-tee@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+              --scopes=cloud-platform \
+              --tags=auth-broker-tee,auth-broker-tee-replica \
+              --shielded-secure-boot \
+              --shielded-vtpm \
+              --shielded-integrity-monitoring \
+              --metadata="$3"
+          }
+          create "${PRIMARY_NAME}" us-west1-b \
+            "${base},tee-env-REPLICA_ROLE=primary,tee-env-REPLICA_PEER_URL=${CUSTODIAN_PEER_URL},tee-env-REPLICA_PEER_INSTANCE=${CUSTODIAN_NAME}"
+          create "${CUSTODIAN_NAME}" "${CUSTODIAN_ZONE}" \
+            "${base},tee-env-REPLICA_ROLE=custodian,tee-env-REPLICA_PEER_URL=${PRIMARY_PEER_URL},tee-env-REPLICA_PEER_INSTANCE=${PRIMARY_NAME}"
+          candidate_ip=$(gcloud compute instances describe "${PRIMARY_NAME}" \
             --project="${GCP_PROJECT_ID}" \
             --zone=us-west1-b \
             --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
           if [[ -z "${candidate_ip}" ]]; then
-            echo "::error::Candidate VM did not receive an external IP"
+            echo "::error::Successor replica ${PRIMARY_NAME} did not receive an external IP"
             exit 1
           fi
           echo "candidate_ip=${candidate_ip}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve candidate IP
-        id: candidate
+      - name: Sanity-check the successor candidate
         env:
-          PREPARED_CANDIDATE_IP: ${{ steps.activation-inputs.outputs.candidate_ip }}
-          MANAGED_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
-        run: |
-          candidate_ip="${PREPARED_CANDIDATE_IP:-${MANAGED_CANDIDATE_IP:-}}"
-          if [[ -z "${candidate_ip}" ]]; then
-            echo "::error::Unable to resolve candidate IP"
-            exit 1
-          fi
-          echo "ip=${candidate_ip}" >> "$GITHUB_OUTPUT"
-
-      - name: Request governance OIDC token for active TEE
-        id: governance-oidc
-        env:
-          AUDIENCE: https://oauth-tee.femled.ai/governance
-        run: |
-          token_json=$(curl -fsS \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}")
-          token=$(echo "${token_json}" | jq -r .value)
-          if [[ -z "${token}" || "${token}" == "null" ]]; then
-            echo "::error::Failed to mint GitHub OIDC token for TEE governance"
-            exit 1
-          fi
-          {
-            echo "token<<EOF"
-            echo "${token}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Sanity-check prepared candidate
-        env:
-          SUCCESSOR_CANDIDATE_IP: ${{ steps.candidate.outputs.ip }}
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
         run: |
           # Confidential Space VMs need 2-5 min to boot (cosign verify ->
@@ -766,33 +770,21 @@ jobs:
           echo "candidate reachable after ${attempt} attempts"
           curl -fsS --max-time 20 \
             --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
-            "https://oauth-tee.femled.ai/health"
-          curl -fsS --max-time 20 \
-            --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
             "https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json" \
             > candidate-governance.json
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';
-          const expected = process.env.CANDIDATE_IMAGE_DIGEST;
-          const doc = JSON.parse(fs.readFileSync('candidate-governance.json', 'utf8'));
-          const payload = doc.payload || {};
-          if (payload.status !== 'inactive') {
-            throw new Error(`candidate governance status must be inactive, got ${payload.status || 'missing'}`);
-          }
-          if (payload.imageDigest !== expected) {
-            throw new Error(`candidate imageDigest mismatch: expected ${expected}, got ${payload.imageDigest || 'missing'}`);
-          }
-          NODE
+          jq -e --arg digest "${CANDIDATE_IMAGE_DIGEST}" \
+            '.payload.status == "inactive" and .payload.imageDigest == $digest' candidate-governance.json >/dev/null \
+            || (echo "::error::candidate is not an inactive TEE on ${CANDIDATE_IMAGE_DIGEST}"; jq '.payload | {status, imageDigest}' candidate-governance.json; exit 1)
 
-      - name: Activate successor through current TEE
+      - name: Hand off from the predecessor
         env:
-          AUTH_BROKER_GOVERNANCE_OIDC_TOKEN: ${{ steps.governance-oidc.outputs.token }}
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
-          SUCCESSOR_CANDIDATE_IP: ${{ steps.candidate.outputs.ip }}
-          WORK_DIR: ${{ runner.temp }}/tee-successor-activation
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
         run: |
+          # Each governance call mints its own OIDC token (id-token: write).
           mkdir -p "${WORK_DIR}"
           node scripts/activate-successor.mjs \
+            --stage handoff \
             --candidate-ip "${SUCCESSOR_CANDIDATE_IP}" \
             --image-digest "${CANDIDATE_IMAGE_DIGEST}" \
             --workflow-run-id "${{ github.run_id }}" \
@@ -802,29 +794,152 @@ jobs:
           cp activation-report.json "${WORK_DIR}/activation-report.json"
           cat activation-report.json
 
-      - name: Cleanup failed managed candidate before activation-complete
-        if: failure() && steps.activation-inputs.outputs.mode == 'managed'
+      - name: Wait for the successor custodian to take custody
+        env:
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
+          CUSTODIAN_NAME: ${{ steps.activation-inputs.outputs.custodian_name }}
+        run: |
+          deadline=$(( $(date +%s) + 900 ))
+          while [[ $(date +%s) -lt ${deadline} ]]; do
+            curl -sS --max-time 15 --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
+              https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json > successor-governance.json || true
+            if jq -e --arg custodian "${CUSTODIAN_NAME}" \
+                '.payload.status == "active" and .payload.replica.peer.instanceName == $custodian and .payload.replica.peer.role == "custodian"' \
+                successor-governance.json >/dev/null 2>&1; then
+              jq '.payload | {status, epoch, replica}' successor-governance.json
+              exit 0
+            fi
+            echo "Successor custodian has not taken custody yet; sleeping 15s"
+            sleep 15
+          done
+          echo "::error::${CUSTODIAN_NAME} did not take custody in time"
+          exit 1
+
+      - name: Move the reserved address to the successor
+        id: move-address
+        env:
+          PRIMARY_NAME: ${{ steps.activation-inputs.outputs.primary_name }}
+          CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
+          PREDECESSOR_NAME: ${{ steps.predecessor.outputs.name }}
+          PREDECESSOR_ZONE: ${{ steps.predecessor.outputs.zone }}
+        run: |
+          bash scripts/move-reserved-ip.sh --to "${PRIMARY_NAME}" --to-zone us-west1-b --expect-digest "${CANDIDATE_IMAGE_DIGEST}"
+          predecessor_ip=$(gcloud compute instances describe "${PREDECESSOR_NAME}" --project="${GCP_PROJECT_ID}" \
+            --zone="${PREDECESSOR_ZONE}" --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "predecessor_ip=${predecessor_ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize the handoff
+        env:
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
+          PREDECESSOR_IP: ${{ steps.move-address.outputs.predecessor_ip }}
+        run: |
+          node scripts/activate-successor.mjs \
+            --stage finalize \
+            --candidate-ip "${SUCCESSOR_CANDIDATE_IP}" \
+            --predecessor-ip "${PREDECESSOR_IP}" \
+            --work-dir "${WORK_DIR}"
+
+      - name: Delete the retired predecessor replicas
+        env:
+          PREDECESSOR_NAME: ${{ steps.predecessor.outputs.name }}
+          PREDECESSOR_ZONE: ${{ steps.predecessor.outputs.zone }}
+          PREDECESSOR_IP: ${{ steps.move-address.outputs.predecessor_ip }}
+        run: |
+          curl -fsS --max-time 15 --resolve "oauth-tee.femled.ai:443:${PREDECESSOR_IP}" \
+            https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json > predecessor-governance.json
+          jq -e '.payload.status == "retired"' predecessor-governance.json >/dev/null \
+            || (echo "::error::the predecessor does not report retired; keeping its replicas"; exit 1)
+          old_custodian=$(jq -r '.payload.replica.peer.instanceName // empty' predecessor-governance.json)
+          gcloud compute instances delete "${PREDECESSOR_NAME}" --project="${GCP_PROJECT_ID}" --zone="${PREDECESSOR_ZONE}" --quiet
+          if [[ -n "${old_custodian}" ]]; then
+            zone=$(gcloud compute instances list --project="${GCP_PROJECT_ID}" --filter="name=${old_custodian}" --format='value(zone.basename())')
+            if [[ -n "${zone}" ]]; then
+              gcloud compute instances delete "${old_custodian}" --project="${GCP_PROJECT_ID}" --zone="${zone}" --quiet
+            fi
+          fi
+
+      - name: Recover a failed handoff
+        if: failure()
         env:
           CANDIDATE_IMAGE_DIGEST: ${{ needs.build-and-sign.outputs.image_digest }}
-          CANDIDATE_VM_NAME: ${{ steps.activation-inputs.outputs.candidate_vm_name }}
-          WORK_DIR: ${{ runner.temp }}/tee-successor-activation
+          PRIMARY_NAME: ${{ steps.activation-inputs.outputs.primary_name }}
+          CUSTODIAN_NAME: ${{ steps.activation-inputs.outputs.custodian_name }}
+          CUSTODIAN_ZONE: ${{ steps.activation-inputs.outputs.custodian_zone }}
+          SUCCESSOR_CANDIDATE_IP: ${{ steps.create-candidate.outputs.candidate_ip }}
+          PREDECESSOR_NAME: ${{ steps.predecessor.outputs.name }}
+          PREDECESSOR_ZONE: ${{ steps.predecessor.outputs.zone }}
         run: |
-          if [[ -s "${WORK_DIR}/activation-complete-response.json" ]]; then
-            echo "activation-complete evidence exists; preserving candidate VM and IAM for manual apply/finalize recovery"
+          delete_successors() {
+            gcloud compute instances delete "${PRIMARY_NAME}" --project="${GCP_PROJECT_ID}" --zone=us-west1-b --quiet || true
+            gcloud compute instances delete "${CUSTODIAN_NAME}" --project="${GCP_PROJECT_ID}" --zone="${CUSTODIAN_ZONE}" --quiet || true
+          }
+          revoke_candidate_iam() {
+            node scripts/reconcile-candidate-resource-iam.mjs \
+              --operation revoke \
+              --candidate-image-digest "${CANDIDATE_IMAGE_DIGEST}" || true
+            gcloud run jobs execute auth-broker-candidate-role-reconciler \
+              --project="${GCP_PROJECT_ID}" \
+              --region=us-west1 \
+              --wait \
+              --update-env-vars="RECONCILE_OPERATION=revoke,CANDIDATE_IMAGE_DIGEST=${CANDIDATE_IMAGE_DIGEST}" || true
+          }
+          if [[ -z "${PRIMARY_NAME}" ]]; then
             exit 0
           fi
-          node scripts/reconcile-candidate-resource-iam.mjs \
-            --operation revoke \
-            --candidate-image-digest "${CANDIDATE_IMAGE_DIGEST}" || true
-          gcloud run jobs execute auth-broker-candidate-role-reconciler \
-            --project="${GCP_PROJECT_ID}" \
-            --region=us-west1 \
-            --wait \
-            --update-env-vars="RECONCILE_OPERATION=revoke,CANDIDATE_IMAGE_DIGEST=${CANDIDATE_IMAGE_DIGEST}" || true
-          gcloud compute instances delete "${CANDIDATE_VM_NAME}" \
-            --project="${GCP_PROJECT_ID}" \
-            --zone=us-west1-b \
-            --quiet || true
+          if [[ ! -s "${WORK_DIR}/activation-complete-response.json" ]]; then
+            echo "The predecessor never entered activating_successor; deleting the successor replicas"
+            delete_successors
+            revoke_candidate_iam
+            exit 0
+          fi
+          if ! jq -e '.activationProof' "${WORK_DIR}/activation-apply-response.json" >/dev/null 2>&1; then
+            echo "No apply response: asking the candidate to decline, then aborting at the predecessor"
+            if node scripts/activate-successor.mjs --stage abort --candidate-ip "${SUCCESSOR_CANDIDATE_IP}" --work-dir "${WORK_DIR}"; then
+              delete_successors
+              revoke_candidate_iam
+              exit 0
+            fi
+            # A candidate that refuses to decline may have applied with its
+            # reply lost: it is then the successor and must not be deleted.
+            status=$(curl -sS --max-time 15 --resolve "oauth-tee.femled.ai:443:${SUCCESSOR_CANDIDATE_IP}" \
+              https://oauth-tee.femled.ai/.well-known/femled-tee-governance.json 2>/dev/null | jq -r '.payload.status' 2>/dev/null || true)
+            if [[ "${status}" == "active" ]]; then
+              {
+                echo "## Successor applied; handoff not finished"
+                echo ""
+                echo "The successor \`${PRIMARY_NAME}\` is active (its apply reply was lost) and the predecessor \`${PREDECESSOR_NAME}\` is still activating_successor and serving."
+                echo "Nothing was deleted. Move the reserved address with \`bash scripts/move-reserved-ip.sh --to ${PRIMARY_NAME} --to-zone us-west1-b --expect-digest ${CANDIDATE_IMAGE_DIGEST}\`, then run successor-recovery.yml (stage finalize, candidate_ip ${SUCCESSOR_CANDIDATE_IP}) with this run's id; the successor serves its proof again."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            # Without a decline, delete the candidate (its key goes with it),
+            # wait until the pending certificate has expired plus the grace,
+            # then abort on expiry. An expired certificate can no longer be applied.
+            delete_successors
+            expires_at=$(jq -r '.successorCertificate.payload.expiresAt' "${WORK_DIR}/activation-complete-response.json")
+            wait_s=$(( $(date -d "${expires_at}" +%s) + 5 * 60 + 30 - $(date +%s) ))
+            if (( wait_s > 0 )); then sleep "${wait_s}"; fi
+            node scripts/activate-successor.mjs --stage abort --expired --work-dir "${WORK_DIR}"
+            revoke_candidate_iam
+            exit 0
+          fi
+          holder=$(gcloud compute addresses describe auth-broker-tee-oauth-ip \
+            --project="${GCP_PROJECT_ID}" --region=us-west1 --format='value(users[0])')
+          if [[ "${holder##*/}" == "${PRIMARY_NAME}" ]]; then
+            echo "The successor applied and holds the address: finalizing late"
+            predecessor_ip=$(gcloud compute instances describe "${PREDECESSOR_NAME}" --project="${GCP_PROJECT_ID}" \
+              --zone="${PREDECESSOR_ZONE}" --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+            node scripts/activate-successor.mjs --stage finalize --candidate-ip "${SUCCESSOR_CANDIDATE_IP}" \
+              --predecessor-ip "${predecessor_ip}" --work-dir "${WORK_DIR}"
+            exit 0
+          fi
+          {
+            echo "## Successor applied; handoff not finished"
+            echo ""
+            echo "The successor \`${PRIMARY_NAME}\` is active and the predecessor \`${PREDECESSOR_NAME}\` is still activating_successor and serving."
+            echo "Nothing was deleted. Move the reserved address with \`bash scripts/move-reserved-ip.sh --to ${PRIMARY_NAME} --to-zone us-west1-b --expect-digest ${CANDIDATE_IMAGE_DIGEST}\`, then run successor-recovery.yml (stage finalize) with this run's id."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       - name: Upload successor activation evidence
         if: always()
@@ -834,6 +949,8 @@ jobs:
           path: |
             ${{ runner.temp }}/tee-successor-activation/
             candidate-governance.json
+            successor-governance.json
+            predecessor-governance.json
             activation-report.json
           if-no-files-found: ignore
           retention-days: 90
