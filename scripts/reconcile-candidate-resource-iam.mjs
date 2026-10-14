@@ -28,30 +28,27 @@ export const SECRET_VERSION_ADDER_SECRETS = Object.freeze([
 ]);
 
 // TLS is ephemeral: a candidate mints its own in-enclave cert at boot, so it
-// needs NO TLS-sealing KMS unwrap and NO TLS-capsule object grant (there is no
-// capsule). Plaintext TLS keys are never stored in Secret Manager or GCS. The
-// governance state capsule bucket is still shared for genesis-only grants
-// (governance capsules + latest-pointer).
+// needs NO TLS-sealing KMS unwrap and NO TLS-capsule object grant. Plaintext
+// TLS keys are never stored in Secret Manager or GCS. The bucket that held the
+// retired governance capsules still holds the non-secret TLS mint ledger.
 export const CAPSULE_BUCKET = "prod-femled-couple-router-auth-broker-tee-governance-capsules";
+export const TLS_MINT_LOG_OBJECT = "tls/mint-log.v1.json";
 
-// Genesis-only resources. A SUCCESSOR candidate receives its governance key and
-// transferred state in-enclave and carries its TLS cert over, so it needs none
-// of these at candidate stage. A self-attested GENESIS mints everything fresh:
-// it signs its own genesis certificate (governance-signer), mints its first TLS
-// cert via DNS-01 (renewer-governance-signer), and writes its first state
-// capsule + latest-pointer to the capsule bucket. These mirror the Terraform
-// `*_candidates` resources and are only granted with --genesis.
+// Retired: governance is signed in enclave memory, so no candidate is granted
+// the KMS governance signer or the governance capsule objects. The names stay
+// exported so cleanup can strip bindings left by earlier images.
 export const GOVERNANCE_SIGNER_KMS_KEY = Object.freeze({
   keyRing: "auth-broker-governance",
   key: "governance-signer",
   location: "us-west1",
 });
+export const CAPSULE_POINTER_OBJECT = "capsules/latest-pointer.json";
+
 export const RENEWER_SIGNER_KMS_KEY = Object.freeze({
   keyRing: "auth-broker-acme-renewer",
   key: "renewer-governance-signer",
   location: "us-west1",
 });
-export const CAPSULE_POINTER_OBJECT = "capsules/latest-pointer.json";
 
 const VALID_OPERATIONS = new Set(["grant", "revoke"]);
 
@@ -145,18 +142,28 @@ export function buildIamOperations({ operation, candidateImageDigest, genesis = 
     },
     // Ephemeral TLS: EVERY candidate (successor or genesis) mints its own
     // in-enclave cert at boot, so it needs the renewer-governance-signer to sign
-    // the DNS-01 renewer envelope to authoritative-dns-tee. (Under the old
-    // sealed-TLS model a successor carried the cert over and needed no signer at
-    // boot; that carry-over is gone.) Governance-signer + capsule bucket writes
-    // remain genesis-only -- a successor receives its governance identity/state
-    // through the predecessor-signed activation bundle, not by minting genesis.
+    // the DNS-01 renewer envelope to authoritative-dns-tee, and write access to
+    // the non-secret mint ledger that keeps reboots under the Let's Encrypt limit.
     kmsKeyGrant(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier", secretCommand, member),
     kmsKeyGrant(RENEWER_SIGNER_KMS_KEY, "roles/cloudkms.viewer", secretCommand, member),
+    {
+      kind: "bucket",
+      resource: `${CAPSULE_BUCKET}/${TLS_MINT_LOG_OBJECT}`,
+      role: "roles/storage.objectAdmin",
+      command: [
+        "storage", "buckets", secretCommand, `gs://${CAPSULE_BUCKET}`,
+        `--member=${member}`,
+        "--role=roles/storage.objectAdmin",
+        `--condition=expression=resource.name.endsWith("/objects/${TLS_MINT_LOG_OBJECT}"),title=TLS mint ledger object only (candidate)`,
+        "--quiet",
+      ],
+    },
   ];
 
-  if (genesis) {
-    operations.push(...genesisOnlyOperations({ command: secretCommand, member }));
-  }
+  // A genesis candidate needs nothing more than a successor: both sign
+  // governance with a key generated in their own enclave. --genesis is accepted
+  // so existing callers keep working.
+  void genesis;
   return operations;
 }
 
@@ -178,45 +185,6 @@ function kmsKeyGrant(keySpec, role, command, member) {
   };
 }
 
-// Bindings a self-attested GENESIS needs that a SUCCESSOR does not: sign its own
-// genesis cert (governance-signer) and write its first state capsule +
-// latest-pointer to the capsule bucket. (The renewer-governance-signer needed to
-// mint TLS at boot is granted to ALL candidates in the base set now that TLS is
-// ephemeral, so it is not repeated here.) Mirrors the Terraform `*_candidates`
-// resources. Granted only with --genesis; revoked after promotion.
-function genesisOnlyOperations({ command, member }) {
-  const bucketRole = (role) => ({
-    kind: "bucket",
-    resource: CAPSULE_BUCKET,
-    role,
-    command: [
-      "storage", "buckets", command, `gs://${CAPSULE_BUCKET}`,
-      `--member=${member}`,
-      `--role=${role}`,
-      "--condition=None",
-      "--quiet",
-    ],
-  });
-  return [
-    kmsKeyGrant(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.signerVerifier", command, member),
-    kmsKeyGrant(GOVERNANCE_SIGNER_KMS_KEY, "roles/cloudkms.viewer", command, member),
-    bucketRole("roles/storage.objectViewer"),
-    bucketRole("roles/storage.objectCreator"),
-    {
-      kind: "bucket",
-      resource: `${CAPSULE_BUCKET}/${CAPSULE_POINTER_OBJECT}`,
-      role: "roles/storage.objectAdmin",
-      command: [
-        "storage", "buckets", command, `gs://${CAPSULE_BUCKET}`,
-        `--member=${member}`,
-        "--role=roles/storage.objectAdmin",
-        `--condition=expression=resource.name.endsWith("/objects/${CAPSULE_POINTER_OBJECT}"),title=Latest pointer object only (candidate)`,
-        "--quiet",
-      ],
-    },
-  ];
-}
-
 export function isSha256Digest(value) {
   return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
 }
@@ -230,7 +198,7 @@ function runGcloud(args) {
 
 function usage() {
   return `Usage: node scripts/reconcile-candidate-resource-iam.mjs --operation <grant|revoke> --candidate-image-digest <sha256:digest> [--dry-run] [--genesis]
-  --genesis  also grant/revoke the genesis-only bindings (governance-signer + renewer-signer signerVerifier/viewer, capsule reader/writer/latest-pointer). Required for a self-attested operator genesis; omit for successor candidates.`;
+  --genesis  accepted for compatibility; a genesis candidate gets the same bindings as a successor (no governance key or capsule access).`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

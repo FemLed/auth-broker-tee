@@ -88,10 +88,8 @@ export function startAttestationRefreshLoop({ onTick } = {}) {
       recordAttestationRefresh({ status: "failed", reason: err.message });
       console.error("[Attestation] Background refresh failed:", err.message);
     }
-    // Optional governance-restore retry hook (injected by server.js). Runs on
-    // this existing periodic cadence so a boot-time KMS outage that left
-    // governance inactive self-heals without operator action. Isolated from the
-    // attestation refresh above: a failure here never affects attestation.
+    // Optional hook on the same cadence; a failure here never affects the
+    // cached attestation token.
     if (onTick) {
       try {
         await onTick();

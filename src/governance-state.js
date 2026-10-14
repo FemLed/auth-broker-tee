@@ -1,26 +1,8 @@
 import { canonicalStringify, publicKeyFingerprint, sha256Digest } from "./canonical-json.js";
-import { getAttestedImageDigest, getAttestedImageReference, getLauncherAttestationClaims, getProjectId, getWifAccessToken } from "./gcp-auth.js";
+import { getAttestedImageDigest, getAttestedImageReference, getLauncherAttestationClaims, getWifAccessToken } from "./gcp-auth.js";
 import { requestAttestationToken } from "./attestation.js";
 import { getRouteRegistryStatus } from "./route-registry.js";
 import { createInMemoryGovernanceKeyMaterial, buildActivationNonce, verifyGovernanceEnvelope } from "./governance-crypto.js";
-import {
-  createKmsBackedGovernanceKeyMaterial,
-  isKmsGovernanceKeyConfigured,
-} from "./kms-governance-key.js";
-import {
-  buildLatestPointer,
-  isCapsulePersistenceConfigured,
-  listCapsuleObjects,
-  readLatestPointer,
-  readStateCapsule,
-  writeLatestPointer,
-  writeStateCapsule,
-} from "./capsule-store.js";
-import {
-  buildStateCapsuleAad,
-  createEncryptedStateCapsule,
-  decryptStateCapsule,
-} from "./state-capsule.js";
 import {
   ACTIVATION_PROOF_SCHEMA,
   assertPreapprovalMatchesCandidate,
@@ -69,28 +51,6 @@ const TRUSTED_GENESIS_REVIEWER_IMAGE_DIGESTS = new Set([
 ]);
 
 let state = null;
-let capsuleSerial = 0;
-let capsuleRestoreAttempted = false;
-// Anti-rollback: capsuleSerial is a monotonic counter bound into each capsule's
-// KMS-witness-signed AAD. On cold start we restore the highest AUTHENTIC serial
-// in the bucket (not the mutable latest-pointer). `capsuleSerialBaselineEstablished`
-// ensures the FIRST persist of a fresh genesis / operator re-genesis seeds the
-// counter ABOVE any abandoned lineage's serials so it strictly supersedes them.
-let capsuleSerialBaselineEstablished = false;
-// Wall-clock of the last successful capsule persist, so the periodic heartbeat
-// re-seals a fresh (higher-serial) capsule during quiet periods and the true
-// head never ages out of the bucket's retention window.
-let lastCapsulePersistAt = null;
-// Cap on capsules verified during a cold-start scan. Honest operation keeps far
-// fewer than this within the retention window; a larger count only arises from
-// a hostile bucket owner flooding decoys (an availability non-goal).
-const MAX_CAPSULES_SCANNED = 4096;
-// Set when KMS-backed governance key initialization failed at boot. We fail
-// closed (stay inactive; never activate or restore with an in-memory key) and
-// let retryGovernanceRestoreIfDegraded() re-attempt KMS init + capsule restore
-// on the refresh loop, so a transient KMS outage self-heals without operator
-// intervention or a re-genesis.
-let kmsUnavailable = false;
 
 export function initializeGovernance({ mode = "inactive", keyMaterial: providedKeyMaterial = null, now = new Date() } = {}) {
   if (state) return state;
@@ -153,92 +113,16 @@ export function initializeGovernance({ mode = "inactive", keyMaterial: providedK
   return state;
 }
 
-// Async initialization for production cold start.
-//
-// If GOVERNANCE_KMS_SIGNER_KEY_VERSION is set, the running TEE binds its
-// governance signing identity to a Cloud KMS keyVersion gated by the WIF
-// principal that is itself gated by the running container image digest.
-// That makes the signing key portable across restarts of the same image,
-// which is the precondition for restoring a sealed governance state
-// capsule on cold start without inventing operator-driven recovery.
-//
-// Restore path (only when CAPSULE_BUCKET + GOVERNANCE_KMS_SIGNER_KEY_VERSION
-// are both configured AND the latest capsule's AAD matches the running
-// image + KMS key + state shape): restore lineage / epoch / transferredState
-// / latestPreapproval / latestSuccessorCertificate / latestRetirementCertificate
-// from the capsule and return `state.status === ACTIVE` directly. The
-// running TEE skips genesis-bootstrap and tenant re-admission entirely.
-//
-// Anything that fails the integrity gates falls through to the standard
-// `inactive` init. Recovery from that point is the standard
-// genesis-bootstrap path against a trusted-reviewer TEE; there is no
-// env-gated escape hatch.
-export async function initializeGovernanceAsync({ mode = "inactive", keyMaterial: providedKeyMaterial = null, now = new Date(), createKeyMaterial = createKmsBackedGovernanceKeyMaterial } = {}) {
+// Production cold start. The governance key is generated in this process and
+// has no at-rest form, so a fresh boot is inactive until genesis, successor
+// activation, or custody from a live replica of the same lineage.
+export async function initializeGovernanceAsync({ mode = "inactive", keyMaterial = null, now = new Date() } = {}) {
   if (state) return state;
-  let keyMaterial = providedKeyMaterial;
-  if (!keyMaterial && isKmsGovernanceKeyConfigured()) {
-    try {
-      keyMaterial = await createKeyMaterial();
-      kmsUnavailable = false;
-    } catch (error) {
-      // FAIL CLOSED: do NOT silently fall back to an in-memory governance key.
-      // An in-memory key is not recoverable across restarts and is not the
-      // attested KMS-bound key, so activating or restoring with it yields a
-      // lineage that can never self-restore (the root cause of the inactive
-      // broker incident). Instead keep an inactive in-memory shell so /health,
-      // /attestation, and the governance manifest still serve, mark KMS
-      // unavailable, and skip restore. retryGovernanceRestoreIfDegraded()
-      // re-attempts KMS init + capsule restore until Cloud KMS recovers.
-      console.error("[governance] CRITICAL: KMS-backed governance key init failed; staying INACTIVE (no in-memory activation or restore) and will retry:", error.message);
-      kmsUnavailable = true;
-      keyMaterial = null;
-    }
-  }
-  // If genesis was requested AND we picked a KMS-backed key material
-  // (whose sign is async), use the async-aware init path: synthesize
-  // the genesis cert through the same signGenesisCertificate flow but
-  // await the Promise it returns.
-  if (mode === "genesis" && keyMaterial?.kind === "kms-backed") {
-    initializeGovernance({ mode: "inactive", keyMaterial, now });
-    const current = getGovernanceState();
-    const genesisCertificate = await signGenesisCertificate({
-      keyMaterial,
-      imageDigest: current.imageDigest,
-      routeRegistryStatus: getRouteRegistryStatus(),
-      attestationDigest: digestLauncherAttestation(),
-      now,
-    });
-    current.status = ACTIVE;
-    current.epoch = 1;
-    current.lineage = [genesisCertificate];
-    await persistGovernanceCapsuleBestEffort({ now });
-    return state;
-  }
-  initializeGovernance({ mode, keyMaterial, now });
-  if (state.status === INACTIVE && mode === "inactive" && isCapsulePersistenceConfigured() && state.keyMaterial.kind === "kms-backed") {
-    try {
-      await tryRestoreGovernanceFromCapsule({ now });
-    } catch (error) {
-      console.error("[governance] capsule restore attempt failed; remaining inactive:", error.message);
-    }
-  }
-  return state;
+  return initializeGovernance({ mode, keyMaterial, now });
 }
 
 export function resetGovernanceForTests(nextState = null) {
   state = nextState;
-  capsuleSerial = 0;
-  capsuleRestoreAttempted = false;
-  capsuleSerialBaselineEstablished = false;
-  lastCapsulePersistAt = null;
-  kmsUnavailable = false;
-}
-
-// The highest authentic capsule serial restored/persisted this process. Surfaced
-// on /health so an external probe can alert on an unexpected regression (a
-// rollback attempt refused, or a stuck heartbeat).
-export function getCapsuleSerial() {
-  return capsuleSerial;
 }
 
 export function getGovernanceState() {
@@ -314,18 +198,16 @@ export async function issuePreapprovalCertificate({
   });
   current.latestPreapproval = envelope;
   recordPreapproval({ status: "issued", candidateDigest: candidate.candidateImageDigest });
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
   return envelope;
 }
 
-// In production the active governance key MUST be the KMS-backed, attested,
-// restorable key. Refuse genesis / successor activation with an in-memory key:
-// an in-memory key is lost on restart and yields a lineage that can never
-// self-restore from the capsule (the root cause of the avoidable re-genesis).
-// Dev/test (NODE_ENV != production) may still use in-memory key material.
-function assertKmsBackedGovernanceKeyInProduction(current) {
-  if (process.env.NODE_ENV === "production" && current.keyMaterial.kind !== "kms-backed") {
-    throw new Error("refusing to establish active governance with non-KMS-backed key material in production");
+// Active governance must sign with key material generated inside this enclave.
+// A signer held outside it (a Cloud KMS key) can be used directly by whoever
+// administers the project, so production refuses to establish governance on one.
+function assertEnclaveGovernanceKeyInProduction(current) {
+  if (process.env.NODE_ENV === "production" && current.keyMaterial.kind !== "in-memory") {
+    throw new Error("refusing to establish active governance with key material held outside the enclave");
   }
 }
 
@@ -340,7 +222,7 @@ export async function bootstrapGenesisFromAttestedApproval({
   if (current.status !== INACTIVE || current.lineage.length > 0) {
     throw new Error("genesis bootstrap requires inactive governance with empty lineage");
   }
-  assertKmsBackedGovernanceKeyInProduction(current);
+  assertEnclaveGovernanceKeyInProduction(current);
   const expectedTarget = targetImageDigest || current.imageDigest;
   if (expectedTarget !== current.imageDigest) {
     throw new Error("genesis bootstrap target image digest must match the running TEE image");
@@ -449,7 +331,7 @@ export async function bootstrapGenesisFromAttestedApproval({
   current.status = ACTIVE;
   current.epoch = 1;
   current.lineage = [genesisCertificate];
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
 
   return buildGovernanceManifestPayload();
 }
@@ -506,7 +388,7 @@ export async function issueTenantAdmissionCertificate({
     ...(ttlMs ? { ttlMs } : {}),
   });
   recordTenantAdmissionInState(envelope.payload, envelope.payloadDigest);
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
   return envelope;
 }
 
@@ -587,7 +469,7 @@ export async function completeActivation({
 }) {
   assertActiveGovernance();
   const current = getGovernanceState();
-  assertKmsBackedGovernanceKeyInProduction(current);
+  assertEnclaveGovernanceKeyInProduction(current);
   let challenge;
   let preapproval;
   let attestation;
@@ -705,7 +587,7 @@ export async function completeActivation({
     expiresAt: successorCertificate.payload.expiresAt,
   };
   current.latestSuccessorCertificate = successorCertificate;
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
 
   return {
     successorCertificate,
@@ -728,7 +610,7 @@ export async function completeActivation({
 export async function applyActivationBundle({ successorCertificate, encryptedState, predecessorActivationPublicKeyPem, activationNonce, now = new Date() }) {
   const current = getGovernanceState();
   if (current.status !== INACTIVE) throw new Error("activation bundle can only be applied to inactive candidate");
-  assertKmsBackedGovernanceKeyInProduction(current);
+  assertEnclaveGovernanceKeyInProduction(current);
   if (successorCertificate?.payload?.schema !== SUCCESSOR_SCHEMA) {
     throw new Error("activation bundle successor certificate missing");
   }
@@ -784,7 +666,7 @@ export async function applyActivationBundle({ successorCertificate, encryptedSta
     lineageDigest,
     now,
   });
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
 
   return {
     ...buildGovernanceManifestPayload(),
@@ -834,7 +716,7 @@ export async function finalizeActivation({ activationProof, now = new Date() } =
   current.pendingSuccessorActivation = null;
   recordActivation({ status: "success", candidateDigest: pending.candidateImageDigest });
   recordRetirement({ successorDigest: pending.successorPayloadDigest });
-  await persistGovernanceCapsuleBestEffort();
+  notifyGovernanceStateChanged();
   return {
     status: "retired",
     successorCertificate: pending.successorCertificate,
@@ -1125,316 +1007,22 @@ function normalizeSuccessorArbitrationResult(result) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Governance state capsule persistence (KMS-sealed, GCS-backed)
-//
-// Every mutation that issues a lineage cert or updates routePolicy ends with
-// `await persistGovernanceCapsuleBestEffort()`. The capsule write is best-
-// effort because the call path is on a request-handling hot path; a transient
-// GCS error must not roll back a signed certificate that is already in
-// `current.lineage`. The next mutation re-attempts, and on cold start any
-// inconsistency surfaces as "capsule does not match running image" and we
-// fall back to inactive rather than restoring a stale state.
-//
-// The persistable subset deliberately excludes:
-//   - `keyMaterial` (governance signing key lives in KMS by reference; the
-//     X25519 activation key is per-handoff and regenerated on cold start)
-//   - `pendingActivationChallenges` (transient HTTP nonces with 30s TTL)
-//   - `selfHealingProposals` (rebuildable from monitor evidence)
-//   - `modelPolicySupervisor` (rebuildable from supervisor scans)
-//   - `pendingSuccessorActivation` (only meaningful inside the predecessor
-//     between activation-complete and activation-finalize; if the VM
-//     restarts mid-handoff, the candidate has already received its capsule
-//     out-of-band and the predecessor stays retired-via-cert-only)
-// ---------------------------------------------------------------------------
+// Governance state lives only in this process. Every mutation that issues a
+// lineage certificate or changes the route policy notifies listeners, which is
+// how a replica's custodian is kept current without any at-rest copy.
+const governanceStateListeners = new Set();
 
-const PERSISTABLE_STATE_SCHEMA = "femled.auth_broker_tee.governance.persistable_state.v1";
-
-export function buildPersistableState(current = getGovernanceState()) {
-  return {
-    schema: PERSISTABLE_STATE_SCHEMA,
-    status: current.status,
-    epoch: current.epoch,
-    imageDigest: current.imageDigest,
-    governanceKeyId: current.keyMaterial.governanceKeyId,
-    governancePublicKeyPem: current.keyMaterial.governancePublicKeyPem,
-    governanceKmsKeyVersion: current.keyMaterial.kmsKeyVersion || null,
-    lineage: current.lineage,
-    latestPreapproval: current.latestPreapproval,
-    latestSuccessorCertificate: current.latestSuccessorCertificate,
-    latestRetirementCertificate: current.latestRetirementCertificate,
-    transferredState: current.transferredState,
-  };
+export function onGovernanceStateChange(listener) {
+  governanceStateListeners.add(listener);
+  return () => governanceStateListeners.delete(listener);
 }
 
-export function isGovernancePersistenceEnabled() {
-  if (!isCapsulePersistenceConfigured()) return false;
-  const current = state || null;
-  if (!current) return false;
-  return current.keyMaterial.kind === "kms-backed";
-}
-
-export async function persistGovernanceCapsuleBestEffort({ now = new Date() } = {}) {
-  if (!isGovernancePersistenceEnabled()) return null;
-  try {
-    return await persistGovernanceCapsule({ now });
-  } catch (error) {
-    console.error("[governance] capsule persist failed (best-effort):", error.message);
-    return null;
-  }
-}
-
-export async function persistGovernanceCapsule({ now = new Date() } = {}) {
-  const current = getGovernanceState();
-  if (current.keyMaterial.kind !== "kms-backed") {
-    throw new Error("capsule persistence requires KMS-backed governance key material");
-  }
-  if (!isCapsulePersistenceConfigured()) {
-    throw new Error("CAPSULE_BUCKET and GOVERNANCE_KMS_SIGNER_KEY_VERSION must both be configured");
-  }
-  if (!capsuleSerialBaselineEstablished) {
-    // First persist of this process without a prior restore (a fresh genesis or
-    // an operator re-genesis on the same image + KMS key). Seed the serial ABOVE
-    // the highest authentic serial already in the bucket so this lineage
-    // strictly supersedes any abandoned one -- otherwise "highest serial wins"
-    // on the next cold boot could resurrect the abandoned lineage's
-    // higher-serial capsules (they share this KMS key, so they pass the
-    // active-key gate too).
-    const bucketMax = await maxVerifiedCapsuleSerial({ now, current });
-    if (bucketMax > capsuleSerial) capsuleSerial = bucketMax;
-    capsuleSerialBaselineEstablished = true;
-  }
-  capsuleSerial += 1;
-  const persistableState = buildPersistableState(current);
-  const transferredStateDigest = sha256Digest(canonicalStringify(current.transferredState));
-  const lineageDigest = sha256Digest(canonicalStringify(current.lineage));
-  const governancePublicKeyDigest = `sha256:${publicKeyFingerprint(current.keyMaterial.governancePublicKeyPem)}`;
-  const aad = buildStateCapsuleAad({
-    imageDigest: current.imageDigest,
-    imageReference: readCurrentImageReference() || `image-digest:${current.imageDigest}`,
-    governanceKmsKeyVersion: current.keyMaterial.kmsKeyVersion,
-    governancePublicKeyDigest,
-    lineageDigest,
-    epoch: current.epoch,
-    transferredStateDigest,
-    status: current.status,
-    gcpProjectId: getProjectId(),
-    capsuleSerial,
-  });
-  const kmsPublicKeyPem = await current.keyMaterial.getKmsPublicKeyPem();
-  const capsule = await createEncryptedStateCapsule({
-    persistableState,
-    aad,
-    kmsSign: (buffer) => current.keyMaterial.signWithKms(buffer),
-    kmsPublicKeyPem,
-    now,
-  });
-  await writeStateCapsule(capsule);
-  await writeLatestPointer(buildLatestPointer({
-    capsuleDigest: capsule.capsuleDigest,
-    imageDigest: current.imageDigest,
-    governanceKmsKeyVersion: current.keyMaterial.kmsKeyVersion,
-    epoch: current.epoch,
-    status: current.status,
-    capsuleSerial,
-    lineageDigest,
-    now,
-  }));
-  lastCapsulePersistAt = now;
-  return { capsuleDigest: capsule.capsuleDigest, capsuleSerial };
-}
-
-// Anti-rollback restore. Rather than trusting the mutable latest-pointer (which
-// a bucket-write attacker can rewind to an older capsule), we ENUMERATE every
-// capsule the bucket holds, keep only those that are AUTHENTIC (KMS-witness
-// signed) and bind to this running image + KMS key + governance public key with
-// a valid predecessor-signed lineage whose ACTIVE key is our KMS key, and
-// restore the one with the highest authentic capsuleSerial. The serial lives in
-// the witness-signed AAD so it cannot be forged upward; the bucket's locked
-// retention policy forbids deleting the real head; therefore the maximum
-// authentic serial is the true latest state and cannot be rolled back short of
-// forging a KMS witness signature or removing a Google-enforced retention lock.
-export async function tryRestoreGovernanceFromCapsule({ now = new Date() } = {}) {
-  if (capsuleRestoreAttempted) return null;
-  capsuleRestoreAttempted = true;
-  const current = getGovernanceState();
-  if (current.status !== INACTIVE || current.lineage.length > 0) {
-    return null;
-  }
-  if (current.keyMaterial.kind !== "kms-backed") {
-    return null;
-  }
-
-  const verified = await scanVerifiedCapsules({ now, current });
-  if (verified.length === 0) {
-    console.info("[governance] capsule restore: no authentic capsule for this image + KMS key in the bucket; starting inactive");
-    return null;
-  }
-  // Highest authentic serial = true head (retention lock forbids deleting it).
-  const winner = verified[0];
-  const persistableState = winner.persistableState;
-
-  // Observability: a latest-pointer naming a strictly-lower serial than the true
-  // head is the fingerprint of a rollback attempt (or a lagged pointer write).
-  try {
-    const pointer = await readLatestPointer();
-    if (pointer && Number.isInteger(pointer.capsuleSerial) && pointer.capsuleSerial < winner.serial) {
-      console.warn(`[governance] capsule restore: latest-pointer names serial ${pointer.capsuleSerial} but the highest authentic capsule is serial ${winner.serial}; ignoring the pointer (possible rollback attempt or lagged write)`);
-    }
-  } catch (error) {
-    console.warn("[governance] capsule restore: latest-pointer read failed (non-fatal; pointer is advisory):", error.message);
-  }
-
-  current.status = persistableState.status === "retired" ? RETIRED
-    : persistableState.status === "activating_successor" ? ACTIVATING_SUCCESSOR
-    : ACTIVE;
-  current.epoch = persistableState.epoch;
-  current.lineage = persistableState.lineage;
-  current.latestPreapproval = persistableState.latestPreapproval || null;
-  current.latestSuccessorCertificate = persistableState.latestSuccessorCertificate || null;
-  current.latestRetirementCertificate = persistableState.latestRetirementCertificate || null;
-  current.transferredState = persistableState.transferredState || {
-    schema: "femled.tee.governance.transferred_state.v1",
-    routePolicy: emptyRoutePolicyState(),
-  };
-  capsuleSerial = winner.serial;
-  capsuleSerialBaselineEstablished = true;
-  console.info(`[governance] capsule restore: restored ${current.status} governance at epoch ${current.epoch} from capsule serial ${winner.serial} (${winner.capsuleDigest}); ${verified.length} authentic capsule(s) considered`);
-
-  return {
-    restored: true,
-    capsuleDigest: winner.capsuleDigest,
-    status: current.status,
-    epoch: current.epoch,
-    capsuleSerial: winner.serial,
-  };
-}
-
-// Enumerate the bucket and return every AUTHENTIC, restorable capsule with its
-// witness-signed serial + decrypted state, sorted by serial descending. A
-// capsule qualifies only if it decrypts under our KMS public key (proving the
-// TEE itself sealed it) AND binds to this image + KMS key version + governance
-// public key AND carries a valid predecessor-signed lineage whose active key is
-// our KMS-bound key. The mutable latest-pointer is deliberately NOT consulted.
-async function scanVerifiedCapsules({ now, current }) {
-  let digests;
-  try {
-    digests = await listCapsuleObjects();
-  } catch (error) {
-    console.error("[governance] capsule restore: bucket enumeration failed:", error.message);
-    return [];
-  }
-  if (digests.length > MAX_CAPSULES_SCANNED) {
-    console.warn(`[governance] capsule restore: bucket holds ${digests.length} capsule objects (> ${MAX_CAPSULES_SCANNED}); scanning the first ${MAX_CAPSULES_SCANNED} (possible decoy flood by a hostile bucket owner)`);
-    digests = digests.slice(0, MAX_CAPSULES_SCANNED);
-  }
-  const kmsPublicKeyPem = await current.keyMaterial.getKmsPublicKeyPem();
-  const verified = [];
-  for (const capsuleDigest of digests) {
-    let capsule;
+function notifyGovernanceStateChanged() {
+  for (const listener of governanceStateListeners) {
     try {
-      capsule = await readStateCapsule(capsuleDigest);
+      listener(getGovernanceState());
     } catch (error) {
-      console.warn(`[governance] capsule restore: skipping unreadable capsule ${capsuleDigest}: ${error.message}`);
-      continue;
+      console.error("[governance] state-change listener failed:", error.message);
     }
-    let persistableState;
-    try {
-      // Verifies the KMS witness signature over the AAD + the AES-GCM auth tag.
-      // A forged or tampered capsule (or one sealed under a different key) fails
-      // here and is skipped -- the bucket is untrusted.
-      persistableState = decryptStateCapsule({ capsule, kmsPublicKeyPem });
-    } catch {
-      continue;
-    }
-    const serial = capsule?.aad?.capsuleSerial;
-    if (!Number.isInteger(serial) || serial < 0) continue;
-    if (!isRestorableGovernanceState({ persistableState, current, now })) continue;
-    verified.push({ capsuleDigest, serial, persistableState });
   }
-  verified.sort((a, b) => b.serial - a.serial);
-  return verified;
-}
-
-// True when a decrypted capsule state binds to this running image + KMS key +
-// governance public key AND its lineage verifies with the ACTIVE key equal to
-// our KMS-bound key. We check the lineage's ACTIVE key (verifyLineage's
-// currentGovernancePublicKeyPem), NOT the lineage TAIL's signingKeyId: a
-// successor certificate is signed by the PREDECESSOR and only NAMES the new
-// active key, so once the broker has activated past genesis the tail signer is
-// never the current key (checking it falsely refused every legitimate
-// successor-activated state).
-function isRestorableGovernanceState({ persistableState, current, now }) {
-  if (persistableState?.schema !== PERSISTABLE_STATE_SCHEMA) return false;
-  if (persistableState.imageDigest !== current.imageDigest) return false;
-  if (persistableState.governanceKmsKeyVersion !== current.keyMaterial.kmsKeyVersion) return false;
-  if (persistableState.governancePublicKeyPem !== current.keyMaterial.governancePublicKeyPem) return false;
-  let verified;
-  try {
-    verified = verifyLineage(persistableState.lineage || [], { now, enforceTerminalExpiry: false });
-  } catch {
-    return false;
-  }
-  const activeGovernanceKeyId = `sha256:${publicKeyFingerprint(verified.currentGovernancePublicKeyPem)}`;
-  return activeGovernanceKeyId === current.keyMaterial.governanceKeyId
-    && verified.currentGovernancePublicKeyPem === current.keyMaterial.governancePublicKeyPem;
-}
-
-// The highest authentic capsule serial already in the bucket for this image +
-// KMS key, or 0 if none. Used to seed a fresh genesis / re-genesis above any
-// abandoned lineage so it strictly supersedes it under highest-serial-wins.
-async function maxVerifiedCapsuleSerial({ now, current }) {
-  const verified = await scanVerifiedCapsules({ now, current });
-  return verified.length > 0 ? verified[0].serial : 0;
-}
-
-// Retry hook for the boot-time fail-closed path. When KMS-backed governance key
-// init failed at boot, initializeGovernanceAsync keeps an inactive in-memory
-// shell (kmsUnavailable=true) and never activates/restores with it. This
-// re-attempts KMS key init on the periodic refresh loop; on success it swaps in
-// the KMS-backed key material, re-arms the one-shot restore guard, and re-runs
-// the capsule restore -- so a transient Cloud KMS outage self-heals without
-// operator action or a re-genesis. No-op once governance is active, when KMS was
-// healthy at boot, or when KMS is still unavailable.
-export async function retryGovernanceRestoreIfDegraded({ now = new Date(), createKeyMaterial = createKmsBackedGovernanceKeyMaterial } = {}) {
-  if (!state || !kmsUnavailable) return null;
-  if (state.status !== INACTIVE || state.lineage.length > 0) return null;
-  if (!isKmsGovernanceKeyConfigured()) return null;
-  let keyMaterial;
-  try {
-    keyMaterial = await createKeyMaterial();
-  } catch (error) {
-    console.error("[governance] KMS retry still failing; remaining inactive:", error.message);
-    return null;
-  }
-  state.keyMaterial = keyMaterial;
-  kmsUnavailable = false;
-  // Re-arm the one-shot guard so the restore skipped at boot can run now that
-  // we hold the KMS-bound governance key.
-  capsuleRestoreAttempted = false;
-  console.info("[governance] KMS recovered; re-attempting governance capsule restore");
-  try {
-    return await tryRestoreGovernanceFromCapsule({ now });
-  } catch (error) {
-    console.error("[governance] capsule restore retry failed; remaining inactive:", error.message);
-    return null;
-  }
-}
-
-// Periodic heartbeat: re-seal a fresh (higher-serial) capsule during quiet
-// periods so the true head never ages out of the bucket's retention window. If
-// the newest real capsule were allowed to age out and be deleted, cold-start
-// "highest authentic serial wins" could silently fall back to an older
-// still-present capsule -- a rollback. Hooked into the attestation refresh loop
-// (server.js). Rate-limited to GOVERNANCE_CAPSULE_HEARTBEAT_MS (default 24h),
-// well inside the retention window. No-op unless governance is active and
-// persistence is configured.
-export async function governanceCapsuleHeartbeatIfDue({ now = new Date() } = {}) {
-  if (!isGovernancePersistenceEnabled()) return null;
-  if (getGovernanceState().status !== ACTIVE) return null;
-  const intervalMs = Number(process.env.GOVERNANCE_CAPSULE_HEARTBEAT_MS || 24 * 60 * 60 * 1000);
-  if (lastCapsulePersistAt && (now.getTime() - lastCapsulePersistAt.getTime()) < intervalMs) {
-    return null;
-  }
-  return persistGovernanceCapsuleBestEffort({ now });
 }

@@ -36,9 +36,10 @@ unchanged (every genesis relaxation is `status === INACTIVE`-only).
 - `gh-actions-publisher@prod-femled-couple-router.iam.gserviceaccount.com` can
   sign with the Cosign KMS key (already granted) and write Artifact Registry.
 - `SUCCESSOR_ACTIVATION_SERVICE_ACCOUNT` (used by `operator-genesis.yml`) can set
-  IAM on the broker secrets, the `auth-broker-governance` + `auth-broker-acme-renewer`
-  KMS keys, and the governance capsule bucket (so the `--genesis` reconciler can
-  open the candidate window).
+  IAM on the broker secrets, the `auth-broker-acme-renewer` KMS key, and the bucket
+  holding the TLS mint ledger (so the candidate reconciler can open the candidate
+  window). There is no governance KMS key: the genesis certificate is signed with
+  a key generated in the candidate's enclave.
 
 ## Steps
 
@@ -50,7 +51,7 @@ unchanged (every genesis relaxation is `status === INACTIVE`-only).
 
 2. **Genesis the candidate.** Dispatch `operator-genesis.yml` on the same ref,
    with `image_digest=D` and `source_revision` = the same commit. It opens the
-   complete candidate WIF window (`reconcile-candidate-resource-iam.mjs --genesis`
+   candidate WIF window (`reconcile-candidate-resource-iam.mjs`
    + the project-role reconciler), provisions a fresh INACTIVE TDX candidate VM,
    self-adjudicates, genesis-bootstraps to active/epoch-1, and verifies.
    - On failure it auto-revokes the candidate window and deletes the VM.

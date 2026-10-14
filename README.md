@@ -223,68 +223,31 @@ and (b) the Sigstore-signed digest in Rekor.
 specifically, see Step 4 and Step 5 there, and the build pipeline at
 [.github/workflows/build-and-attest.yml](.github/workflows/build-and-attest.yml).**
 
-## Governance State Persistence
+## Governance Key Custody
 
-The TEE's governance state -- lineage, epoch, accepted tenant route
-policy, latest preapproval / successor / retirement certificates -- now
-survives a cold start without operator intervention. The mechanism has
-two parts, both gated by the same WIF attestation principal that already
-controls Secret Manager and the ACME renewer signer:
+The governance signing key is an Ed25519 key generated in enclave memory when
+the broker boots ([`src/governance-crypto.js`](src/governance-crypto.js)). It
+has no at-rest form: it is never written to disk, Cloud Storage, Secret
+Manager or Cloud KMS, so nobody who administers the GCP project holds a key
+that can sign for the broker's lineage. In production the broker refuses to
+establish governance on key material held anywhere else
+([`src/governance-state.js`](src/governance-state.js)).
 
-1. **Governance signing key in Cloud KMS.** When the VM is launched with
-   `tee-env-GOVERNANCE_KMS_SIGNER_KEY_VERSION` (provisioned by
-   [`terraform/governance-state-capsule.tf`](terraform/governance-state-capsule.tf)),
-   [`src/kms-governance-key.js`](src/kms-governance-key.js) replaces the
-   legacy in-memory ed25519 signer with a Cloud KMS asymmetric ECDSA
-   P-256 key whose `cloudkms.signerVerifier` role is bound only to the
-   federated principal that the running image digest attests to. The
-   private key never leaves KMS and is not extractable; the same image
-   restarting on a new VM still mints the same `governancePublicKeyPem`
-   and `governanceKeyId`. The activation X25519 key stays in process
-   memory because successor handoffs always negotiate a fresh key pair
-   on both sides.
+Successor activation hands governance to a new image without the key ever
+leaving an enclave: the predecessor signs a successor certificate naming the
+candidate's own in-enclave key, and encrypts the transferred state (lineage,
+epoch, accepted tenant route policy) to the candidate's attested X25519
+activation key.
 
-2. **State capsules in GCS.** After every mutation that issues a new
-   lineage certificate or updates `transferredState.routePolicy`, the
-   running TEE seals the persistable subset of state into a capsule
-   with [`src/state-capsule.js`](src/state-capsule.js) and writes it to
-   the bucket provisioned by Terraform via
-   [`src/capsule-store.js`](src/capsule-store.js). The capsule's AAD
-   binds (image digest, KMS key version, governance public key digest,
-   lineage digest, epoch, transferredState digest, status, project ID,
-   capsule serial). The capsule body is AES-256-GCM encrypted under a
-   per-capsule data key derived (via HKDF) from a KMS-produced witness
-   signature over the AAD bytes, so the same image digest is required
-   to both produce the witness and re-derive the data key on restore.
-   `capsules/latest-pointer.json` is a non-authoritative hint only (see
-   the rollback protection below).
+The price is availability. A broker whose memory is lost comes back
+`inactive`, and losing every copy of the key means an operator-authorized
+re-genesis plus an explicit re-admission by every relying party
+([GENESIS.md](GENESIS.md)).
 
-On cold start [`initializeGovernanceAsync`](src/governance-state.js)
-fetches the KMS public key and **enumerates every capsule in the bucket**,
-keeping only those that decrypt under this image's KMS witness key and
-bind to the running image + KMS key version + governance public key with
-a valid predecessor-signed lineage whose **active** key equals the
-KMS-bound `governanceKeyId` (the active key -- the successor key handed
-off by the last activation -- not the predecessor that *signed* the tail).
-It then restores the one with the **highest authentic `capsuleSerial`**
-(the serial lives in the witness-signed AAD, so it cannot be forged
-upward). Any capsule that fails a gate is skipped; if none qualify the
-broker stays `inactive` and recovery is the standard genesis-bootstrap
-path against a trusted-reviewer TEE.
-
-**Rollback protection.** The bucket is untrusted storage, so restore does
-**not** trust the mutable `latest-pointer.json` (a bucket-write attacker
-can rewind it). Instead it takes the maximum authentic serial, and the
-bucket enforces a **locked GCS retention policy** so the true-head capsule
-cannot be deleted to force a downgrade. A periodic heartbeat re-seals a
-fresh head at least daily so it never ages out of the retention window,
-and a fresh genesis / operator re-genesis seeds its serial above any
-abandoned lineage so it strictly supersedes it. Rolling governance back
-therefore requires forging a KMS witness signature or removing a
-Google-enforced retention lock. Recovery is **forward-only**: a botched
-restore is repaired by rolling forward or an operator re-genesis, never by
-repointing to an older capsule. `/health` surfaces the restored
-`capsuleSerial` so an external probe can alert on an unexpected regression.
+Earlier images signed governance with a Cloud KMS key and persisted state in
+GCS capsules. Both were removed: anyone administering the project could use
+the KMS key directly to sign as the broker, and the capsules' data key was
+derivable from fields stored in the capsule itself.
 
 ## Lineage Extension Example
 

@@ -10,17 +10,19 @@ COPY src/ ./src/
 ENV SOURCE_DATE_EPOCH=0
 ENV NODE_ENV=production
 
-# Governance config is image-PINNED, not operator-overridable. The successor
-# preapprove hard check (src/governance-image-inspection.js) rejects any
-# GOVERNANCE/PRIVATE/SECRET entry in allow_env_override, because letting an
-# operator repoint the governance signing key or the governance state-capsule
-# bucket via VM metadata would be a governance escape. These were previously
-# passed through tee-env metadata; they are now baked here so the launch policy
-# can drop them from allow_env_override.
-ENV GOVERNANCE_KMS_SIGNER_KEY_VERSION="projects/prod-femled-couple-router/locations/us-west1/keyRings/auth-broker-governance/cryptoKeys/governance-signer/cryptoKeyVersions/1"
-ENV CAPSULE_BUCKET="prod-femled-couple-router-auth-broker-tee-governance-capsules"
+# The governance key is generated in enclave memory; there is no KMS governance
+# key and no state capsule. The OAuth redirect, scopes, project and route
+# collection are image-PINNED: launch metadata is controlled by whoever
+# administers the project, and an overridable redirect or scope set would let
+# them divert users' authorization codes. Tenants also check these values in
+# the attestation's container env.
+ENV GCP_PROJECT_ID="prod-femled-couple-router"
+ENV GCP_PROJECT_NUMBER="125139120897"
+ENV AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION="auth_broker_route_documents"
+ENV REDIRECT_URI="https://oauth-tee.femled.ai/callback"
+ENV GOOGLE_SCOPES="openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify"
 
-# Ephemeral in-enclave TLS trust roots, image-PINNED like the governance config
+# Ephemeral in-enclave TLS trust roots, image-PINNED like the configuration
 # above. The renewer signer key authenticates this caller to the
 # authoritative-dns-tee renewer route for ACME DNS-01; the renewer is baked ON
 # because in-enclave minting is mandatory (there is no Secret Manager TLS pair
@@ -33,10 +35,10 @@ ENV ACME_RENEWER_ENABLED="true"
 
 LABEL "tee.launch_policy.log_redirect"="never"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
-# ACME_RENEWER_DRY_RUN is the only renewer toggle exposed for staged
-# validation via add-metadata; it is not a trust root (every renewer
-# trust-root value is image-baked above / in src).
-LABEL "tee.launch_policy.allow_env_override"="GCP_PROJECT_ID,GCP_PROJECT_NUMBER,REDIRECT_URI,GOOGLE_SCOPES,AUTH_BROKER_ROUTE_FIRESTORE_COLLECTION,ACME_RENEWER_DRY_RUN"
+# ACME_RENEWER_DRY_RUN is the only toggle exposed for staged validation via
+# add-metadata; it is not a trust root (every trust-root value is image-baked
+# above / in src).
+LABEL "tee.launch_policy.allow_env_override"="ACME_RENEWER_DRY_RUN"
 
 # OCI source/revision labels so Cosign and the verifier can correlate
 # image -> commit at a glance. COMMIT_SHA is set by the build-and-attest
