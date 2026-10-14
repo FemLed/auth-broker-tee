@@ -676,7 +676,7 @@ function routeMetric(routeDigest) {
 }
 
 function publicHttpError({ httpStatus = null, error = null } = {}) {
-  const status = Number(httpStatus);
+  const status = httpStatus === null || httpStatus === undefined ? NaN : Number(httpStatus);
   if (Number.isInteger(status)) {
     if (status >= 500) return { category: "http_5xx", httpStatusClass: "5xx" };
     if (status >= 400) return { category: "http_4xx", httpStatusClass: "4xx" };

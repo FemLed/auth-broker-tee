@@ -44,31 +44,49 @@ export async function initializeRouteRegistry(options = {}) {
     refreshTimer = null;
   }
 
-  const trustAnchors = options.trustAnchors || await loadTrustAnchors(options.trustAnchorsPath);
-  const source = await loadRouteSources(options);
-  registryState = buildRegistryState({
-    trustAnchors,
-    bundle: source.bundle,
-    routeDocuments: source.routeDocuments,
-    verifyAdmission: options.verifyAdmission || tenantAdmissionVerifier,
-    now: options.now || new Date(),
-    ignoreInvalidRouteDocuments: Boolean(options.ignoreInvalidRouteDocuments),
-  });
-  recordRouteBundleRefresh({ status: "success" });
-
-  const refreshMs = Number(options.refreshMs || process.env.AUTH_BROKER_ROUTE_BUNDLE_REFRESH_MS || DEFAULT_REFRESH_MS);
-  if (!options.skipTenantRouteDocuments && !options.bundle && !options.routeDocuments && refreshMs > 0 && hasConfiguredRouteSource()) {
-    refreshTimer = setInterval(() => {
-      refreshRouteRegistry({
-        ignoreInvalidRouteDocuments: Boolean(options.ignoreInvalidRouteDocuments),
-      }).catch((error) => {
-        recordRouteBundleRefresh({ status: "failed", reason: error.message });
-        console.error("[RouteRegistry] Refresh failed:", error.message);
-      });
-    }, refreshMs);
+  // The periodic refresh is scheduled even when this first load fails, so
+  // route documents corrected later (a re-issued tenant admission) are picked
+  // up without a restart.
+  try {
+    const trustAnchors = options.trustAnchors || await loadTrustAnchors(options.trustAnchorsPath);
+    const source = await loadRouteSources(options);
+    registryState = buildRegistryState({
+      trustAnchors,
+      bundle: source.bundle,
+      routeDocuments: source.routeDocuments,
+      verifyAdmission: options.verifyAdmission || tenantAdmissionVerifier,
+      now: options.now || new Date(),
+      ignoreInvalidRouteDocuments: Boolean(options.ignoreInvalidRouteDocuments),
+    });
+    recordRouteBundleRefresh({ status: "success" });
+  } finally {
+    scheduleRouteRefresh(options);
   }
 
   return getRouteRegistryStatus();
+}
+
+function scheduleRouteRefresh(options) {
+  const refreshMs = Number(options.refreshMs || process.env.AUTH_BROKER_ROUTE_BUNDLE_REFRESH_MS || DEFAULT_REFRESH_MS);
+  if (options.skipTenantRouteDocuments || options.bundle || options.routeDocuments || !(refreshMs > 0) || !hasConfiguredRouteSource()) return;
+  refreshTimer = setInterval(() => {
+    refreshRouteRegistry({
+      ignoreInvalidRouteDocuments: Boolean(options.ignoreInvalidRouteDocuments),
+    }).catch((error) => {
+      recordRouteBundleRefresh({ status: "failed", reason: error.message });
+      console.error("[RouteRegistry] Refresh failed:", error.message);
+    });
+  }, refreshMs);
+  refreshTimer.unref?.();
+}
+
+export function isRouteRefreshScheduledForTests() {
+  return Boolean(refreshTimer);
+}
+
+export function stopRouteRefreshForTests() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = null;
 }
 
 export async function refreshRouteRegistry(options = {}) {

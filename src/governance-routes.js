@@ -328,7 +328,7 @@ export async function handleGenesisBootstrap(req, res) {
     let routeRegistry = null;
     let routeRegistryError = null;
     try {
-      routeRegistry = await initializeRouteRegistry();
+      routeRegistry = await initializeRouteRegistry({ ignoreInvalidRouteDocuments: true });
     } catch (error) {
       routeRegistryError = error.message;
     }
@@ -432,7 +432,13 @@ export async function handleActivationApply(req, res) {
       predecessorActivationPublicKeyPem: body.predecessorActivationPublicKeyPem,
       activationNonce: body.activationNonce,
     });
-    await initializeRouteRegistry();
+    // The bundle is applied and its proof must reach the caller; a route
+    // loading problem is retried by the registry's periodic refresh.
+    try {
+      await initializeRouteRegistry({ ignoreInvalidRouteDocuments: true });
+    } catch (error) {
+      console.error("[Governance] route registry load after activation apply failed:", error.message);
+    }
     return jsonResponse(res, 200, manifest);
   } catch (error) {
     return jsonResponse(res, 400, { error: error.message });
