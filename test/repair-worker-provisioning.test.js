@@ -27,8 +27,14 @@ test("repair-worker runtime has minimal native tooling but avoids tenant code-ag
   assert.equal(entrypoint.includes('eval "value=\\${$required:-}"'), true);
 });
 
-test("repair-worker Vertex model calls use Google Search grounding", () => {
-  assert.match(runner, /"tools":\s*\[\{"googleSearch":\s*\{\}\}\]/);
+test("repair-worker runs on pinned mini-swe-agent 2.x without provider tools", () => {
+  assert.match(dockerfile, /mini-swe-agent==2\.4\.6 litellm==1\.105\.0/);
+  // mini-swe-agent 2.x passes its own bash tool; a provider `tools` kwarg
+  // collides with it on every step.
+  assert.doesNotMatch(runner, /"tools":/);
+  assert.match(runner, /cost_tracking="ignore_errors"/);
+  assert.match(runner, /wall_time_limit_seconds=/);
+  assert.match(runner, /"structured_submission": payload/);
 });
 
 test("repair-worker Terraform keeps untrusted worker and launcher roles narrow", () => {

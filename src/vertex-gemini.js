@@ -7,6 +7,7 @@ import {
   FIRST_PRINCIPLES_MODEL_POLICY,
   FIRST_PRINCIPLES_RESPONSE_MIME_TYPE,
   FIRST_PRINCIPLES_RESPONSE_SCHEMA,
+  FIRST_PRINCIPLES_THINKING_LEVEL,
   FIRST_PRINCIPLES_VERTEX_LOCATION,
   isPermittedSuccessorModelCandidate,
 } from "./first-principles-review.js";
@@ -155,6 +156,7 @@ async function generateOnce(prompt, { model, googleSearch = false }) {
       temperature: FIRST_PRINCIPLES_GENERATION_TEMPERATURE,
       responseMimeType: FIRST_PRINCIPLES_RESPONSE_MIME_TYPE,
       responseSchema: FIRST_PRINCIPLES_RESPONSE_SCHEMA,
+      thinkingConfig: { thinkingLevel: FIRST_PRINCIPLES_THINKING_LEVEL },
       ...(googleSearch ? { tools: FIRST_PRINCIPLES_VERTEX_GOOGLE_SEARCH_TOOLS } : {}),
     },
   });
@@ -204,7 +206,7 @@ function rankModelName(model) {
   const version = /gemini-([0-9]+)(?:[.-]([0-9]+))?/.exec(text);
   const major = Number.parseInt(version?.[1] || "0", 10);
   const minor = Number.parseInt(version?.[2] || "0", 10);
-  const proWeight = /pro/.test(text) ? 100 : 0;
+  const proWeight = /pro|argon/.test(text) ? 100 : 0;
   const previewPenalty = /preview|experimental|exp/.test(text) ? -5 : 0;
   return major * 1000 + minor * 10 + proWeight + previewPenalty;
 }
