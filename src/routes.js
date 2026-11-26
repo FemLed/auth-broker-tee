@@ -729,18 +729,25 @@ async function touchRegistryLastSeen(coupleId, deviceToken) {
 // Signed tenant route lookup
 // ---------------------------------------------------------------------------
 function getTenantApiRouteForTenant(uuid) {
+  const lookupDigest = sha256Digest(uuid);
   const route = getTenantApiRoute(uuid);
   if (!route) {
-    recordTenantRouteLookup({ status: "failed", lookupDigest: sha256Digest(uuid) });
+    recordTenantRouteLookup({ status: "failed", lookupDigest });
     console.error(`Tenant ${uuid} has no verified signed API route`);
     return null;
   }
+  recordTenantRouteLookup({ status: "success", lookupDigest });
   return route;
 }
 
 function buildPrivacySafeRouteProofHeaders(route) {
   try {
-    return buildRouteProofHeaders(route);
+    const headers = buildRouteProofHeaders(route);
+    recordRouteProof({
+      routeDigest: route?.payloadDigest || null,
+      status: "success",
+    });
+    return headers;
   } catch (error) {
     recordRouteProof({
       routeDigest: route?.payloadDigest || null,
@@ -1034,10 +1041,11 @@ export async function handleGitHubRepoWebhook(req, res) {
 
   console.log(`[RepoWebhook] Push to master on ${repoName}, resolving couple...`);
 
+  const repoDigest = sha256Digest(repoName);
   const deployRoute = getDeployWebhookRouteForRepo(repoName);
   if (!deployRoute) {
     recordDeployWebhook({
-      repoDigest: sha256Digest(repoName),
+      repoDigest,
       status: "failed",
       error: Object.assign(new Error("missing route"), { code: "MISSING_ROUTE" }),
     });
@@ -1078,7 +1086,7 @@ export async function handleGitHubRepoWebhook(req, res) {
     if (!forwardResponse.ok) {
       recordDeployWebhook({ routeDigest: deployRoute.payloadDigest, status: "failed", httpStatus: status });
     } else {
-      recordDeployWebhook({ routeDigest: deployRoute.payloadDigest, status: "success", httpStatus: status });
+      recordDeployWebhook({ routeDigest: deployRoute.payloadDigest, repoDigest, status: "success", httpStatus: status });
     }
     console.log(`[RepoWebhook] Forwarded to ${target} for ${repoName}: ${status}`);
     return jsonResponse(res, 200, { forwarded: true, repo: repoName, target, triggerStatus: status });

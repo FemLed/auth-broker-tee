@@ -359,6 +359,14 @@ export function recordDeployWebhook({ routeDigest = null, repoDigest = null, sta
     counters.deployWebhookFailures = 0;
     route.deployWebhookFailures = 0;
     route.lastDeployWebhookError = null;
+    if (routeDigest && repoDigest) {
+      const repoKey = isSha256Digest(repoDigest) ? repoDigest : sha256Digest(String(repoDigest));
+      const repoEntry = tenantContractRoutes.get(repoKey);
+      if (repoEntry) {
+        repoEntry.deployWebhookFailures = 0;
+        repoEntry.lastDeployWebhookError = null;
+      }
+    }
     lastSuccessAt.deployWebhook = nowIso();
     recordEvent("deploy_webhook", "success", {
       routeDigest,

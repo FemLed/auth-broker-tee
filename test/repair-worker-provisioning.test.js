@@ -28,7 +28,8 @@ test("repair-worker runtime has minimal native tooling but avoids tenant code-ag
 });
 
 test("repair-worker runs on pinned mini-swe-agent 2.x without provider tools", () => {
-  assert.match(dockerfile, /mini-swe-agent==2\.4\.6 litellm==1\.105\.0/);
+  assert.match(dockerfile, /mini-swe-agent==2\.4\.6 litellm==1\.110\.1/);
+  assert.match(runner, /"TEE_REPAIR_MODEL",\s*"vertex_ai\/gemini-4-carbon"/);
   // mini-swe-agent 2.x passes its own bash tool; a provider `tools` kwarg
   // collides with it on every step.
   assert.doesNotMatch(runner, /"tools":/);
