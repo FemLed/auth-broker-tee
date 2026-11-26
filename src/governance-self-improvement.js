@@ -1,7 +1,14 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
+import { FIRST_PRINCIPLES_MODEL } from "./first-principles-review.js";
 import { buildHealthSnapshot, recordRepairLaunch, recordSelfImprovement } from "./governance-monitor.js";
 import { getGovernanceState, issueSelfHealingProposal } from "./governance-state.js";
-import { createRepairJobForProposal, getRepairJobManifest } from "./governance-repair-jobs.js";
+import {
+  clearResolvedRepairJobEpisodes,
+  createRepairJobForProposal,
+  getRepairJobManifest,
+  hasEpisodeRepairJob,
+  repairJobDedupeKey,
+} from "./governance-repair-jobs.js";
 import { launchPendingRepairJobs } from "./governance-repair-launcher.js";
 import { evaluateModelPolicyUpgradeOpportunity } from "./governance-model-policy-supervisor.js";
 
@@ -34,7 +41,7 @@ export async function evaluateSelfImprovementOnce({ now = new Date(), modelPolic
       recordSelfImprovement({ status: "skipped" });
       return null;
     }
-    getRepairJobManifest();
+    getRepairJobManifest({ now });
     const lineageDigest = sha256Digest(canonicalStringify(current.lineage));
     let health = buildHealthSnapshot({
       governanceStatus: current.status,
@@ -55,6 +62,7 @@ export async function evaluateSelfImprovementOnce({ now = new Date(), modelPolic
       recordRepairLaunch({ status: "failed", error });
       console.error("[SelfImprovement] repair worker launch failed:", error.message);
     }
+    clearResolvedRepairJobEpisodes(activeRepairDedupeKeys(health, { current }));
     const trigger = chooseTrigger(health);
     if (trigger) {
       const result = await createSelfHealingRepair({
@@ -73,6 +81,7 @@ export async function evaluateSelfImprovementOnce({ now = new Date(), modelPolic
       now,
       ...modelPolicyUpgradeOptions,
     });
+    clearResolvedRepairJobEpisodes(activeRepairDedupeKeys(health, { current }));
     if (!modelPolicyOpportunity?.proposal) {
       recordSelfImprovement({ status: "success" });
       return null;
@@ -101,6 +110,10 @@ export async function evaluateSelfImprovementOnce({ now = new Date(), modelPolic
 }
 
 async function createSelfHealingRepair({ current, proposal, health, now, internalEventDigests }) {
+  const dedupeKey = repairJobDedupeKey(proposal);
+  if (hasEpisodeRepairJob(dedupeKey)) {
+    return null;
+  }
   const problemDigest = sha256Digest(canonicalStringify({
     type: proposal.type,
     problemStatement: proposal.problemStatement,
@@ -142,39 +155,65 @@ async function createSelfHealingRepair({ current, proposal, health, now, interna
   return { proposalEnvelope, repairJob, health };
 }
 
-function chooseTrigger(health) {
+function activeTriggers(health) {
   const unresolved = health.unresolvedFailures || {};
+  const triggers = [];
   if (unresolved.vertexRetryExhausted || health.vertexCircuit?.open) {
-    return { type: "vertex_repair", surface: "vertex", risk: "critical" };
+    triggers.push({ type: "vertex_repair", surface: "vertex", risk: "critical" });
   }
   if (unresolved.wif) {
-    return { type: "wif_repair", surface: "wif", risk: "warning" };
+    triggers.push({ type: "wif_repair", surface: "wif", risk: "warning" });
   }
   if (unresolved.attestationRefresh || unresolved.attestationRefreshFailures >= 3) {
-    return { type: "attestation_repair", surface: "attestation", risk: "critical" };
+    triggers.push({ type: "attestation_repair", surface: "attestation", risk: "critical" });
   }
   if (unresolved.routeBundleRefresh) {
-    return { type: "route_registry_repair", surface: "route-registry", risk: "warning" };
+    triggers.push({ type: "route_registry_repair", surface: "route-registry", risk: "warning" });
   }
   if (unresolved.modelProbe) {
-    return { type: "model_policy_repair", surface: "model-policy", risk: "warning" };
+    triggers.push({ type: "model_policy_repair", surface: "model-policy", risk: "warning" });
   }
   if (unresolved.selfImprovement) {
-    return { type: "self_improvement_repair", surface: "self-improvement", risk: "warning" };
+    triggers.push({ type: "self_improvement_repair", surface: "self-improvement", risk: "warning" });
   }
   if (unresolved.repairLaunch || unresolved.staleRepairJobs) {
-    return { type: "repair_worker_repair", surface: "repair-worker", risk: "warning" };
+    triggers.push({ type: "repair_worker_repair", surface: "repair-worker", risk: "warning" });
   }
   if (unresolved.manifestAttestation) {
-    return { type: "manifest_attestation_repair", surface: "manifest-attestation", risk: "warning" };
+    triggers.push({ type: "manifest_attestation_repair", surface: "manifest-attestation", risk: "warning" });
   }
   if (unresolved.routeProof || unresolved.tokenDeposit || unresolved.tenantRouteLookup) {
-    return { type: "tenant_contract_repair", surface: "tenant-contract", risk: "warning" };
+    triggers.push({ type: "tenant_contract_repair", surface: "tenant-contract", risk: "warning" });
   }
   if (unresolved.deployWebhook) {
-    return { type: "deploy_webhook_repair", surface: "deploy-webhook", risk: "warning" };
+    triggers.push({ type: "deploy_webhook_repair", surface: "deploy-webhook", risk: "warning" });
   }
-  return null;
+  return triggers;
+}
+
+function chooseTrigger(health) {
+  return activeTriggers(health)[0] || null;
+}
+
+function activeRepairDedupeKeys(health, { current } = {}) {
+  const keys = new Set();
+  for (const trigger of activeTriggers(health)) {
+    keys.add(repairJobDedupeKey({
+      type: trigger.type,
+      requestedChange: { surface: trigger.surface },
+    }));
+  }
+  const lastCandidateModel = current?.modelPolicySupervisor?.lastCandidateModel;
+  if (lastCandidateModel) {
+    keys.add(repairJobDedupeKey({
+      type: "model_policy_upgrade",
+      requestedChange: {
+        currentModel: FIRST_PRINCIPLES_MODEL,
+        targetModel: lastCandidateModel,
+      },
+    }));
+  }
+  return keys;
 }
 
 function buildProposalForTrigger({ trigger, health, now }) {
@@ -213,6 +252,13 @@ function hasLiveEquivalentProposal(proposals, { type, problemDigest, now }) {
 
 function dedupeRequestedChange(requestedChange) {
   if (!requestedChange || typeof requestedChange !== "object") return requestedChange || null;
-  const { generatedAt, modelProbeDigest, ...stable } = requestedChange;
+  const {
+    generatedAt,
+    modelProbeDigest,
+    healthStatus,
+    availabilityRisk,
+    governanceRisk,
+    ...stable
+  } = requestedChange;
   return stable;
 }

@@ -12,11 +12,48 @@ import {
 
 const MAX_REPAIR_JOBS = 40;
 const REPAIR_JOB_STALE_MS = 2 * 60 * 60 * 1000;
+const TERMINAL_REPAIR_JOB_STATUSES = new Set(["finished", "candidate_submitted", "failed"]);
+const COMPLETED_EPISODE_STATUSES = new Set(["finished", "candidate_submitted"]);
 
 const repairJobs = [];
 
 export function resetRepairJobsForTests() {
   repairJobs.length = 0;
+}
+
+export function repairJobDedupeKey(proposal = {}) {
+  const payload = proposal?.payload || proposal || {};
+  const type = String(payload.type || "operational_repair");
+  const requestedChange = payload.requestedChange || {};
+  if (type === "model_policy_upgrade") {
+    const currentModel = String(requestedChange.currentModel || "");
+    const targetModel = String(requestedChange.targetModel || "");
+    if (currentModel || targetModel) {
+      return `model_policy_upgrade:${currentModel}->${targetModel}`;
+    }
+  }
+  const surface = String(requestedChange.surface || "default");
+  return `repair:${type}:${surface}`;
+}
+
+export function hasEpisodeRepairJob(dedupeKey) {
+  if (!dedupeKey) return false;
+  return repairJobs.some((candidate) => {
+    if (candidate.dedupeKey !== dedupeKey) return false;
+    const status = candidate.status?.payload?.status;
+    if (!TERMINAL_REPAIR_JOB_STATUSES.has(status)) return true;
+    return COMPLETED_EPISODE_STATUSES.has(status) && !candidate.episodeCleared;
+  });
+}
+
+export function clearResolvedRepairJobEpisodes(activeDedupeKeys = new Set()) {
+  const active = activeDedupeKeys instanceof Set ? activeDedupeKeys : new Set(activeDedupeKeys || []);
+  for (const job of repairJobs) {
+    const status = job.status?.payload?.status;
+    if (COMPLETED_EPISODE_STATUSES.has(status) && !job.episodeCleared && job.dedupeKey && !active.has(job.dedupeKey)) {
+      job.episodeCleared = true;
+    }
+  }
 }
 
 export function createRepairJobForProposal({
@@ -28,10 +65,15 @@ export function createRepairJobForProposal({
   if (findOpenJobByProposalDigest(proposalEnvelope.payloadDigest)) {
     return findOpenJobByProposalDigest(proposalEnvelope.payloadDigest);
   }
+  const resolvedRequestedChange = requestedChange || proposalEnvelope.payload.requestedChange;
+  const dedupeKey = repairJobDedupeKey({
+    type: proposalEnvelope.payload.type,
+    requestedChange: resolvedRequestedChange,
+  });
   const promptEnvelope = buildRepairPromptEnvelope({
     proposalEnvelope,
     healthSnapshotDigest: sha256Digest(canonicalStringify(healthSnapshot)),
-    requestedChange: requestedChange || proposalEnvelope.payload.requestedChange,
+    requestedChange: resolvedRequestedChange,
   });
   const callbackToken = crypto.randomBytes(32).toString("hex");
   const callbackTokenHash = sha256Digest(callbackToken);
@@ -50,6 +92,8 @@ export function createRepairJobForProposal({
     schema: "femled.tee.repair_worker.job_record.v1",
     jobId: jobRequest.payload.jobId,
     proposalDigest: proposalEnvelope.payloadDigest,
+    dedupeKey,
+    episodeCleared: false,
     promptEnvelope,
     promptDigest: jobRequest.payload.promptDigest,
     jobRequest,
@@ -147,10 +191,14 @@ export function markRepairJobRunning(jobId, { now = new Date() } = {}) {
   return publicJob(job);
 }
 
-export function getRepairJobManifest() {
+export function getRepairJobManifest({ now = new Date() } = {}) {
   const openJobs = repairJobs.map(publicJob);
-  const now = Date.now();
-  const ages = openJobs.map((job) => Math.max(0, now - Date.parse(job.createdAt)));
+  const nowMs = now instanceof Date ? now.getTime() : Number(now);
+  // Keep completed jobs in openJobs so summarizeSelfHealingEvidence can still
+  // link artifactDigest/candidateSubmissionDigest, but count staleness only
+  // over non-terminal jobs so finished jobs never self-trigger repair loops.
+  const activeJobs = openJobs.filter((job) => !TERMINAL_REPAIR_JOB_STATUSES.has(job.status?.payload?.status));
+  const ages = activeJobs.map((job) => Math.max(0, nowMs - Date.parse(job.createdAt)));
   const summary = {
     schema: "femled.tee.repair_worker.job_age_summary.v1",
     staleThresholdMs: REPAIR_JOB_STALE_MS,

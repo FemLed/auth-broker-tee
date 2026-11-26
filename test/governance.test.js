@@ -45,6 +45,7 @@ import {
 import {
   buildHealthSnapshot,
   getVertexCircuitState,
+  recordAttestationRefresh,
   recordDeployWebhook,
   recordManifestAttestation,
   recordRepairLaunch,
@@ -61,7 +62,9 @@ import { buildRepairPromptEnvelope, validateRepairArtifactEnvelope } from "../sr
 import {
   createRepairJobForProposal,
   getPendingRepairJobsForLaunch,
+  getRepairJobManifest,
   recordRepairArtifact,
+  recordRepairCandidateSubmission,
   resetRepairJobsForTests,
 } from "../src/governance-repair-jobs.js";
 import { buildRepairJobOverrides } from "../src/governance-repair-launcher.js";
@@ -1575,6 +1578,286 @@ test("operational successes clear prior unresolved failure counters", () => {
   assert.equal(health.counters.selfImprovementFailures, 0);
   assert.equal(health.counters.repairLaunchFailures, 0);
   assert.equal(health.counters.manifestAttestationFailures, 0);
+  assert.equal(health.counters.deployWebhookFailures, 0);
+});
+
+test("finished and candidate_submitted jobs aged past 2h do not count as stale or self-trigger repair", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  initializeGovernance({ mode: "genesis" });
+
+  const t0 = new Date("2026-11-26T00:00:00Z");
+  recordDeployWebhook({ routeDigest: digestOf("r1"), status: "failed", httpStatus: 502 });
+  recordDeployWebhook({ routeDigest: digestOf("r1"), status: "failed", httpStatus: 502 });
+
+  const first = await evaluateSelfImprovementOnce({
+    now: t0,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(first?.proposalEnvelope?.payload?.type, "deploy_webhook_repair");
+  const [job] = getPendingRepairJobsForLaunch();
+  recordRepairArtifact({
+    schema: "femled.tee.repair_worker.artifact_envelope.v1",
+    runId: "run-finished",
+    proposalDigest: job.proposalDigest,
+    promptDigest: job.promptDigest,
+    sourceBundleDigest: digestOf("src-1"),
+    buildSummaryDigest: digestOf("build-1"),
+    testSummaryDigest: digestOf("test-1"),
+  }, { callbackToken: job.callbackToken, now: new Date(t0.getTime() + 5 * 60 * 1000) });
+
+  // Clear deploy webhook failure so only staleRepairJobs could trigger.
+  recordDeployWebhook({ routeDigest: digestOf("r1"), status: "success", httpStatus: 200 });
+
+  // 3 hours later: finished job remains in openJobs (for evidence linkage) but is NOT stale.
+  const t3h = new Date(t0.getTime() + 3 * 60 * 60 * 1000);
+  const manifest = getRepairJobManifest({ now: t3h });
+  assert.equal(manifest.openJobs.length, 1);
+  assert.equal(manifest.openJobs[0].artifactDigest !== null, true);
+  assert.equal(manifest.summary.staleOpenJobCount, 0);
+  assert.equal(manifest.summary.oldestOpenJobAgeMs, 0);
+
+  const followUp = await evaluateSelfImprovementOnce({
+    now: t3h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(followUp, null);
+
+  // Also verify candidate_submitted is excluded from staleness.
+  recordRepairCandidateSubmission({
+    schema: "femled.tee.repair_worker.candidate_submission.v1",
+    selfHealingProposalDigest: job.proposalDigest,
+    sourceBundleDigest: digestOf("src-1"),
+    candidateImageDigest: IMAGE_DIGEST,
+    buildSummaryDigest: digestOf("build-1"),
+    testSummaryDigest: digestOf("test-1"),
+    complianceSummaryDigest: digestOf("compliance-1"),
+  }, { callbackToken: job.callbackToken, now: new Date(t0.getTime() + 10 * 60 * 1000) });
+
+  const submittedManifest = getRepairJobManifest({ now: new Date(t0.getTime() + 8 * 60 * 60 * 1000) });
+  assert.equal(submittedManifest.openJobs.length, 1);
+  assert.equal(submittedManifest.openJobs[0].candidateSubmissionDigest !== null, true);
+  assert.equal(submittedManifest.summary.staleOpenJobCount, 0);
+});
+
+test("completed repair job deduplicates past 6h proposal TTL and re-arms after failure clears", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  initializeGovernance({ mode: "genesis" });
+
+  const t0 = new Date("2026-11-26T00:00:00Z");
+  const routeDigest = digestOf("persistent-deploy-route");
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 502 });
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 502 });
+
+  const first = await evaluateSelfImprovementOnce({
+    now: t0,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(first?.proposalEnvelope?.payload?.type, "deploy_webhook_repair");
+  const [job] = getPendingRepairJobsForLaunch();
+  recordRepairArtifact({
+    schema: "femled.tee.repair_worker.artifact_envelope.v1",
+    runId: "run-1",
+    proposalDigest: job.proposalDigest,
+    promptDigest: job.promptDigest,
+    sourceBundleDigest: digestOf("src"),
+    buildSummaryDigest: digestOf("build"),
+    testSummaryDigest: digestOf("test"),
+  }, { callbackToken: job.callbackToken, now: new Date(t0.getTime() + 10 * 60 * 1000) });
+
+  // 7 hours later (past 6h proposal TTL) while failure persists: must NOT launch another job.
+  const t7h = new Date(t0.getTime() + 7 * 60 * 60 * 1000);
+  const stillUnresolved = await evaluateSelfImprovementOnce({
+    now: t7h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(stillUnresolved, null);
+  assert.equal(getRepairJobManifest({ now: t7h }).openJobs.length, 1);
+
+  // Failure clears on a subsequent tick -> episode clears.
+  recordDeployWebhook({ routeDigest, status: "success", httpStatus: 200 });
+  const t8h = new Date(t0.getTime() + 8 * 60 * 60 * 1000);
+  const recovered = await evaluateSelfImprovementOnce({
+    now: t8h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(recovered, null);
+
+  // Failure genuinely recurs later -> re-armed and creates one new job.
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 503 });
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 503 });
+  const t9h = new Date(t0.getTime() + 9 * 60 * 60 * 1000);
+  const recurred = await evaluateSelfImprovementOnce({
+    now: t9h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(recurred?.proposalEnvelope?.payload?.type, "deploy_webhook_repair");
+  assert.equal(getRepairJobManifest({ now: t9h }).openJobs.length, 2);
+});
+
+test("higher-priority failure does not prematurely clear masked lower-priority completed episode", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  initializeGovernance({ mode: "genesis" });
+
+  const t0 = new Date("2026-11-26T00:00:00Z");
+  const routeDigest = digestOf("masked-deploy-route");
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 502 });
+  recordDeployWebhook({ routeDigest, status: "failed", httpStatus: 502 });
+
+  const first = await evaluateSelfImprovementOnce({
+    now: t0,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(first?.proposalEnvelope?.payload?.type, "deploy_webhook_repair");
+  const [deployJob] = getPendingRepairJobsForLaunch();
+  recordRepairArtifact({
+    schema: "femled.tee.repair_worker.artifact_envelope.v1",
+    runId: "run-deploy",
+    proposalDigest: deployJob.proposalDigest,
+    promptDigest: deployJob.promptDigest,
+    sourceBundleDigest: digestOf("src"),
+    buildSummaryDigest: digestOf("build"),
+    testSummaryDigest: digestOf("test"),
+  }, { callbackToken: deployJob.callbackToken, now: new Date(t0.getTime() + 10 * 60 * 1000) });
+
+  // Higher-priority failure arrives and masks deployWebhook in chooseTrigger().
+  recordVertexRetryExhausted({ reason: "transient vertex outage" });
+  const t7h = new Date(t0.getTime() + 7 * 60 * 60 * 1000);
+  const vertexResult = await evaluateSelfImprovementOnce({
+    now: t7h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(vertexResult?.proposalEnvelope?.payload?.type, "vertex_repair");
+
+  // Vertex recovers while deployWebhook is STILL unresolved: deployWebhook must NOT re-spawn.
+  recordVertexCall({ status: "success", model: "gemini-4-argon" });
+  const t8h = new Date(t0.getTime() + 8 * 60 * 60 * 1000);
+  const afterVertexRecovered = await evaluateSelfImprovementOnce({
+    now: t8h,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(afterVertexRecovered, null);
+  assert.equal(getRepairJobManifest({ now: t8h }).openJobs.length, 2);
+});
+
+test("severity oscillation between warning and critical does not mint duplicate repair proposals", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  initializeGovernance({ mode: "genesis" });
+
+  const t0 = new Date("2026-11-26T00:00:00Z");
+  recordAttestationRefresh({ status: "failed", reason: "attempt 1" });
+  const first = await evaluateSelfImprovementOnce({
+    now: t0,
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(first?.proposalEnvelope?.payload?.type, "attestation_repair");
+  assert.equal(first.health.availabilityRisk, "low");
+
+  // Escalate to critical (>= 3 failures -> availabilityRisk: "critical", status: "critical").
+  recordAttestationRefresh({ status: "failed", reason: "attempt 2" });
+  recordAttestationRefresh({ status: "failed", reason: "attempt 3" });
+  const second = await evaluateSelfImprovementOnce({
+    now: new Date(t0.getTime() + 60_000),
+    modelPolicyUpgradeOptions: { scanIntervalMs: 0, discoverModelCandidates: async () => [] },
+  });
+  assert.equal(second, null);
+  assert.equal(getRepairJobManifest({ now: new Date(t0.getTime() + 60_000) }).openJobs.length, 1);
+});
+
+test("completed model_policy_upgrade deduplicates across 24h scans and re-arms for newer candidate", async () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  resetRepairJobsForTests();
+  initializeGovernance({ mode: "genesis" });
+
+  const t0 = new Date("2026-11-26T00:00:00Z");
+  const first = await evaluateSelfImprovementOnce({
+    now: t0,
+    modelPolicyUpgradeOptions: passingModelUpgradeOptions(),
+  });
+  assert.equal(first?.proposalEnvelope?.payload?.type, "model_policy_upgrade");
+  const [job] = getPendingRepairJobsForLaunch();
+  recordRepairArtifact({
+    schema: "femled.tee.repair_worker.artifact_envelope.v1",
+    runId: "run-model-1",
+    proposalDigest: job.proposalDigest,
+    promptDigest: job.promptDigest,
+    sourceBundleDigest: digestOf("src"),
+    buildSummaryDigest: digestOf("build"),
+    testSummaryDigest: digestOf("test"),
+  }, { callbackToken: job.callbackToken, now: new Date(t0.getTime() + 15 * 60 * 1000) });
+
+  // Intermediate tick (1h later, no scan) must NOT clear the model_policy_upgrade episode.
+  const t1h = new Date(t0.getTime() + 60 * 60 * 1000);
+  assert.equal(await evaluateSelfImprovementOnce({
+    now: t1h,
+    modelPolicyUpgradeOptions: {
+      ...passingModelUpgradeOptions(),
+      scanIntervalMs: 24 * 60 * 60 * 1000,
+    },
+  }), null);
+
+  // 25 hours later (past 6h proposal TTL and 24h scan interval): same model must NOT re-launch.
+  const t25h = new Date(t0.getTime() + 25 * 60 * 60 * 1000);
+  const dailyRescan = await evaluateSelfImprovementOnce({
+    now: t25h,
+    modelPolicyUpgradeOptions: {
+      ...passingModelUpgradeOptions(),
+      scanIntervalMs: 24 * 60 * 60 * 1000,
+    },
+  });
+  assert.equal(dailyRescan, null);
+  assert.equal(getRepairJobManifest({ now: t25h }).openJobs.length, 1);
+
+  // 50 hours later: a stronger model candidate appears -> spawns once for the new target.
+  const t50h = new Date(t0.getTime() + 50 * 60 * 60 * 1000);
+  const newerModel = await evaluateSelfImprovementOnce({
+    now: t50h,
+    modelPolicyUpgradeOptions: {
+      scanIntervalMs: 24 * 60 * 60 * 1000,
+      discoverModelCandidates: async () => [{
+        ...strongerCatalogCandidate(),
+        model: "gemini-9.5-pro",
+        rank: 9150,
+      }],
+      probeModelCandidate: async (model) => ({ status: "passed", model, responseDigest: digestOf(`probe:${model}`) }),
+    },
+  });
+  assert.equal(newerModel?.proposalEnvelope?.payload?.requestedChange?.targetModel, "gemini-9.5-pro");
+  assert.equal(getRepairJobManifest({ now: t50h }).openJobs.length, 2);
+});
+
+test("deploy webhook success with routeDigest and repoDigest clears prior missing-route failures", () => {
+  resetGovernanceForTests(null);
+  resetGovernanceMonitorForTests();
+  const repoDigest = digestOf("newly-admitted-repo");
+  const routeDigest = digestOf("newly-admitted-route");
+
+  recordDeployWebhook({
+    repoDigest,
+    status: "failed",
+    error: Object.assign(new Error("missing route"), { code: "MISSING_ROUTE" }),
+  });
+  recordDeployWebhook({
+    repoDigest,
+    status: "failed",
+    error: Object.assign(new Error("missing route"), { code: "MISSING_ROUTE" }),
+  });
+
+  let health = buildHealthSnapshot({ governanceStatus: "active" });
+  assert.equal(health.unresolvedFailures.deployWebhook, true);
+
+  recordDeployWebhook({ routeDigest, repoDigest, status: "success", httpStatus: 200 });
+
+  health = buildHealthSnapshot({ governanceStatus: "active" });
+  assert.equal(health.unresolvedFailures.deployWebhook, false);
   assert.equal(health.counters.deployWebhookFailures, 0);
 });
 

@@ -116,7 +116,7 @@ def parse_submit(command: str) -> dict:
 
 
 def run_agent(prompt: str, base_branch: str) -> dict:
-    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-4-argon")
+    model_name = os.getenv("TEE_REPAIR_MODEL", "vertex_ai/gemini-4-carbon")
     # mini-swe-agent 2.x drives the model through tool calling and passes its
     # own `tools=[bash]` to litellm; anything named `tools` here collides with
     # it (TypeError on every step), so no provider tools are added.
