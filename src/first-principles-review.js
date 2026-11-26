@@ -1,12 +1,12 @@
 import { canonicalStringify, sha256Digest } from "./canonical-json.js";
 import { recordVertexParseFailure } from "./governance-monitor.js";
 
-export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-10-14.v8";
-export const FIRST_PRINCIPLES_MODEL = "gemini-4-argon";
+export const FIRST_PRINCIPLES_POLICY_VERSION = "2026-11-26.v9";
+export const FIRST_PRINCIPLES_MODEL = "gemini-4-carbon";
 export const FIRST_PRINCIPLES_VERTEX_LOCATION = "global";
 export const FIRST_PRINCIPLES_GENERATION_TEMPERATURE = 1.0;
-// gemini-4-argon skips reasoning under a JSON response schema unless a thinking
-// level is requested explicitly.
+// gemini-4-argon skipped reasoning under a JSON response schema unless a
+// thinking level was requested explicitly, so the level stays explicit.
 export const FIRST_PRINCIPLES_THINKING_LEVEL = "HIGH";
 export const FIRST_PRINCIPLES_RESPONSE_MIME_TYPE = "application/json";
 

@@ -25,6 +25,62 @@ export const FIRST_PRINCIPLES_VERTEX_GOOGLE_SEARCH_TOOLS = Object.freeze([
   Object.freeze({ googleSearch: {} }),
 ]);
 
+// Node's fetch is Undici, which abandons a request whose response has not
+// started within 300 seconds, or whose body stalls that long. A review can
+// think for longer than that before it answers (gemini-4-carbon at HIGH often
+// does), and its caller then got "fetch failed". A review request is bounded
+// by this timeout instead: the SDK aborts it when the time is up. The CI job
+// that waits for a review allows 20 minutes.
+export const REVIEW_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+// @google/genai calls the global fetch and takes neither a fetch nor a
+// dispatcher, so the two Undici limits cannot be lifted where the request is
+// made. Every fetch in the process goes through Undici's global dispatcher, so
+// that one is wrapped, once: a generateContent request to Vertex is handed on
+// with both timeouts off, and everything else passes through untouched.
+const UNDICI_GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+let longRequestDispatcher = null;
+function installLongRequestDispatcher() {
+  let dispatcher = globalThis[UNDICI_GLOBAL_DISPATCHER];
+  if (!dispatcher && typeof Headers !== "undefined") {
+    // Node sets its dispatcher up lazily, on the first use of fetch's types.
+    new Headers();
+    dispatcher = globalThis[UNDICI_GLOBAL_DISPATCHER];
+  }
+  if (typeof dispatcher?.dispatch !== "function") {
+    throw new Error("Undici's global dispatcher is not available");
+  }
+  if (dispatcher === longRequestDispatcher) return;
+  const vertexOrigin = new URL(vertexPublisherModelCatalogUrl()).origin;
+  const dispatch = (options, handler) => dispatcher.dispatch(
+    options?.origin === vertexOrigin && String(options.path).endsWith(":generateContent")
+      ? { ...options, headersTimeout: 0, bodyTimeout: 0 }
+      : options,
+    handler,
+  );
+  longRequestDispatcher = new Proxy(dispatcher, {
+    get: (target, key) => (key === "dispatch" ? dispatch : target[key]),
+  });
+  globalThis[UNDICI_GLOBAL_DISPATCHER] = longRequestDispatcher;
+}
+
+export function buildVertexClient({ accessToken, project }) {
+  installLongRequestDispatcher();
+  return new GoogleGenAI({
+    vertexai: true,
+    project,
+    location: FIRST_PRINCIPLES_VERTEX_LOCATION,
+    googleAuthOptions: {
+      scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+    },
+    httpOptions: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+      timeout: REVIEW_REQUEST_TIMEOUT_MS,
+    },
+  });
+}
+
 export async function generateFirstPrinciplesContent(prompt, {
   model = FIRST_PRINCIPLES_MODEL,
   probe = false,
@@ -135,19 +191,7 @@ export async function listFirstPrinciplesModelCatalogCandidates() {
 
 async function generateOnce(prompt, { model, googleSearch = false }) {
   const accessToken = await getWifAccessToken();
-  const genAI = new GoogleGenAI({
-    vertexai: true,
-    project: getProjectId(),
-    location: FIRST_PRINCIPLES_VERTEX_LOCATION,
-    googleAuthOptions: {
-      scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-    },
-    httpOptions: {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    },
-  });
+  const genAI = buildVertexClient({ accessToken, project: getProjectId() });
 
   const response = await genAI.models.generateContent({
     model,
