@@ -408,10 +408,10 @@ async function fetchJson(url, { method = "GET", body = null, resolveIp = "", hea
 
 // Governance mutations through the active TEE include full-evidence Gemini
 // arbitrations (image preapproval over the whole source bundle, activation
-// acceptance) that routinely exceed 60s. Match coach-email-tee's
-// activate-successor budget so a slow-but-healthy arbitration is not
-// aborted mid-flight (the epoch-5 roll's first attempt died exactly here).
-const GOVERNANCE_CALL_TIMEOUT_MS = 600_000;
+// acceptance) that can exceed 10 minutes on gemini-4-carbon at HIGH. Match
+// src/vertex-gemini.js's REVIEW_REQUEST_TIMEOUT_MS (15 minutes) so a
+// slow-but-healthy arbitration is not aborted mid-flight.
+const GOVERNANCE_CALL_TIMEOUT_MS = 900_000;
 
 // Errors name the method, path and status and quote the response; request
 // headers (the governance token) and bodies never appear in them.
