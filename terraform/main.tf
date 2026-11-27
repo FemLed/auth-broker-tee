@@ -59,10 +59,47 @@ resource "google_project_service" "aiplatform" {
 # Artifact Registry
 # ---------------------------------------------------------------------------
 resource "google_artifact_registry_repository" "auth_broker" {
-  location      = var.region
-  repository_id = "auth-broker"
-  format        = "DOCKER"
-  description   = "Auth broker TEE container images"
+  location               = var.region
+  repository_id          = "auth-broker"
+  format                 = "DOCKER"
+  description            = "Auth broker TEE container images"
+  cleanup_policy_dry_run = true
+
+  cleanup_policies {
+    id     = "keep-protected-tags"
+    action = "KEEP"
+    condition {
+      tag_state    = "TAGGED"
+      tag_prefixes = ["prod-", "keep-", "latest", "sha256-"]
+    }
+  }
+
+  cleanup_policies {
+    id     = "keep-recent"
+    action = "KEEP"
+    most_recent_versions {
+      keep_count = 10
+    }
+  }
+
+  cleanup_policies {
+    id     = "delete-old-repair-worker"
+    action = "DELETE"
+    condition {
+      tag_state             = "ANY"
+      package_name_prefixes = ["auth-broker-tee-repair-worker"]
+      older_than            = "1209600s" # 14 d
+    }
+  }
+
+  cleanup_policies {
+    id     = "delete-old-any"
+    action = "DELETE"
+    condition {
+      tag_state  = "ANY"
+      older_than = "2592000s" # 30 d
+    }
+  }
 
   depends_on = [google_project_service.artifact_registry]
 }
