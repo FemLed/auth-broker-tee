@@ -63,7 +63,7 @@ resource "google_artifact_registry_repository" "auth_broker" {
   repository_id          = "auth-broker"
   format                 = "DOCKER"
   description            = "Auth broker TEE container images"
-  cleanup_policy_dry_run = true
+  cleanup_policy_dry_run = false
 
   cleanup_policies {
     id     = "keep-protected-tags"
